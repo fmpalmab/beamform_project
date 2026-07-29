@@ -53,22 +53,26 @@ def summarize_timings(records: Iterable[dict[str, float]]) -> list[dict[str, flo
             "estimated_flop": first["estimated_flop"],
             "repetitions": float(len(rows)),
         }
-        for field in TIME_FIELDS:
+        available_time_fields = [field for field in TIME_FIELDS if field in first]
+        for field in available_time_fields:
             values = np.asarray([row[field] for row in rows], dtype=np.float64)
             result[f"{field}_median"] = float(np.median(values))
             result[f"{field}_p25"] = float(np.percentile(values, 25.0))
             result[f"{field}_p75"] = float(np.percentile(values, 75.0))
 
-        cpu_ms = result["cpu_ms_median"]
         kernel_ms = result["gpu_kernel_ms_median"]
         pipeline_ms = result["gpu_pipeline_wall_ms_median"]
-        result["speedup_kernel"] = cpu_ms / kernel_ms
-        result["speedup_pipeline"] = cpu_ms / pipeline_ms
-        for label, milliseconds in (
-            ("cpu", cpu_ms),
+        if "cpu_ms_median" in result:
+            cpu_ms = result["cpu_ms_median"]
+            result["speedup_kernel"] = cpu_ms / kernel_ms
+            result["speedup_pipeline"] = cpu_ms / pipeline_ms
+        rate_values = [
             ("gpu_kernel", kernel_ms),
             ("gpu_pipeline", pipeline_ms),
-        ):
+        ]
+        if "cpu_ms_median" in result:
+            rate_values.insert(0, ("cpu", result["cpu_ms_median"]))
+        for label, milliseconds in rate_values:
             seconds = milliseconds / 1000.0
             result[f"{label}_cmac_per_s"] = result["n_cmac"] / seconds
             result[f"{label}_estimated_flop_per_s"] = (
@@ -132,6 +136,7 @@ def plot_performance(summary: list[dict[str, float]], metadata: dict,
     import matplotlib.pyplot as plt
 
     antenna_values = sorted({int(record["n_ant"]) for record in summary})
+    has_cpu_timings = "cpu_ms_median" in summary[0]
     figure, axes = plt.subplots(
         len(antenna_values), 3, figsize=(18, 5.2 * len(antenna_values)),
         squeeze=False, constrained_layout=True,
@@ -144,11 +149,13 @@ def plot_performance(summary: list[dict[str, float]], metadata: dict,
         times = np.asarray([record["n_time"] for record in maximum])
 
         timing_axis = axes[row, 0]
-        for field, label, color in (
-            ("cpu_ms", "CPU serial", "tab:blue"),
+        timing_fields = [
             ("gpu_kernel_ms", "CUDA kernel", "tab:orange"),
             ("gpu_pipeline_wall_ms", "GPU H2D+kernel+D2H", "tab:green"),
-        ):
+        ]
+        if has_cpu_timings:
+            timing_fields.insert(0, ("cpu_ms", "CPU serial", "tab:blue"))
+        for field, label, color in timing_fields:
             median = np.asarray([record[f"{field}_median"] for record in maximum])
             p25 = np.asarray([record[f"{field}_p25"] for record in maximum])
             p75 = np.asarray([record[f"{field}_p75"] for record in maximum])
@@ -162,30 +169,40 @@ def plot_performance(summary: list[dict[str, float]], metadata: dict,
         timing_axis.grid(True, which="both", alpha=0.3)
         timing_axis.legend()
 
-        speedup_axis = axes[row, 1]
+        comparison_axis = axes[row, 1]
         for n_beams in beam_values:
             beam_records = _records_for(summary, n_ant, n_beams)
-            speedup_axis.plot(
+            field = "speedup_pipeline" if has_cpu_timings \
+                else "gpu_pipeline_wall_ms_median"
+            comparison_axis.plot(
                 [record["n_time"] for record in beam_records],
-                [record["speedup_pipeline"] for record in beam_records],
+                [record[field] for record in beam_records],
                 marker="o", label=f"B={n_beams}",
             )
-        speedup_axis.axhline(1.0, color="black", linestyle="--", linewidth=1.2,
-                             label="CPU = GPU")
-        speedup_axis.set_xscale("log")
-        speedup_axis.set_yscale("log")
-        speedup_axis.set_xlabel("n_time")
-        speedup_axis.set_ylabel("Speedup CPU / pipeline GPU")
-        speedup_axis.set_title(f"Frontera de conveniencia, A={n_ant}")
-        speedup_axis.grid(True, which="both", alpha=0.3)
-        speedup_axis.legend(ncol=2, fontsize=9)
+        if has_cpu_timings:
+            comparison_axis.axhline(
+                1.0, color="black", linestyle="--", linewidth=1.2,
+                label="CPU = GPU")
+            comparison_axis.set_ylabel("Speedup CPU / pipeline GPU")
+            comparison_axis.set_title(f"Frontera de conveniencia, A={n_ant}")
+        else:
+            comparison_axis.set_ylabel("Pipeline GPU [ms]")
+            comparison_axis.set_title(f"Escalamiento GPU por beams, A={n_ant}")
+        comparison_axis.set_xscale("log")
+        comparison_axis.set_yscale("log")
+        comparison_axis.set_xlabel("n_time")
+        comparison_axis.grid(True, which="both", alpha=0.3)
+        comparison_axis.legend(ncol=2, fontsize=9)
 
         throughput_axis = axes[row, 2]
-        for field, label, color in (
-            ("cpu_estimated_flop_per_s", "CPU serial", "tab:blue"),
+        throughput_fields = [
             ("gpu_kernel_estimated_flop_per_s", "CUDA kernel", "tab:orange"),
             ("gpu_pipeline_estimated_flop_per_s", "GPU pipeline", "tab:green"),
-        ):
+        ]
+        if has_cpu_timings:
+            throughput_fields.insert(
+                0, ("cpu_estimated_flop_per_s", "CPU serial", "tab:blue"))
+        for field, label, color in throughput_fields:
             throughput_axis.plot(
                 [record["n_cmac"] for record in maximum],
                 [record[field] / 1.0e9 for record in maximum],
@@ -202,7 +219,8 @@ def plot_performance(summary: list[dict[str, float]], metadata: dict,
     gpu_name = metadata.get("gpu_name", "GPU desconocida")
     repetitions = metadata.get("repetitions", "?")
     figure.suptitle(
-        f"Beamformer CPU/CUDA — {gpu_name}; {repetitions} repeticiones\n"
+        f"Beamformer {'CPU/CUDA' if has_cpu_timings else 'CUDA'} — "
+        f"{gpu_name}; {repetitions} repeticiones\n"
         "Ncmac=T×F×B×A; FLOP estimados=8×Ncmac+3×Noutput",
         fontsize=14,
     )
@@ -261,6 +279,47 @@ def plot_speedup_heatmaps(summary: list[dict[str, float]],
             _annotate_matrix(axis, matrix, ".2g")
             figure.colorbar(image, ax=axis, label="Speedup")
     figure.suptitle("Speedup; el contorno negro marca speedup = 1", fontsize=14)
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+
+
+def plot_gpu_time_heatmaps(summary: list[dict[str, float]],
+                           output_path: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    antenna_values = sorted({int(record["n_ant"]) for record in summary})
+    figure, axes = plt.subplots(
+        len(antenna_values), 2, figsize=(14, 4.8 * len(antenna_values)),
+        squeeze=False, constrained_layout=True,
+    )
+    for row, n_ant in enumerate(antenna_values):
+        for column, (field, title) in enumerate((
+            ("gpu_kernel_ms_median", "CUDA kernel [ms]"),
+            ("gpu_pipeline_wall_ms_median", "GPU pipeline [ms]"),
+        )):
+            beams, times, matrix = matrix_for(summary, n_ant, field)
+            limits = positive_log_limits(matrix)
+            if limits is None:
+                raise ValueError(f"no positive GPU timings for {field}, n_ant={n_ant}")
+            lower, upper = limits
+            upper = max(upper, lower * 1.01)
+            axis = axes[row, column]
+            image = axis.imshow(
+                matrix, aspect="auto", origin="lower", cmap="viridis",
+                norm=LogNorm(vmin=lower, vmax=upper),
+            )
+            axis.set_xticks(np.arange(len(times)), [str(value) for value in times],
+                            rotation=35, ha="right")
+            axis.set_yticks(np.arange(len(beams)), [str(value) for value in beams])
+            axis.set_xlabel("n_time")
+            axis.set_ylabel("n_beams")
+            axis.set_title(f"{title}, n_ant={n_ant}")
+            _annotate_matrix(axis, matrix, ".3g")
+            figure.colorbar(image, ax=axis, label="Tiempo [ms] (escala log)")
+    figure.suptitle("Tiempos GPU; CPU se usa sólo para validación compacta", fontsize=14)
     figure.savefig(output_path, dpi=160)
     plt.close(figure)
 
@@ -325,7 +384,7 @@ def plot_validation(validation: list[dict[str, float]],
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-prefix", type=Path,
-                        default=Path("results/cpu_cuda_benchmark"))
+                        default=Path("results/gpu_benchmark_fft"))
     parser.add_argument("--output-prefix", type=Path)
     return parser.parse_args()
 
@@ -346,15 +405,22 @@ def main() -> None:
 
     summary_path = with_suffix(output_prefix, "_summary.csv")
     performance_path = with_suffix(output_prefix, "_performance.png")
-    speedup_path = with_suffix(output_prefix, "_speedup_heatmaps.png")
+    has_cpu_timings = "cpu_ms_median" in summary[0]
+    heatmap_path = with_suffix(
+        output_prefix,
+        "_speedup_heatmaps.png" if has_cpu_timings else "_gpu_time_heatmaps.png",
+    )
     validation_output_path = with_suffix(output_prefix, "_validation.png")
     write_summary(summary_path, summary)
     plot_performance(summary, metadata, performance_path)
-    plot_speedup_heatmaps(summary, speedup_path)
+    if has_cpu_timings:
+        plot_speedup_heatmaps(summary, heatmap_path)
+    else:
+        plot_gpu_time_heatmaps(summary, heatmap_path)
     plot_validation(validation, validation_output_path)
     print(f"Wrote {summary_path}")
     print(f"Wrote {performance_path}")
-    print(f"Wrote {speedup_path}")
+    print(f"Wrote {heatmap_path}")
     print(f"Wrote {validation_output_path}")
 
 

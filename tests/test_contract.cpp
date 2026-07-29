@@ -87,8 +87,10 @@ int main() {
     validate_dimensions({32, 672, 64, 48});
     validate_dimensions({32, 672, 32, 32});
     validate_dimensions({32, 672, 64, 64});
-    assert(throws_invalid_argument([] { validate_dimensions({32, 672, 32, 33}); }));
-    assert(throws_invalid_argument([] { validate_dimensions({32, 672, 64, 65}); }));
+    validate_dimensions({32, 672, 32, 128});
+    validate_dimensions({32, 672, 64, 128});
+    assert(throws_invalid_argument([] { validate_dimensions({32, 672, 32, 129}); }));
+    assert(throws_invalid_argument([] { validate_dimensions({32, 672, 64, 129}); }));
 
     return 0;
 }

@@ -32,16 +32,17 @@ constexpr double real_flops_per_complex_mac = 8.0;
 constexpr double real_flops_per_intensity = 3.0;
 
 struct Options {
-    std::filesystem::path output_prefix = "results/cpu_cuda_benchmark";
+    std::filesystem::path output_prefix = "results/gpu_benchmark_fft";
     std::vector<std::size_t> antenna_values{32, 64};
-    std::vector<std::size_t> time_values{1, 16, 256, 1024, 4096, 15360};
-    std::vector<std::size_t> beams_32{1, 4, 16, 32};
-    std::vector<std::size_t> beams_64{1, 4, 16, 32, 48, 64};
+    std::vector<std::size_t> time_values{15360, 24576, 30720};
+    std::vector<std::size_t> beam_values{16, 32, 64, 128};
+    std::size_t validation_time = 16;
     std::size_t warmup = 3;
     std::size_t repetitions = 10;
     std::uint32_t seed = 1;
     double absolute_tolerance = 1.0e-3;
     double relative_tolerance = 1.0e-5;
+    bool dry_run = false;
 };
 
 struct ValidationStats {
@@ -61,16 +62,17 @@ struct ValidationStats {
 void print_usage(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n\n"
-        << "  --output-prefix PATH    default: results/cpu_cuda_benchmark\n"
+        << "  --output-prefix PATH    default: results/gpu_benchmark_fft\n"
         << "  --n-ant LIST            comma list from {32,64}; default: 32,64\n"
-        << "  --times LIST            default: 1,16,256,1024,4096,15360\n"
-        << "  --beams-32 LIST         default: 1,4,16,32\n"
-        << "  --beams-64 LIST         default: 1,4,16,32,48,64\n"
+        << "  --times LIST            GPU times; default: 15360,24576,30720\n"
+        << "  --beams LIST            default: 16,32,64,128\n"
+        << "  --validation-time N     compact CPU/CUDA check; default: 16\n"
         << "  --warmup N              default: 3\n"
         << "  --repetitions N         default: 10\n"
         << "  --seed N                default: 1\n"
         << "  --absolute-tolerance X  default: 1e-3\n"
-        << "  --relative-tolerance X  default: 1e-5\n";
+        << "  --relative-tolerance X  default: 1e-5\n"
+        << "  --dry-run               validate and print the matrix only\n";
 }
 
 const char* require_value(const int argc, char** argv, int& index) {
@@ -130,10 +132,11 @@ Options parse_options(const int argc, char** argv) {
             options.antenna_values = parse_list(require_value(argc, argv, i), "--n-ant");
         } else if (argument == "--times") {
             options.time_values = parse_list(require_value(argc, argv, i), "--times");
-        } else if (argument == "--beams-32") {
-            options.beams_32 = parse_list(require_value(argc, argv, i), "--beams-32");
-        } else if (argument == "--beams-64") {
-            options.beams_64 = parse_list(require_value(argc, argv, i), "--beams-64");
+        } else if (argument == "--beams") {
+            options.beam_values = parse_list(require_value(argc, argv, i), "--beams");
+        } else if (argument == "--validation-time") {
+            options.validation_time =
+                parse_size(require_value(argc, argv, i), "--validation-time");
         } else if (argument == "--warmup") {
             options.warmup = parse_size(require_value(argc, argv, i), "--warmup");
         } else if (argument == "--repetitions") {
@@ -148,6 +151,8 @@ Options parse_options(const int argc, char** argv) {
         } else if (argument == "--relative-tolerance") {
             options.relative_tolerance = parse_double(
                 require_value(argc, argv, i), "--relative-tolerance");
+        } else if (argument == "--dry-run") {
+            options.dry_run = true;
         } else {
             throw std::invalid_argument("unknown option: " + argument);
         }
@@ -175,16 +180,19 @@ void validate_options(const Options& options) {
             throw std::invalid_argument("time values must be positive");
         }
     }
-    const auto validate_beams = [](const std::vector<std::size_t>& values,
-                                   const std::size_t n_ant) {
-        for (const std::size_t beams : values) {
-            if (beams == 0 || beams > n_ant) {
-                throw std::invalid_argument("beam values must be between 1 and n_ant");
-            }
+    if (options.validation_time == 0) {
+        throw std::invalid_argument("validation-time must be positive");
+    }
+    for (const std::size_t beams : options.beam_values) {
+        if (beams == 0 || beams > beamformer::maximum_beams) {
+            throw std::invalid_argument("beam values must be between 1 and 128");
         }
-    };
-    validate_beams(options.beams_32, 32);
-    validate_beams(options.beams_64, 64);
+    }
+    for (const std::size_t n_ant : options.antenna_values) {
+        for (const std::size_t beams : options.beam_values) {
+            static_cast<void>(beamformer::fft_beam_grid(n_ant, beams));
+        }
+    }
 }
 
 std::filesystem::path with_suffix(const std::filesystem::path& prefix,
@@ -235,9 +243,7 @@ beamformer::Weights make_benchmark_weights(const std::size_t n_ant,
         1, beamformer::default_frequency_channels, n_ant, n_beams};
     const auto positions = beamformer::default_positions(n_ant);
     const auto frequencies = beamformer::channelized_frequencies(dims.n_freq);
-    const auto directions = n_beams == n_ant
-                                ? beamformer::rectangular_beam_grid(n_ant)
-                                : beamformer::default_beam_grid(n_beams);
+    const auto directions = beamformer::fft_beam_grid(n_ant, n_beams);
     return beamformer::generate_weights(dims, positions, frequencies, directions);
 }
 
@@ -345,17 +351,16 @@ ValidationStats compare_outputs(const beamformer::Intensities& cpu,
 void write_timing_header(std::ofstream& output) {
     output
         << "n_ant,n_freq,n_beams,n_time,repeat,n_outputs,n_cmac,estimated_flop,"
-           "cuda_setup_ms,weights_h2d_ms,cpu_ms,gpu_kernel_ms,gpu_h2d_ms,"
+           "cuda_setup_ms,weights_h2d_ms,gpu_kernel_ms,gpu_h2d_ms,"
            "gpu_pipeline_kernel_ms,gpu_d2h_ms,gpu_pipeline_event_ms,"
-           "gpu_pipeline_wall_ms,cpu_cmac_per_s,gpu_kernel_cmac_per_s,"
-           "gpu_pipeline_cmac_per_s,cpu_estimated_flop_per_s,"
-           "gpu_kernel_estimated_flop_per_s,gpu_pipeline_estimated_flop_per_s,"
-           "speedup_kernel,speedup_pipeline\n";
+           "gpu_pipeline_wall_ms,gpu_kernel_cmac_per_s,"
+           "gpu_pipeline_cmac_per_s,gpu_kernel_estimated_flop_per_s,"
+           "gpu_pipeline_estimated_flop_per_s\n";
 }
 
 void write_timing_row(std::ofstream& output, const beamformer::Dimensions& dims,
                       const std::size_t repeat, const double setup_ms,
-                      const double weights_h2d_ms, const double cpu_ms,
+                      const double weights_h2d_ms,
                       const double gpu_kernel_ms,
                       const beamformer::CudaBeamformerTimings& pipeline,
                       const double pipeline_wall_ms) {
@@ -366,17 +371,14 @@ void write_timing_row(std::ofstream& output, const beamformer::Dimensions& dims,
                                      + pipeline.device_to_host_ms;
     output << dims.n_ant << ',' << dims.n_freq << ',' << dims.n_beams << ','
            << dims.n_time << ',' << repeat << ',' << outputs << ',' << cmac << ','
-           << flops << ',' << setup_ms << ',' << weights_h2d_ms << ',' << cpu_ms
-           << ',' << gpu_kernel_ms << ',' << pipeline.host_to_device_ms << ','
+           << flops << ',' << setup_ms << ',' << weights_h2d_ms << ','
+           << gpu_kernel_ms << ',' << pipeline.host_to_device_ms << ','
            << pipeline.kernel_ms << ',' << pipeline.device_to_host_ms << ','
            << pipeline_event_ms << ',' << pipeline_wall_ms << ','
-           << rate_per_second(static_cast<double>(cmac), cpu_ms) << ','
            << rate_per_second(static_cast<double>(cmac), gpu_kernel_ms) << ','
            << rate_per_second(static_cast<double>(cmac), pipeline_wall_ms) << ','
-           << rate_per_second(flops, cpu_ms) << ','
            << rate_per_second(flops, gpu_kernel_ms) << ','
-           << rate_per_second(flops, pipeline_wall_ms) << ','
-           << cpu_ms / gpu_kernel_ms << ',' << cpu_ms / pipeline_wall_ms << '\n';
+           << rate_per_second(flops, pipeline_wall_ms) << '\n';
     output.flush();
 }
 
@@ -401,11 +403,6 @@ void write_validation_row(std::ofstream& output,
     output.flush();
 }
 
-const std::vector<std::size_t>& beams_for(const Options& options,
-                                         const std::size_t n_ant) {
-    return n_ant == 32 ? options.beams_32 : options.beams_64;
-}
-
 void print_memory_estimate(const std::size_t n_ant, const std::size_t max_time,
                            const std::size_t max_beams) {
     const beamformer::Dimensions capacity{
@@ -417,7 +414,7 @@ void print_memory_estimate(const std::size_t n_ant, const std::size_t max_time,
     const double intensity_bytes = static_cast<double>(output_count(capacity)
                                                         * sizeof(float));
     std::cout << "n_ant=" << n_ant << " max host working set ~= "
-              << (voltage_bytes + 2.0 * intensity_bytes + weight_bytes) / bytes_per_gib
+              << (voltage_bytes + intensity_bytes + weight_bytes) / bytes_per_gib
               << " GiB; max GPU workspace ~= "
               << (voltage_bytes + intensity_bytes + weight_bytes) / bytes_per_gib
               << " GiB\n";
@@ -427,9 +424,10 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
                         std::ofstream& timings_output,
                         std::ofstream& validation_output,
                         beamformer::CudaDeviceInfo& device_info) {
-    const auto& beam_values = beams_for(options, n_ant);
-    const std::size_t max_time = *std::max_element(options.time_values.begin(),
-                                                  options.time_values.end());
+    const auto& beam_values = options.beam_values;
+    const std::size_t max_time = std::max(
+        options.validation_time,
+        *std::max_element(options.time_values.begin(), options.time_values.end()));
     const std::size_t max_beams = *std::max_element(beam_values.begin(),
                                                    beam_values.end());
     print_memory_estimate(n_ant, max_time, max_beams);
@@ -450,38 +448,47 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
         const beamformer::Dimensions weight_dims{
             1, beamformer::default_frequency_channels, n_ant, n_beams};
         const double weights_h2d_ms = workspace.upload_weights(weights, weight_dims);
+
+        const beamformer::Dimensions validation_dims{
+            options.validation_time, beamformer::default_frequency_channels,
+            n_ant, n_beams};
+        const std::size_t validation_outputs =
+            static_cast<std::size_t>(output_count(validation_dims));
+        beamformer::Intensities cpu_validation(validation_outputs);
+        beamformer::Intensities gpu_validation(validation_outputs);
+        const auto cpu_start = Clock::now();
+        beamformer::cpu_beamform_intensity_into(
+            voltage, weights, validation_dims, cpu_validation);
+        const auto cpu_end = Clock::now();
+        const auto gpu_validation_timing =
+            workspace.run_pipeline(voltage, gpu_validation, validation_dims);
+        const auto validation = compare_outputs(
+            cpu_validation, gpu_validation, validation_dims,
+            options.absolute_tolerance, options.relative_tolerance);
+        write_validation_row(validation_output, validation_dims, validation);
+        std::cout << "validate A=" << n_ant << " B=" << n_beams
+                  << " T=" << options.validation_time
+                  << " cpu_ms=" << wall_ms(cpu_start, cpu_end)
+                  << " gpu_pipeline_event_ms="
+                  << gpu_validation_timing.host_to_device_ms
+                         + gpu_validation_timing.kernel_ms
+                         + gpu_validation_timing.device_to_host_ms
+                  << " max_rel=" << validation.max_relative_error
+                  << " outside=" << validation.outside_tolerance
+                  << " peaks=" << validation.cpu_peak_beam << '/'
+                  << validation.gpu_peak_beam << std::endl;
+        if (validation.outside_tolerance != 0
+            || validation.cpu_peak_beam != validation.gpu_peak_beam) {
+            throw std::runtime_error(
+                "compact CPU/CUDA validation failed for benchmark configuration");
+        }
+
         for (const std::size_t n_time : options.time_values) {
             const beamformer::Dimensions dims{
                 n_time, beamformer::default_frequency_channels, n_ant, n_beams};
             const std::size_t outputs = static_cast<std::size_t>(output_count(dims));
-            beamformer::Intensities cpu_output(outputs);
             beamformer::Intensities gpu_output(outputs);
             workspace.upload_voltage(voltage, dims);
-
-            for (std::size_t warmup = 0; warmup < options.warmup; ++warmup) {
-                const auto cpu_start = Clock::now();
-                beamformer::cpu_beamform_intensity_into(voltage, weights, dims,
-                                                        cpu_output);
-                const auto cpu_end = Clock::now();
-                std::cout << "cpu warmup " << warmup + 1 << '/' << options.warmup
-                          << " A=" << n_ant << " B=" << n_beams
-                          << " T=" << n_time
-                          << " cpu_ms=" << wall_ms(cpu_start, cpu_end)
-                          << std::endl;
-            }
-
-            std::vector<double> cpu_times(options.repetitions);
-            for (std::size_t repeat = 0; repeat < options.repetitions; ++repeat) {
-                const auto cpu_start = Clock::now();
-                beamformer::cpu_beamform_intensity_into(voltage, weights, dims,
-                                                        cpu_output);
-                const auto cpu_end = Clock::now();
-                cpu_times[repeat] = wall_ms(cpu_start, cpu_end);
-                std::cout << "cpu measure " << repeat + 1 << '/'
-                          << options.repetitions << " A=" << n_ant
-                          << " B=" << n_beams << " T=" << n_time
-                          << " cpu_ms=" << cpu_times[repeat] << std::endl;
-            }
 
             for (std::size_t warmup = 0; warmup < options.warmup; ++warmup) {
                 const double kernel_ms = workspace.run_kernel(dims);
@@ -507,29 +514,16 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
                 const auto pipeline_end = Clock::now();
                 pipeline_wall_times[repeat] = wall_ms(pipeline_start, pipeline_end);
                 write_timing_row(timings_output, dims, repeat, workspace.setup_ms(),
-                                 weights_h2d_ms, cpu_times[repeat],
-                                 gpu_kernel_times[repeat], pipeline_times[repeat],
+                                 weights_h2d_ms, gpu_kernel_times[repeat],
+                                 pipeline_times[repeat],
                                  pipeline_wall_times[repeat]);
                 std::cout << "gpu measure " << repeat + 1 << '/'
                           << options.repetitions << " A=" << n_ant
                           << " B=" << n_beams << " T=" << n_time
                           << " kernel_ms=" << gpu_kernel_times[repeat]
                           << " pipeline_ms=" << pipeline_wall_times[repeat]
-                          << " speedup_pipeline="
-                          << cpu_times[repeat] / pipeline_wall_times[repeat]
                           << std::endl;
             }
-
-            const auto validation = compare_outputs(
-                cpu_output, gpu_output, dims, options.absolute_tolerance,
-                options.relative_tolerance);
-            write_validation_row(validation_output, dims, validation);
-            std::cout << "validate A=" << n_ant << " B=" << n_beams
-                      << " T=" << n_time
-                      << " max_rel=" << validation.max_relative_error
-                      << " outside=" << validation.outside_tolerance
-                      << " peaks=" << validation.cpu_peak_beam << '/'
-                      << validation.gpu_peak_beam << std::endl;
         }
     }
 }
@@ -561,18 +555,20 @@ void write_metadata(const std::filesystem::path& path, const Options& options,
     write_list(options.antenna_values);
     output << ",\n  \"n_time\": ";
     write_list(options.time_values);
-    output << ",\n  \"n_beams_32\": ";
-    write_list(options.beams_32);
-    output << ",\n  \"n_beams_64\": ";
-    write_list(options.beams_64);
-    output << ",\n  \"warmup\": " << options.warmup
+    output << ",\n  \"n_beams\": ";
+    write_list(options.beam_values);
+    output << ",\n  \"validation_n_time\": " << options.validation_time
+           << ",\n  \"warmup\": " << options.warmup
            << ",\n  \"repetitions\": " << options.repetitions
            << ",\n  \"seed\": " << options.seed
            << ",\n  \"absolute_tolerance\": " << options.absolute_tolerance
            << ",\n  \"relative_tolerance\": " << options.relative_tolerance
            << ",\n  \"complex_mac_real_flops\": " << real_flops_per_complex_mac
            << ",\n  \"intensity_real_flops\": " << real_flops_per_intensity
-           << ",\n  \"cpu_threads\": 1,\n"
+           << ",\n  \"timed_backend\": \"cuda\""
+           << ",\n  \"cpu_validation_threads\": 1"
+           << ",\n  \"beam_grid\": \"centered zero-padded rectangular FFT bins\""
+           << ",\n  \"temporal_chunking\": false,\n"
            << "  \"voltage_pattern\": \"one seeded int4 noise spectrum repeated over time\"\n"
            << "}\n";
 }
@@ -583,6 +579,23 @@ int main(int argc, char** argv) {
     try {
         const auto options = parse_options(argc, argv);
         validate_options(options);
+        if (options.dry_run) {
+            const std::size_t max_time = std::max(
+                options.validation_time,
+                *std::max_element(options.time_values.begin(),
+                                  options.time_values.end()));
+            const std::size_t max_beams = *std::max_element(
+                options.beam_values.begin(), options.beam_values.end());
+            std::cout << "GPU-only timing matrix: "
+                      << options.antenna_values.size() * options.beam_values.size()
+                             * options.time_values.size()
+                      << " configurations; CPU/CUDA validation T="
+                      << options.validation_time << '\n';
+            for (const std::size_t n_ant : options.antenna_values) {
+                print_memory_estimate(n_ant, max_time, max_beams);
+            }
+            return 0;
+        }
         const auto parent = options.output_prefix.parent_path();
         if (!parent.empty()) {
             std::filesystem::create_directories(parent);

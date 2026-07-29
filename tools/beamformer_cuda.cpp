@@ -49,7 +49,7 @@ void print_usage(const char* program) {
         << " --input FILE --weights FILE --output FILE [options]\n\n"
         << "  --n-time N              default: 32\n"
         << "  --n-ant N               32 or 64; default: 64\n"
-        << "  --n-beams N             1 to n-ant; default: 5\n"
+        << "  --n-beams N             1 to 128; default: 5\n"
         << "  --metrics FILE          append timing row to CSV\n";
 }
 

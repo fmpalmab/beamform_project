@@ -6,6 +6,7 @@
 namespace beamformer {
 
 inline constexpr std::size_t default_frequency_channels = 672;
+inline constexpr std::size_t maximum_beams = 128;
 inline constexpr std::size_t rfsoc_channels_per_subband = 168;
 inline constexpr std::size_t rfsoc_subbands_per_nic = 2;
 inline constexpr std::size_t rfsoc_channels_per_nic =
@@ -33,8 +34,8 @@ inline void validate_dimensions(const Dimensions& dims) {
     if (dims.n_ant != 32 && dims.n_ant != 64) {
         throw std::invalid_argument("n_ant must be either 32 or 64");
     }
-    if (dims.n_beams == 0 || dims.n_beams > dims.n_ant) {
-        throw std::invalid_argument("n_beams must be between 1 and n_ant");
+    if (dims.n_beams == 0 || dims.n_beams > maximum_beams) {
+        throw std::invalid_argument("n_beams must be between 1 and 128");
     }
 }
 

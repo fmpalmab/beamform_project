@@ -15,8 +15,8 @@ CUDA implementation are available:
 - regular 4x8 and 8x8 array geometries with 0.6 m spacing in x and y;
 - 672 frequency centers `300 + 0.3*channel` MHz, spanning 300 to 501.3 MHz;
 - optional position and frequency overrides from text files;
-- deterministic beam grids in direction cosines;
-- 1 to `n_ant` beams, including compact validation and final 32/64-beam grids;
+- deterministic zero-padded FFT-bin beam grids in direction cosines;
+- 1 to 128 beams for 32- or 64-element arrays;
 - one-hot, constant, point-source, and seeded-noise voltage generation;
 - a small `generate_fake_data` CLI that writes headerless RFSoC-layout files;
 - geometric complex `float32` weights in `[beam][frequency][element]` order;
@@ -28,7 +28,7 @@ CUDA implementation are available:
   same `ComplexFloat` voltage and weight arrays;
 - strict binary-size validation and optional per-run CSV timing metrics.
 
-The complete CPU/CUDA validation matrix, repeatable timing sweep, summary tables, and
+Compact CPU/CUDA validation, a repeatable GPU-only timing sweep, summary tables, and
 comparison plots are available. CPU point-source validation and full-sky beam-coverage
 plots are also included.
 
@@ -66,6 +66,7 @@ with:
 conda run -n kotekan_test python tools/plot_results.py \
     --input results/point_source_32beam_nxd_grid_cpu_intensity.bin --label CPU \
     --n-time 4 --n-freq 672 --n-ant 32 --n-beams 32 \
+    --beam-grid legacy-rectangular \
     --synthetic-type point-source \
     --source-l 0.078070952604 --source-m -0.156141905208 --amplitude 4 \
     --output results/cpu_32beam_point_source_validation_nxd_grid.png
@@ -73,6 +74,7 @@ conda run -n kotekan_test python tools/plot_results.py \
 conda run -n kotekan_test python tools/plot_results.py \
     --input results/point_source_32beam_nxd_grid_gpu_intensity.bin --label GPU \
     --n-time 4 --n-freq 672 --n-ant 32 --n-beams 32 \
+    --beam-grid legacy-rectangular \
     --synthetic-type point-source \
     --source-l 0.078070952604 --source-m -0.156141905208 --amplitude 4 \
     --output results/gpu_32beam_point_source_validation_nxd_grid.png
@@ -110,11 +112,18 @@ Each command below writes exactly `n_time * 672 * n_ant` bytes:
 The point source uses
 `x_a[f] = A * exp(-j * 2*pi*frequency[f]*dot(position[a], direction)/c)`,
 quantized to signed `int4`, and repeats that spectrum for every requested time sample.
-For non-final validation and benchmark beam counts, the default line uses
-`l=(beam-floor(n_beams/2))*0.02`, `m=0`. When `n_beams=n_ant`, a rectangular grid is
-designed at 400 MHz using `delta_l=lambda/(N_x*d)` and
-`delta_m=lambda/(N_y*d)`; its fixed directions are reused at every channel while weights
-remain frequency-dependent.
+Default weights use centers selected from the native bin bank of a zero-padded `(2M,2N)`
+FFT geometry. This only defines beam directions: the CPU and CUDA implementations remain
+direct voltage beamformers. At the 400 MHz design frequency,
+`du=lambda/(2*M*d)` and `dv=lambda/(2*N*d)`. A centered candidate window is ranked by
+radial distance and truncated to `n_beams`; the selected directions stay fixed while
+weights remain frequency-dependent. `--beam-grid line` retains the earlier one-dimensional
+grid, and `--beam-grid legacy-rectangular` reproduces existing 32/64-beam artifacts.
+
+For 32 antennas, `(M,N)=(8,4)` gives a `16x8` bank and exactly 128 possible centers. For
+64 antennas, `(M,N)=(8,8)` gives a `16x16` bank; 128 beams use a centered `12x11` candidate
+window followed by radial truncation. Hexagonal FoV count and target-lattice helpers are
+available for design studies, but are not yet mapped to hardware FFT bins.
 
 ## Generate weights and run CPU/CUDA
 
@@ -123,7 +132,7 @@ the default synthetic point source with the last beam:
 
 ```bash
 ./build/generate_weights \
-    --n-ant 64 --n-beams 5 \
+    --n-ant 64 --n-beams 5 --beam-grid line \
     --output weights.bin
 
 ./build/beamformer_cpu \
@@ -163,6 +172,7 @@ parameters used to generate the input:
 conda run -n kotekan_test python tools/plot_results.py \
     --input cpu_intensity.bin \
     --n-time 32 --n-freq 672 --n-ant 64 --n-beams 5 \
+    --beam-grid line \
     --synthetic-type point-source \
     --source-l 0.04 --source-m 0.0 --amplitude 4 \
     --label CPU \
@@ -189,6 +199,7 @@ Generate the complete local `l-m` coverage without requiring an intensity file:
 ```bash
 conda run -n kotekan_test python tools/plot_results.py \
     --n-ant 32 --n-beams 32 \
+    --beam-grid legacy-rectangular \
     --spacing-m 0.6 \
     --frequency-start-hz 300000000 \
     --channel-width-hz 300000 \
@@ -221,6 +232,7 @@ conda run -n kotekan_test python tools/plot_results.py \
     --input cpu_intensity.bin --label CPU \
     --compare cuda_intensity.bin --compare-label CUDA \
     --n-time 32 --n-freq 672 --n-ant 64 --n-beams 5 \
+    --beam-grid line \
     --synthetic-type point-source --source-l 0.04 --source-m 0.0 \
     --output results/cpu_cuda_validation.png \
     --comparison-output results/cpu_cuda_comparison.png \
@@ -281,35 +293,42 @@ about 0.070 ms in the kernel, while the first-process CUDA setup took about 91 m
 numbers only establish that the implementation runs and is numerically sensible; they are
 not the final CPU/GPU performance result.
 
-## Reproducible CPU/CUDA benchmark
+## Reproducible GPU benchmark with compact CPU validation
 
-The benchmark keeps `F=672` fixed and runs the agreed matrix:
+The benchmark keeps `F=672` fixed and uses this default matrix:
 
-- `n_ant=32`, `n_beams={1,4,16,32}`;
-- `n_ant=64`, `n_beams={1,4,16,32,48,64}`;
-- `n_time={1,16,256,1024,4096,15360}`;
-- three warmups and ten measured repetitions by default.
+- `n_ant={32,64}`;
+- `n_beams={16,32,64,128}`;
+- GPU timing at `n_time={15360,24576,30720}`;
+- one CPU/CUDA numerical comparison per antenna/beam pair at `n_time=16`;
+- three GPU warmups and ten measured repetitions.
+
+The 24 long configurations never execute the serial CPU implementation. First verify the
+matrix and maximum allocations without creating a CUDA context or output files:
+
+```bash
+./build/benchmark_cpu_cuda --dry-run
+```
+
+On the tested configuration this reports maximum host/GPU working sets of approximately
+14.79 GiB for 32 antennas and 19.73 GiB for 64 antennas. Then run and plot with:
 
 ```bash
 ./build/benchmark_cpu_cuda \
-    --output-prefix results/cpu_cuda_benchmark
+    --output-prefix results/gpu_benchmark_fft
 
 conda run -n kotekan_test python tools/plot_benchmark.py \
-    --input-prefix results/cpu_cuda_benchmark
+    --input-prefix results/gpu_benchmark_fft
 ```
 
 The process generates one deterministic signed-`int4` noise spectrum per antenna count
-and repeats it over time outside all timed regions. CPU and CUDA consume the same
-unpacked values and weights. CPU and GPU measurements run in separate warm blocks so a
-long serial CPU iteration does not cool the GPU immediately before its sample.
+and repeats it over time outside timed regions. Compact CPU validation and all GPU runs
+consume the same unpacked prefix and FFT-grid weights. The principal steady-state metric
+keeps weights resident on the GPU. It reports resident CUDA kernel time and pipeline wall
+time containing voltage H2D, kernel, output D2H, and synchronization; context/buffer setup
+and the one-time weight upload are recorded separately.
 
-The principal steady-state comparison keeps weights resident on the GPU. It reports a
-resident CUDA kernel time and a pipeline wall time containing voltage H2D, kernel, output
-D2H, and synchronization. Context/buffer setup and the one-time weight upload are recorded
-separately. For the maximum 64-antenna case, the estimated working sets are approximately
-9.86 GiB on the host and 7.40 GiB on the GPU.
-
-Work and throughput use these explicit conventions:
+Work and throughput use these conventions:
 
 ```text
 Ncmac = n_time * n_freq * n_beams * n_ant
@@ -318,47 +337,31 @@ estimated_FLOP = 8 * Ncmac + 3 * (n_time * n_freq * n_beams)
 
 `Ncmac/time` is reported as CMAC/s. Estimated FLOP/s counts eight real operations per
 complex multiply-accumulate and three for the final squared magnitude. CSV results contain
-every repetition; plots use medians and p25/p75 intervals.
-
-### RTX 4090 benchmark result
-
-The full default sweep produced 600 timing samples and 60 numerical comparisons. With one
-beam, the end-to-end GPU pipeline first exceeds the serial CPU at `n_time=16` for both
-antenna counts. With four or more beams, it is already faster at `n_time=1`.
-
-For `n_ant=64`, `n_beams=64`, and `n_time=15360`, median time was 42.331 s on the serial
-CPU, 254.321 ms for the resident CUDA kernel, and 953.775 ms for voltage H2D + kernel +
-intensity D2H. This corresponds to `166.45x` kernel-only and `44.38x` pipeline speedup.
-The same configuration reached an estimated 1.338 TFLOP/s in the kernel and 356.7 GFLOP/s
-including transfers. Its CPU and pipeline p25/p75 intervals were 39.083-43.097 s and
-953.235-955.690 ms, respectively, so plots should be interpreted from medians and their
-intervals rather than individual samples.
-
-All 60 configurations passed the combined `atol=1e-3`, `rtol=1e-5` criterion with zero
-values outside tolerance and no CPU/GPU peak-beam mismatches. Across the sweep,
-`max_absolute_error=0.005859375`, maximum sampled p99 relative error was `9.77e-7`, maximum
-normalized RMSE was `1.18e-7`, and minimum correlation was `0.999999999945`.
+every GPU repetition; plots use medians and p25/p75 intervals. Speedups are intentionally
+not reported because the long CPU cases are not measured.
 
 Generated products are:
 
-- `results/cpu_cuda_benchmark_timings.csv`;
-- `results/cpu_cuda_benchmark_validation.csv`;
-- `results/cpu_cuda_benchmark_metadata.json`;
-- `results/cpu_cuda_benchmark_summary.csv`;
-- `results/cpu_cuda_benchmark_performance.png`;
-- `results/cpu_cuda_benchmark_speedup_heatmaps.png`;
-- `results/cpu_cuda_benchmark_validation.png`.
+- `results/gpu_benchmark_fft_timings.csv`;
+- `results/gpu_benchmark_fft_validation.csv`;
+- `results/gpu_benchmark_fft_metadata.json`;
+- `results/gpu_benchmark_fft_summary.csv`;
+- `results/gpu_benchmark_fft_performance.png`;
+- `results/gpu_benchmark_fft_gpu_time_heatmaps.png`;
+- `results/gpu_benchmark_fft_validation.png`.
 
-In the numerical-validation dashboard, exact zeros are not replaced by an artificial
-floor. Positive errors use logarithmic color normalization, zero-error cells are white,
-and an all-zero outside-tolerance panel is light green. Cell annotations remain the exact
-CSV values.
+Temporal chunking remains intentionally pending. Each current configuration allocates and
+transfers its complete `n_time` voltage and intensity products; do not increase the default
+maximum beyond the available device memory without implementing chunked execution.
 
 For a short functional check before a full run:
 
 ```bash
 ./build/benchmark_cpu_cuda \
-    --output-prefix /tmp/cpu_cuda_benchmark_smoke \
-    --n-ant 32 --times 1,16 --beams-32 1,4 \
+    --output-prefix /tmp/gpu_benchmark_fft_smoke \
+    --n-ant 32 --beams 16 --times 16 --validation-time 2 \
     --warmup 1 --repetitions 2
 ```
+
+The existing `results/cpu_cuda_benchmark_*` files are the archived pre-change CPU/CUDA
+sweep. The new default prefix deliberately avoids overwriting them.

@@ -56,6 +56,7 @@ int main() {
                                      + direction[2] * direction[2]);
         assert(std::abs(norm - 1.0F) < 1.0e-6F);
     }
+    assert(default_beam_grid(128, 0.005F).size() == 128);
 
     const auto beams_32 = rectangular_beam_grid(32);
     assert(beams_32.size() == 32);
@@ -77,6 +78,50 @@ int main() {
     }
     const auto beams_64 = rectangular_beam_grid(64);
     assert(beams_64.size() == 64);
+
+    const auto centered_4 = centered_integer_range(4);
+    assert((centered_4 == std::vector<long long>{-2, -1, 0, 1}));
+
+    const float fft_delta_u = wavelength_400_m / (2.0F * 8.0F * default_spacing_m);
+    const float fft_delta_v_32 =
+        wavelength_400_m / (2.0F * 4.0F * default_spacing_m);
+    const auto fft_selection_32 = select_fft_beam_centers_rectangular(
+        fft_delta_u, fft_delta_v_32, 128, 8, 4);
+    assert(fft_selection_32.centers.size() == 128);
+    assert(fft_selection_32.n_u == 16);
+    assert(fft_selection_32.n_v == 8);
+    assert(fft_selection_32.n_bank_u == 16);
+    assert(fft_selection_32.n_bank_v == 8);
+    assert((fft_selection_32.centers.front() == Vec2{0.0F, 0.0F}));
+
+    const auto fft_directions_32 = fft_beam_grid(32, 128);
+    assert(fft_directions_32.size() == 128);
+    for (const auto& direction : fft_directions_32) {
+        const float norm = std::sqrt(direction[0] * direction[0]
+                                     + direction[1] * direction[1]
+                                     + direction[2] * direction[2]);
+        assert(std::abs(norm - 1.0F) < 1.0e-6F);
+    }
+
+    const auto fft_selection_64 = select_fft_beam_centers_rectangular(
+        fft_delta_u, fft_delta_u, 128, 8, 8);
+    assert(fft_selection_64.centers.size() == 128);
+    assert(fft_selection_64.n_u == 12);
+    assert(fft_selection_64.n_v == 11);
+    assert(fft_selection_64.n_bank_u == 16);
+    assert(fft_selection_64.n_bank_v == 16);
+
+    const auto hex_estimate = estimate_nbeams_hex_formula(
+        default_spacing_m, 8, 8, 108.0F, 74.0F, wavelength_400_m);
+    assert(hex_estimate > 0);
+    const auto hex_targets = generate_hex_targets_cropped_fov(128, 0.8F, 0.6F);
+    assert(hex_targets.size() == 128);
+    for (const auto& target : hex_targets) {
+        const float elliptical_radius =
+            target[0] * target[0] / (0.8F * 0.8F)
+            + target[1] * target[1] / (0.6F * 0.6F);
+        assert(elliptical_radius <= 1.0F + 1.0e-6F);
+    }
 
     const auto temp_dir = std::filesystem::temp_directory_path();
     const auto positions_path = temp_dir / "beamformer_poc_positions_test.txt";

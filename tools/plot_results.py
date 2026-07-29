@@ -18,6 +18,7 @@ DEFAULT_FREQUENCY_START_HZ = 300_000_000.0
 DEFAULT_CHANNEL_WIDTH_HZ = 300_000.0
 BEAM_GRID_DESIGN_FREQUENCY_HZ = 400_000_000.0
 DEFAULT_SPACING_M = 0.6
+ETA_HEX = np.pi / (2.0 * np.sqrt(3.0))
 ANTENNA_SPECS = {
     300e6: {"BW_E": 92.0, "BW_H": 66.0, "gain_dBi": 8.7},
     400e6: {"BW_E": 108.0, "BW_H": 74.0, "gain_dBi": 7.75},
@@ -53,8 +54,8 @@ def default_positions(n_ant: int, spacing_m: float = DEFAULT_SPACING_M) -> np.nd
 
 def default_beam_directions(n_beams: int, l_step: float = 0.02,
                             m: float = 0.0) -> np.ndarray:
-    if not 1 <= n_beams <= 64:
-        raise ValueError("n_beams must be between 1 and 64")
+    if not 1 <= n_beams <= 128:
+        raise ValueError("n_beams must be between 1 and 128")
     center = n_beams // 2
     directions = []
     for beam in range(n_beams):
@@ -80,6 +81,154 @@ def array_shape(n_ant: int) -> tuple[int, int]:
     if n_ant == 64:
         return 8, 8
     raise ValueError("n_ant must be 32 or 64")
+
+
+def centered_integer_range(n: int) -> np.ndarray:
+    """Centered integer indices of length n (e.g. n=4 -> [-2, -1, 0, 1])."""
+    if n <= 0:
+        raise ValueError("centered integer range length must be positive")
+    start = -int(np.floor(n / 2))
+    return np.arange(start, start + n)
+
+
+def select_fft_beam_centers_rectangular(
+    du_fft_u: float,
+    dv_fft_v: float,
+    n_beams: int,
+    m_side: int,
+    n_side: int,
+) -> tuple[list[tuple[float, float]], int, int, int, int]:
+    """Select a centered block from the (2M)x(2N) zero-padded FFT bin bank."""
+    if du_fft_u <= 0.0 or dv_fft_v <= 0.0 or not np.isfinite(du_fft_u + dv_fft_v):
+        raise ValueError("FFT beam spacing must be positive and finite")
+    if n_beams <= 0 or m_side <= 0 or n_side <= 0:
+        raise ValueError("beam count and array sides must be positive")
+
+    n_bank_u = 2 * m_side
+    n_bank_v = 2 * n_side
+    n_bank_total = n_bank_u * n_bank_v
+    if n_beams > n_bank_total:
+        raise ValueError(
+            f"n-beams must be <= (2M)*(2N) = {n_bank_total} "
+            f"for M={m_side}, N={n_side}"
+        )
+
+    n_u = int(np.ceil(np.sqrt(n_beams)))
+    n_v = int(np.ceil(n_beams / n_u))
+    if n_u > n_bank_u:
+        n_u = n_bank_u
+        n_v = int(np.ceil(n_beams / n_u))
+    if n_v > n_bank_v:
+        n_v = n_bank_v
+        # Recompute the other dimension after clamping. This is required for
+        # A=32, B=128, whose complete bank is 16x8.
+        n_u = int(np.ceil(n_beams / n_v))
+    if n_u > n_bank_u or n_u * n_v < n_beams:
+        raise RuntimeError("failed to select a sufficient FFT beam window")
+
+    iu = centered_integer_range(n_u)
+    iv = centered_integer_range(n_v)
+    centers_ranked: list[tuple[float, float, float]] = []
+    for i in iu:
+        for j in iv:
+            u0 = float(i * du_fft_u)
+            v0 = float(j * dv_fft_v)
+            centers_ranked.append((u0 * u0 + v0 * v0, u0, v0))
+    centers_ranked.sort(key=lambda value: (value[0], value[1], value[2]))
+    centers = [(u0, v0) for _, u0, v0 in centers_ranked[:n_beams]]
+    return centers, n_u, n_v, n_bank_u, n_bank_v
+
+
+def fft_beam_directions(
+    n_ant: int,
+    n_beams: int,
+    spacing_m: float = DEFAULT_SPACING_M,
+    design_frequency_hz: float = BEAM_GRID_DESIGN_FREQUENCY_HZ,
+) -> np.ndarray:
+    """Directions selected from FFT-bin geometry for the direct beamformer."""
+    rows, columns = array_shape(n_ant)
+    wavelength_m = SPEED_OF_LIGHT_M_PER_S / design_frequency_hz
+    du_fft_u = wavelength_m / (2 * columns * spacing_m)
+    dv_fft_v = wavelength_m / (2 * rows * spacing_m)
+    centers, _, _, _, _ = select_fft_beam_centers_rectangular(
+        du_fft_u, dv_fft_v, n_beams, columns, rows)
+    directions = []
+    for u_value, v_value in centers:
+        transverse_squared = u_value * u_value + v_value * v_value
+        if transverse_squared > 1.0:
+            raise ValueError("the selected FFT beam grid extends outside the visible sky")
+        directions.append(
+            (u_value, v_value, math.sqrt(1.0 - transverse_squared)))
+    return np.asarray(directions, dtype=np.float64)
+
+
+def fov_axis(n_points: int, u_fov: float) -> np.ndarray:
+    if n_points <= 1:
+        return np.array([0.0])
+    return np.linspace(-u_fov, u_fov, n_points)
+
+
+def estimate_nbeams_hex_formula(
+    d_m: float,
+    m_side: int,
+    n_side: int,
+    bw_e_deg: float,
+    bw_h_deg: float,
+    wavelength_m: float,
+) -> int:
+    """Estimate hex beam count over the requested E/H field of view."""
+    d_u = d_m * (m_side - 1)
+    d_v = d_m * (n_side - 1)
+    bw_e_rad = np.radians(bw_e_deg)
+    bw_h_rad = np.radians(bw_h_deg)
+    n_est = (
+        ETA_HEX
+        * 4.0
+        * d_u
+        * d_v
+        * np.sin(bw_e_rad / 2.0)
+        * np.sin(bw_h_rad / 2.0)
+        * (wavelength_m ** -2)
+    )
+    return max(1, int(np.ceil(n_est)))
+
+
+def generate_hex_targets_cropped_fov(
+    n_beams: int,
+    u_max: float,
+    v_max: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generate a hexagonal target lattice cropped by an FoV ellipse."""
+    if n_beams <= 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    s_unit = np.sqrt((2.0 * np.pi) / (np.sqrt(3.0) * n_beams))
+    points_u: list[float] = []
+    points_v: list[float] = []
+    for _ in range(10):
+        points_u.clear()
+        points_v.clear()
+        dy = np.sqrt(3.0) * 0.5 * s_unit
+        j_max = int(np.ceil(1.0 / max(dy, 1e-12))) + 2
+        i_max = int(np.ceil(1.0 / max(s_unit, 1e-12))) + 2
+        for j in range(-j_max, j_max + 1):
+            y = j * dy
+            x_shift = 0.5 * s_unit if (j % 2 != 0) else 0.0
+            for i in range(-i_max, i_max + 1):
+                x = i * s_unit + x_shift
+                if x * x + y * y <= 1.0:
+                    points_u.append(float(x * u_max))
+                    points_v.append(float(y * v_max))
+        if len(points_u) >= n_beams:
+            break
+        s_unit *= 0.9
+
+    if not points_u:
+        return np.array([0.0]), np.array([0.0])
+    uu = np.array(points_u, dtype=float)
+    vv = np.array(points_v, dtype=float)
+    order = np.argsort(uu**2 + vv**2)[:n_beams]
+    return uu[order], vv[order]
 
 
 def rectangular_beam_directions(
@@ -279,10 +428,16 @@ def _load_geometry(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np
         raise ValueError(f"frequencies must contain exactly {args.n_freq} positive values")
 
     directions = (_text_rows(args.directions, 3) if args.directions
+                  else fft_beam_directions(
+                      args.n_ant, args.n_beams, args.spacing_m,
+                      args.design_frequency_hz)
+                  if args.beam_grid == "fft"
                   else rectangular_beam_directions(
-                      args.n_ant, args.spacing_m, args.design_frequency_hz)
-                  if args.n_beams == args.n_ant
-                  else default_beam_directions(args.n_beams, args.beam_l_step, args.beam_m))
+                      args.n_beams, args.spacing_m,
+                      args.design_frequency_hz)
+                  if args.beam_grid == "legacy-rectangular"
+                  else default_beam_directions(
+                      args.n_beams, args.beam_l_step, args.beam_m))
     if directions.shape != (args.n_beams, 3):
         raise ValueError(f"directions must contain exactly {args.n_beams} x,y,z rows")
     norms = np.linalg.norm(directions, axis=1)
@@ -660,6 +815,9 @@ def build_parser() -> argparse.ArgumentParser:
                         default=BEAM_GRID_DESIGN_FREQUENCY_HZ)
     parser.add_argument("--frequencies", type=Path, help="optional frequency-Hz text file")
     parser.add_argument("--directions", type=Path, help="optional beam x,y,z text file")
+    parser.add_argument(
+        "--beam-grid", choices=("fft", "line", "legacy-rectangular"),
+        default="fft")
     parser.add_argument("--beam-l-step", type=float, default=0.02)
     parser.add_argument("--beam-m", type=float, default=0.0)
     parser.add_argument("--uv-channel", type=int, help="frequency channel used for u-v coverage")
@@ -689,9 +847,11 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     if args.n_time <= 0 or args.n_freq != DEFAULT_N_FREQ:
         raise ValueError("n_time must be positive and this PoC requires n_freq=672")
-    valid_beam_count = 1 <= args.n_beams <= args.n_ant
+    valid_beam_count = 1 <= args.n_beams <= 128
     if args.n_ant not in (32, 64) or not valid_beam_count:
-        raise ValueError("n_ant must be 32 or 64; n_beams must be 1 to n_ant")
+        raise ValueError("n_ant must be 32 or 64; n_beams must be 1 to 128")
+    if args.beam_grid == "legacy-rectangular" and args.n_beams != args.n_ant:
+        raise ValueError("legacy-rectangular requires n_beams == n_ant")
     if args.spacing_m <= 0.0 or args.frequency_start_hz <= 0.0 \
             or args.channel_width_hz <= 0.0 or args.design_frequency_hz <= 0.0:
         raise ValueError("spacing and frequency parameters must be positive")

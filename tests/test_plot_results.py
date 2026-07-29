@@ -36,6 +36,10 @@ class PlotResultsTest(unittest.TestCase):
         np.testing.assert_allclose(directions[:, 0], [-0.04, -0.02, 0.0, 0.02, 0.04])
         np.testing.assert_allclose(np.linalg.norm(directions, axis=1), 1.0)
         self.assertEqual(plot_results.default_beam_directions(16).shape, (16, 3))
+        self.assertEqual(
+            plot_results.default_beam_directions(128, l_step=0.005).shape,
+            (128, 3),
+        )
 
     def test_uv_coverage_contains_conjugate_pairs(self):
         positions = plot_results.default_positions(32)
@@ -60,6 +64,43 @@ class PlotResultsTest(unittest.TestCase):
         self.assertLess(directions[0, 1], 0.0)
         self.assertGreater(directions[-1, 0], 0.0)
         self.assertGreater(directions[-1, 1], 0.0)
+
+    def test_fft_grid_fills_rectangular_32_antenna_bank(self):
+        wavelength_m = plot_results.SPEED_OF_LIGHT_M_PER_S / 400_000_000.0
+        du = wavelength_m / (2 * 8 * 0.6)
+        dv = wavelength_m / (2 * 4 * 0.6)
+        centers, n_u, n_v, bank_u, bank_v = (
+            plot_results.select_fft_beam_centers_rectangular(
+                du, dv, 128, 8, 4)
+        )
+        self.assertEqual(len(centers), 128)
+        self.assertEqual((n_u, n_v), (16, 8))
+        self.assertEqual((bank_u, bank_v), (16, 8))
+        self.assertEqual(centers[0], (0.0, 0.0))
+
+        directions = plot_results.fft_beam_directions(32, 128)
+        self.assertEqual(directions.shape, (128, 3))
+        np.testing.assert_allclose(np.linalg.norm(directions, axis=1), 1.0)
+
+    def test_fft_grid_64_antenna_window_and_hex_helpers(self):
+        directions = plot_results.fft_beam_directions(64, 128)
+        self.assertEqual(directions.shape, (128, 3))
+        wavelength_m = plot_results.SPEED_OF_LIGHT_M_PER_S / 400_000_000.0
+        du = wavelength_m / (2 * 8 * 0.6)
+        _, n_u, n_v, bank_u, bank_v = (
+            plot_results.select_fft_beam_centers_rectangular(
+                du, du, 128, 8, 8)
+        )
+        self.assertEqual((n_u, n_v), (12, 11))
+        self.assertEqual((bank_u, bank_v), (16, 16))
+
+        estimate = plot_results.estimate_nbeams_hex_formula(
+            0.6, 8, 8, 108.0, 74.0, wavelength_m)
+        self.assertGreater(estimate, 0)
+        uu, vv = plot_results.generate_hex_targets_cropped_fov(128, 0.8, 0.6)
+        self.assertEqual(uu.shape, (128,))
+        self.assertEqual(vv.shape, (128,))
+        self.assertTrue(np.all((uu / 0.8) ** 2 + (vv / 0.6) ** 2 <= 1.0 + 1e-12))
 
     def test_antenna_specs_interpolate_and_extrapolate(self):
         bw_e, bw_h, gain = plot_results.interpolated_antenna_specs(400e6)

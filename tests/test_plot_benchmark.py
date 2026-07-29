@@ -48,6 +48,25 @@ class PlotBenchmarkTest(unittest.TestCase):
         self.assertEqual(record["speedup_pipeline"], 2.0)
         self.assertAlmostEqual(record["cpu_cmac_per_s"], 1_376_256.0 / 0.012)
 
+    def test_gpu_only_summary_omits_cpu_and_speedup(self):
+        rows = [timing_row(0, 10.0, 2.0, 5.0),
+                timing_row(1, 14.0, 4.0, 7.0)]
+        records = [
+            {key: value for key, value in row.items() if key != "cpu_ms"}
+            for row in rows
+        ]
+        summary = plot_benchmark.summarize_timings(records)
+        self.assertEqual(summary[0]["gpu_kernel_ms_median"], 3.0)
+        self.assertEqual(summary[0]["gpu_pipeline_wall_ms_median"], 6.0)
+        self.assertNotIn("cpu_ms_median", summary[0])
+        self.assertNotIn("speedup_pipeline", summary[0])
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "gpu_heatmap.png"
+            plot_benchmark.plot_gpu_time_heatmaps(summary, output)
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 0)
+
     def test_matrix_preserves_beam_and_time_order(self):
         records = [
             {"n_ant": 32.0, "n_beams": 4.0, "n_time": 16.0,
