@@ -125,9 +125,32 @@ void verify_case(const std::string& label,
                  const beamformer::PackedVoltage& packed,
                  const beamformer::Weights& weights,
                  const beamformer::Dimensions& dims) {
+    beamformer::TiledWeights tiled_weights(
+        beamformer::tiled_weight_count(dims), beamformer::ComplexFloat{0.0F, 0.0F});
+    for (std::size_t beam = 0; beam < dims.n_beams; ++beam) {
+        for (std::size_t frequency = 0; frequency < dims.n_freq; ++frequency) {
+            for (std::size_t antenna = 0; antenna < dims.n_ant; ++antenna) {
+                tiled_weights[beamformer::tiled_weight_index(
+                    frequency, beam / beamformer::tiled_weight_beam_tile,
+                    antenna, beam % beamformer::tiled_weight_beam_tile, dims)] =
+                    weights[beamformer::weight_index(beam, frequency, antenna, dims)];
+            }
+        }
+    }
     const auto cpu = beamformer::cpu_beamform_packed_intensity(packed, weights, dims);
-    const auto gpu = beamformer::cuda_beamform_packed_intensity(packed, weights, dims);
-    compare_cpu_gpu(label, cpu, gpu);
+    for (const auto kernel : std::array{
+             beamformer::CudaBeamformerKernel::Direct,
+             beamformer::CudaBeamformerKernel::Tiled}) {
+        const auto& kernel_weights =
+            kernel == beamformer::CudaBeamformerKernel::Direct
+                ? static_cast<const beamformer::Weights&>(weights)
+                : static_cast<const beamformer::Weights&>(tiled_weights);
+        const auto gpu = beamformer::cuda_beamform_packed_intensity(
+            packed, kernel_weights, dims, nullptr, kernel);
+        compare_cpu_gpu(label + (kernel == beamformer::CudaBeamformerKernel::Direct
+                                     ? " [Direct]" : " [Tiled]"),
+                        cpu, gpu);
+    }
 }
 
 beamformer::Weights make_weights(const beamformer::Dimensions& dims,
@@ -173,7 +196,7 @@ int main() {
             channelized_frequencies(point_dims.n_freq), point_directions[12], 4.0F);
         verify_case("point source", point_source, point_weights, point_dims);
 
-        const Dimensions noise_dims{2, default_frequency_channels, 64, 7};
+        const Dimensions noise_dims{10, default_frequency_channels, 64, 7};
         const auto noise_weights = make_weights(
             noise_dims, fft_beam_grid(noise_dims.n_ant, noise_dims.n_beams));
         const auto noise = make_noise(noise_dims, 9876);
@@ -197,10 +220,15 @@ int main() {
         verify_case("shard one", shards[1].payload, shard_weights, shard_dims);
 
         // The production workspace reserves exactly one byte per voltage sample.
-        CudaBeamformerWorkspace workspace(noise_dims);
-        require(workspace.packed_voltage_capacity_bytes()
-                    == packed_voltage_bytes(noise_dims),
-                "CUDA workspace input allocation is not packed-byte sized");
+        for (const auto kernel : std::array{
+                 CudaBeamformerKernel::Direct, CudaBeamformerKernel::Tiled}) {
+            CudaBeamformerWorkspace workspace(noise_dims, kernel);
+            require(workspace.kernel() == kernel,
+                    "CUDA workspace did not retain the selected kernel");
+            require(workspace.packed_voltage_capacity_bytes()
+                        == packed_voltage_bytes(noise_dims),
+                    "CUDA workspace input allocation is not packed-byte sized");
+        }
     } catch (const std::exception& error) {
         std::cerr << "test_cuda_packed: " << error.what() << '\n';
         return 1;

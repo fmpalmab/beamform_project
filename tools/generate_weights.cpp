@@ -26,6 +26,7 @@ struct Options {
     float beam_l_step = 0.02F;
     float beam_m = 0.0F;
     std::string beam_grid = "fft";
+    std::string layout = "canonical";
 };
 
 void print_usage(const char* program) {
@@ -37,6 +38,7 @@ void print_usage(const char* program) {
         << "  --frequency-hz HZ       optional constant-frequency override\n"
         << "                          default centers: 300 + 0.3*channel MHz\n"
         << "  --beam-grid GRID        fft, line, or legacy-rectangular; default: fft\n"
+        << "  --layout LAYOUT         canonical or tiled; default: canonical\n"
         << "  --beam-l-step L         line-grid spacing in l: 0.02\n"
         << "  --beam-m M              line-grid m direction cosine: 0\n"
         << "  --positions FILE        optional x,y,z rows\n"
@@ -84,6 +86,8 @@ Options parse_options(const int argc, char** argv) {
             options.beam_m = std::stof(require_value(argc, argv, i));
         } else if (argument == "--beam-grid") {
             options.beam_grid = require_value(argc, argv, i);
+        } else if (argument == "--layout") {
+            options.layout = require_value(argc, argv, i);
         } else if (argument == "--positions") {
             options.positions_file = require_value(argc, argv, i);
         } else if (argument == "--frequencies") {
@@ -96,6 +100,9 @@ Options parse_options(const int argc, char** argv) {
     }
     if (options.output.empty()) {
         throw std::invalid_argument("--output is required");
+    }
+    if (options.layout != "canonical" && options.layout != "tiled") {
+        throw std::invalid_argument("--layout must be canonical or tiled");
     }
     if (options.beam_grid != "fft" && options.beam_grid != "line"
         && options.beam_grid != "legacy-rectangular") {
@@ -148,15 +155,27 @@ int main(int argc, char** argv) {
                                     : beamformer::default_beam_grid(
                                           dims.n_beams, options.beam_l_step,
                                           options.beam_m);
-        const auto weights =
-            beamformer::generate_weights(dims, positions, frequencies, directions);
-        beamformer::write_weights(options.output, weights, dims);
+        const auto weights = options.layout == "tiled"
+                                 ? beamformer::generate_tiled_weights(
+                                       dims, positions, frequencies, directions)
+                                 : beamformer::generate_weights(
+                                       dims, positions, frequencies, directions);
+        if (options.layout == "tiled") {
+            beamformer::write_tiled_weights(options.output, weights, dims);
+        } else {
+            beamformer::write_weights(options.output, weights, dims);
+        }
 
         std::cout << "Wrote " << weights.size() << " complex float32 weights ("
                   << weights.size() * sizeof(beamformer::ComplexFloat) << " bytes) to "
                   << options.output << "\n"
-                  << "layout=[B=" << dims.n_beams << "][F=" << dims.n_freq
-                  << "][E=" << dims.n_ant << "]\n";
+                  << "layout=" << options.layout;
+        if (options.layout == "tiled") {
+            std::cout << "[F][beam_tile][A][local_B], beam_tile=32, padded";
+        } else {
+            std::cout << "[B][F][A]";
+        }
+        std::cout << "\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "generate_weights: " << error.what() << "\n";

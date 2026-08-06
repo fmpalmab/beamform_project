@@ -13,6 +13,9 @@ namespace beamformer {
 using PackedVoltage = std::vector<std::uint8_t>;
 using ComplexVoltage = std::vector<ComplexFloat>;
 using Weights = std::vector<ComplexFloat>;
+// The vector is interpreted as [frequency][beam_tile][antenna][local_beam]
+// when passed to the Tiled CUDA kernel. The final beam tile is zero-padded.
+using TiledWeights = std::vector<ComplexFloat>;
 using Intensities = std::vector<float>;
 
 // One validity byte per [time][local_frequency] frame. A zero marks a lost
@@ -42,6 +45,22 @@ constexpr std::size_t loss_mask_count(const Dimensions& dims) {
 // little-endian float32 [beam][frequency][antenna][real, imag]
 constexpr std::size_t weight_bytes(const Dimensions& dims) {
     return dims.n_beams * dims.n_freq * dims.n_ant * 2 * sizeof(float);
+}
+
+constexpr std::size_t tiled_weight_beam_tile = 32;
+
+constexpr std::size_t tiled_weight_beam_tiles(const Dimensions& dims) {
+    return (dims.n_beams + tiled_weight_beam_tile - 1) / tiled_weight_beam_tile;
+}
+
+// little-endian float32 [frequency][beam_tile][antenna][local_beam][real, imag]
+constexpr std::size_t tiled_weight_count(const Dimensions& dims) {
+    return dims.n_freq * tiled_weight_beam_tiles(dims) * dims.n_ant
+           * tiled_weight_beam_tile;
+}
+
+constexpr std::size_t tiled_weight_bytes(const Dimensions& dims) {
+    return tiled_weight_count(dims) * 2 * sizeof(float);
 }
 
 // little-endian float32 [time][frequency][beam]

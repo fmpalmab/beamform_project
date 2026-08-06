@@ -9,6 +9,11 @@
 
 namespace beamformer {
 
+enum class CudaBeamformerKernel {
+    Direct,
+    Tiled,
+};
+
 struct CudaBeamformerTimings {
     double setup_ms = 0.0;
     double host_to_device_ms = 0.0;
@@ -32,13 +37,16 @@ CudaDeviceInfo cuda_device_info();
 // blocks and intensity products move for every pipeline iteration.
 class CudaBeamformerWorkspace {
   public:
-    explicit CudaBeamformerWorkspace(const Dimensions& capacity);
+    explicit CudaBeamformerWorkspace(
+        const Dimensions& capacity,
+        CudaBeamformerKernel kernel = CudaBeamformerKernel::Direct);
     ~CudaBeamformerWorkspace();
 
     CudaBeamformerWorkspace(const CudaBeamformerWorkspace&) = delete;
     CudaBeamformerWorkspace& operator=(const CudaBeamformerWorkspace&) = delete;
 
     double setup_ms() const;
+    CudaBeamformerKernel kernel() const;
     double upload_packed_voltage(const PackedVoltage& packed, const Dimensions& dims);
     double upload_weights(const Weights& weights, const Dimensions& dims);
     double run_kernel(const Dimensions& dims);
@@ -63,6 +71,8 @@ class CudaBeamformerWorkspace {
 Intensities cuda_beamform_packed_intensity(const PackedVoltage& packed,
                                            const Weights& weights,
                                            const Dimensions& dims,
-                                           CudaBeamformerTimings* timings = nullptr);
+                                           CudaBeamformerTimings* timings = nullptr,
+                                           CudaBeamformerKernel kernel =
+                                               CudaBeamformerKernel::Direct);
 
 } // namespace beamformer

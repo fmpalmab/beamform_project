@@ -87,6 +87,21 @@ void write_weights(const std::filesystem::path& path, const Weights& weights,
     write_binary(path, weights);
 }
 
+TiledWeights read_tiled_weights(const std::filesystem::path& path,
+                                const Dimensions& dims) {
+    validate_dimensions(dims);
+    return read_binary<ComplexFloat>(path, tiled_weight_count(dims));
+}
+
+void write_tiled_weights(const std::filesystem::path& path,
+                         const TiledWeights& weights, const Dimensions& dims) {
+    validate_dimensions(dims);
+    if (weights.size() != tiled_weight_count(dims)) {
+        throw std::invalid_argument("tiled weight count does not match dimensions");
+    }
+    write_binary(path, weights);
+}
+
 void write_intensities(const std::filesystem::path& path,
                        const Intensities& intensities,
                        const Dimensions& dims) {

@@ -43,6 +43,8 @@ struct Options {
     double absolute_tolerance = 1.0e-3;
     double relative_tolerance = 1.0e-5;
     bool dry_run = false;
+    beamformer::CudaBeamformerKernel kernel =
+        beamformer::CudaBeamformerKernel::Direct;
 };
 
 struct ValidationStats {
@@ -72,6 +74,7 @@ void print_usage(const char* program) {
         << "  --seed N                default: 1\n"
         << "  --absolute-tolerance X  default: 1e-3\n"
         << "  --relative-tolerance X  default: 1e-5\n"
+        << "  --kernel NAME           direct or tiled; default: direct\n"
         << "  --dry-run               validate and print the matrix only\n";
 }
 
@@ -89,6 +92,20 @@ std::size_t parse_size(const std::string& text, const char* option) {
         throw std::invalid_argument(std::string("invalid integer for ") + option);
     }
     return static_cast<std::size_t>(value);
+}
+
+beamformer::CudaBeamformerKernel parse_kernel(const std::string& text) {
+    if (text == "direct") {
+        return beamformer::CudaBeamformerKernel::Direct;
+    }
+    if (text == "tiled") {
+        return beamformer::CudaBeamformerKernel::Tiled;
+    }
+    throw std::invalid_argument("kernel must be direct or tiled");
+}
+
+const char* kernel_name(const beamformer::CudaBeamformerKernel kernel) {
+    return kernel == beamformer::CudaBeamformerKernel::Direct ? "direct" : "tiled";
 }
 
 double parse_double(const std::string& text, const char* option) {
@@ -151,6 +168,8 @@ Options parse_options(const int argc, char** argv) {
         } else if (argument == "--relative-tolerance") {
             options.relative_tolerance = parse_double(
                 require_value(argc, argv, i), "--relative-tolerance");
+        } else if (argument == "--kernel") {
+            options.kernel = parse_kernel(require_value(argc, argv, i));
         } else if (argument == "--dry-run") {
             options.dry_run = true;
         } else {
@@ -236,14 +255,19 @@ beamformer::PackedVoltage make_benchmark_voltage(const std::size_t n_ant,
     return packed;
 }
 
-beamformer::Weights make_benchmark_weights(const std::size_t n_ant,
-                                           const std::size_t n_beams) {
+beamformer::Weights make_benchmark_weights(
+    const std::size_t n_ant, const std::size_t n_beams,
+    const beamformer::CudaBeamformerKernel kernel) {
     const beamformer::Dimensions dims{
         1, beamformer::default_frequency_channels, n_ant, n_beams};
     const auto positions = beamformer::default_positions(n_ant);
     const auto frequencies = beamformer::channelized_frequencies(dims.n_freq);
     const auto directions = beamformer::fft_beam_grid(n_ant, n_beams);
-    return beamformer::generate_weights(dims, positions, frequencies, directions);
+    return kernel == beamformer::CudaBeamformerKernel::Tiled
+               ? beamformer::generate_tiled_weights(
+                     dims, positions, frequencies, directions)
+               : beamformer::generate_weights(
+                     dims, positions, frequencies, directions);
 }
 
 ValidationStats compare_outputs(const beamformer::Intensities& cpu,
@@ -436,17 +460,21 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
                                           options.seed + static_cast<std::uint32_t>(n_ant));
     const beamformer::Dimensions capacity{
         max_time, beamformer::default_frequency_channels, n_ant, max_beams};
-    beamformer::CudaBeamformerWorkspace workspace(capacity);
+    beamformer::CudaBeamformerWorkspace workspace(capacity, options.kernel);
     if (device_info.name.empty()) {
         device_info = beamformer::cuda_device_info();
     }
-    std::cout << "CUDA workspace ready: setup_ms=" << workspace.setup_ms() << std::endl;
+    std::cout << "CUDA workspace ready: kernel=" << kernel_name(options.kernel)
+              << " setup_ms=" << workspace.setup_ms() << std::endl;
 
     for (const std::size_t n_beams : beam_values) {
-        auto weights = make_benchmark_weights(n_ant, n_beams);
+        const auto cpu_weights = make_benchmark_weights(
+            n_ant, n_beams, beamformer::CudaBeamformerKernel::Direct);
+        const auto gpu_weights = make_benchmark_weights(
+            n_ant, n_beams, options.kernel);
         const beamformer::Dimensions weight_dims{
             1, beamformer::default_frequency_channels, n_ant, n_beams};
-        const double weights_h2d_ms = workspace.upload_weights(weights, weight_dims);
+        const double weights_h2d_ms = workspace.upload_weights(gpu_weights, weight_dims);
 
         const beamformer::Dimensions validation_dims{
             options.validation_time, beamformer::default_frequency_channels,
@@ -457,7 +485,7 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
         beamformer::Intensities gpu_validation(validation_outputs);
         const auto cpu_start = Clock::now();
         beamformer::cpu_beamform_packed_intensity_into(
-            packed_voltage, weights, validation_dims, cpu_validation);
+            packed_voltage, cpu_weights, validation_dims, cpu_validation);
         const auto cpu_end = Clock::now();
         const auto gpu_validation_timing =
             workspace.run_pipeline(packed_voltage, gpu_validation, validation_dims);
@@ -565,6 +593,7 @@ void write_metadata(const std::filesystem::path& path, const Options& options,
            << ",\n  \"complex_mac_real_flops\": " << real_flops_per_complex_mac
            << ",\n  \"intensity_real_flops\": " << real_flops_per_intensity
            << ",\n  \"timed_backend\": \"cuda\""
+           << ",\n  \"kernel\": \"" << kernel_name(options.kernel) << "\""
            << ",\n  \"cpu_validation_threads\": 1"
            << ",\n  \"beam_grid\": \"centered zero-padded rectangular FFT bins\""
            << ",\n  \"temporal_chunking\": false,\n"

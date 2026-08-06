@@ -82,6 +82,32 @@ int main() {
     for (const auto& weight : weights) {
         assert(close(weight.real * weight.real + weight.imag * weight.imag, 1.0F));
     }
+    const auto tiled_weights = generate_tiled_weights(
+        dims, positions, frequencies, directions);
+    assert(tiled_weights.size() == tiled_weight_count(dims));
+    for (std::size_t beam = 0; beam < dims.n_beams; ++beam) {
+        for (std::size_t frequency = 0; frequency < dims.n_freq; ++frequency) {
+            for (std::size_t antenna = 0; antenna < dims.n_ant; ++antenna) {
+                const auto tiled = tiled_weights[tiled_weight_index(
+                    frequency, beam / tiled_weight_beam_tile, antenna,
+                    beam % tiled_weight_beam_tile, dims)];
+                const auto canonical = weights[weight_index(beam, frequency, antenna, dims)];
+                assert(tiled.real == canonical.real);
+                assert(tiled.imag == canonical.imag);
+            }
+        }
+    }
+    for (std::size_t beam = dims.n_beams;
+         beam < tiled_weight_beam_tiles(dims) * tiled_weight_beam_tile; ++beam) {
+        for (std::size_t frequency = 0; frequency < dims.n_freq; ++frequency) {
+            for (std::size_t antenna = 0; antenna < dims.n_ant; ++antenna) {
+                const auto padded = tiled_weights[tiled_weight_index(
+                    frequency, beam / tiled_weight_beam_tile, antenna,
+                    beam % tiled_weight_beam_tile, dims)];
+                assert(padded.real == 0.0F && padded.imag == 0.0F);
+            }
+        }
+    }
 
     const std::size_t active_frequency = 17;
     const auto packed_one_hot =
@@ -228,15 +254,23 @@ int main() {
     const auto temporary = std::filesystem::temp_directory_path();
     const auto voltage_path = temporary / "beamformer_cpu_voltage_test.bin";
     const auto weights_path = temporary / "beamformer_cpu_weights_test.bin";
+    const auto tiled_weights_path = temporary / "beamformer_cpu_tiled_weights_test.bin";
     const auto malformed_path = temporary / "beamformer_cpu_malformed_test.bin";
     write_packed_voltage(voltage_path, point_source, dims);
     write_weights(weights_path, weights, dims);
+    write_tiled_weights(tiled_weights_path, tiled_weights, dims);
     assert(read_packed_voltage(voltage_path, dims) == point_source);
     const auto loaded_weights = read_weights(weights_path, dims);
     assert(loaded_weights.size() == weights.size());
     for (std::size_t index = 0; index < weights.size(); ++index) {
         assert(loaded_weights[index].real == weights[index].real);
         assert(loaded_weights[index].imag == weights[index].imag);
+    }
+    const auto loaded_tiled_weights = read_tiled_weights(tiled_weights_path, dims);
+    assert(loaded_tiled_weights.size() == tiled_weights.size());
+    for (std::size_t index = 0; index < tiled_weights.size(); ++index) {
+        assert(loaded_tiled_weights[index].real == tiled_weights[index].real);
+        assert(loaded_tiled_weights[index].imag == tiled_weights[index].imag);
     }
 
     {
@@ -253,6 +287,7 @@ int main() {
 
     std::filesystem::remove(voltage_path);
     std::filesystem::remove(weights_path);
+    std::filesystem::remove(tiled_weights_path);
     std::filesystem::remove(malformed_path);
     return 0;
 }

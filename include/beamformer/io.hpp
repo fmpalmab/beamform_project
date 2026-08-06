@@ -25,6 +25,10 @@ PackedShard read_packed_shard(const std::filesystem::path& payload_path,
 Weights read_weights(const std::filesystem::path& path, const Dimensions& dims);
 void write_weights(const std::filesystem::path& path, const Weights& weights,
                    const Dimensions& dims);
+TiledWeights read_tiled_weights(const std::filesystem::path& path,
+                                const Dimensions& dims);
+void write_tiled_weights(const std::filesystem::path& path,
+                         const TiledWeights& weights, const Dimensions& dims);
 
 void write_intensities(const std::filesystem::path& path,
                        const Intensities& intensities,

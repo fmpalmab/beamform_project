@@ -1,6 +1,7 @@
 #pragma once
 
 #include "beamformer/config.hpp"
+#include "beamformer/formats.hpp"
 
 #include <cstddef>
 
@@ -48,6 +49,15 @@ constexpr std::size_t full_band_frequency(const std::size_t nic_id,
 constexpr std::size_t weight_index(const std::size_t b, const std::size_t f,
                                    const std::size_t a, const Dimensions& dims) {
     return (b * dims.n_freq + f) * dims.n_ant + a;
+}
+
+constexpr std::size_t tiled_weight_index(const std::size_t f,
+                                          const std::size_t beam_tile,
+                                          const std::size_t a,
+                                          const std::size_t local_beam,
+                                          const Dimensions& dims) {
+    return (((f * tiled_weight_beam_tiles(dims) + beam_tile) * dims.n_ant + a)
+            * tiled_weight_beam_tile + local_beam);
 }
 
 constexpr std::size_t intensity_index(const std::size_t t, const std::size_t f,

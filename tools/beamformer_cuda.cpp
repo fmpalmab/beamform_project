@@ -29,6 +29,8 @@ struct Options {
     std::size_t n_time = 15360;
     std::size_t n_ant = 64;
     std::size_t n_beams = 5;
+    beamformer::CudaBeamformerKernel kernel =
+        beamformer::CudaBeamformerKernel::Direct;
 };
 
 struct Timings {
@@ -49,6 +51,7 @@ void print_usage(const char* program) {
         << "  --n-time N              default: 15360\n"
         << "  --n-ant N               32 or 64; default: 64\n"
         << "  --n-beams N             1 to 128; default: 5\n"
+        << "  --kernel NAME           direct or tiled; default: direct\n"
         << "  --metrics FILE          append timing row to CSV\n";
 }
 
@@ -57,6 +60,21 @@ const char* require_value(const int argc, char** argv, int& index) {
         throw std::invalid_argument(std::string("missing value after ") + argv[index]);
     }
     return argv[++index];
+}
+
+beamformer::CudaBeamformerKernel parse_kernel(const char* value) {
+    const std::string name(value);
+    if (name == "direct") {
+        return beamformer::CudaBeamformerKernel::Direct;
+    }
+    if (name == "tiled") {
+        return beamformer::CudaBeamformerKernel::Tiled;
+    }
+    throw std::invalid_argument("kernel must be direct or tiled");
+}
+
+const char* kernel_name(const beamformer::CudaBeamformerKernel kernel) {
+    return kernel == beamformer::CudaBeamformerKernel::Direct ? "direct" : "tiled";
 }
 
 std::size_t parse_size(const char* value, const char* option) {
@@ -90,6 +108,8 @@ Options parse_options(const int argc, char** argv) {
             options.n_ant = parse_size(require_value(argc, argv, i), "--n-ant");
         } else if (argument == "--n-beams") {
             options.n_beams = parse_size(require_value(argc, argv, i), "--n-beams");
+        } else if (argument == "--kernel") {
+            options.kernel = parse_kernel(require_value(argc, argv, i));
         } else {
             throw std::invalid_argument("unknown option: " + argument);
         }
@@ -166,11 +186,13 @@ int main(int argc, char** argv) {
 
         const auto total_start = Clock::now();
         const auto packed = beamformer::read_packed_voltage(options.input, dims);
-        const auto weights = beamformer::read_weights(options.weights, dims);
+        const auto weights = options.kernel == beamformer::CudaBeamformerKernel::Tiled
+                                 ? beamformer::read_tiled_weights(options.weights, dims)
+                                 : beamformer::read_weights(options.weights, dims);
         const auto load_end = Clock::now();
         beamformer::CudaBeamformerTimings cuda_timings;
         const auto intensity = beamformer::cuda_beamform_packed_intensity(
-            packed, weights, dims, &cuda_timings);
+            packed, weights, dims, &cuda_timings, options.kernel);
         const auto compute_end = Clock::now();
         beamformer::write_intensities(options.output, intensity, dims);
         const auto write_end = Clock::now();
@@ -203,7 +225,8 @@ int main(int argc, char** argv) {
         }
 
         std::cout << std::fixed << std::setprecision(3)
-                  << "CUDA beamforming complete: layout=[T=" << dims.n_time
+                  << "CUDA beamforming complete: kernel=" << kernel_name(options.kernel)
+                  << " layout=[T=" << dims.n_time
                   << "][F=" << dims.n_freq << "][B=" << dims.n_beams << "]\n"
                   << "load_ms=" << timings.load_ms
                   << " unpack_ms=" << timings.unpack_ms

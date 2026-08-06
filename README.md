@@ -406,3 +406,38 @@ For a short functional check before a full run:
 
 The existing `results/cpu_cuda_benchmark_*` files are the archived pre-change CPU/CUDA
 sweep. The new default prefix deliberately avoids overwriting them.
+
+## Medir Direct frente a Tiled
+
+Para comparar ambos kernels en la configuración objetivo (`64` antenas, `336` frecuencias
+locales, `64` beams y `15360` tiempos), usa prefijos distintos para no mezclar las
+mediciones:
+
+```bash
+./build-cuda/benchmark_cpu_cuda \
+    --kernel direct \
+    --n-ant 64 --times 15360 --beams 64 \
+    --validation-time 8 --warmup 1 --repetitions 3 \
+    --output-prefix /tmp/beamformer_direct
+
+./build-cuda/benchmark_cpu_cuda \
+    --kernel tiled \
+    --n-ant 64 --times 15360 --beams 64 \
+    --validation-time 8 --warmup 1 --repetitions 3 \
+    --output-prefix /tmp/beamformer_tiled
+```
+
+El benchmark genera internamente los pesos en el layout correspondiente. Para generar
+además el archivo tiled que consume `beamformer_cuda`, ejecuta:
+
+```bash
+./build-cuda/generate_weights \
+    --n-ant 64 --n-beams 64 \
+    --directions results/hex64_directions.txt \
+    --layout tiled \
+    --output results/weights_hex64_tiled.bin
+```
+
+Las mediciones quedan en `*_timings.csv`, `*_validation.csv` y `*_metadata.json`. El
+kernel `Direct` usa pesos `[beam][frequency][antenna]`; `Tiled` usa
+`[frequency][beam_tile][antenna][local_beam]`, con tiles de 32 beams.

@@ -7,6 +7,7 @@
 #include "beamformer/weights.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -90,7 +91,7 @@ int main() {
     try {
         constexpr std::size_t n_ant = 32;
         constexpr std::size_t n_beams = 32;
-        constexpr std::size_t maximum_time = 4;
+        constexpr std::size_t maximum_time = 12;
 
         const auto positions = beamformer::default_positions(n_ant);
         const auto frequencies =
@@ -105,6 +106,8 @@ int main() {
             1, beamformer::default_frequency_channels, n_ant, n_beams};
         const auto weights = beamformer::generate_weights(
             weight_dims, positions, frequencies, directions);
+        const auto tiled_weights = beamformer::generate_tiled_weights(
+            weight_dims, positions, frequencies, directions);
 
         for (std::size_t n_time = 1; n_time <= maximum_time; ++n_time) {
             const beamformer::Dimensions dims{
@@ -113,37 +116,48 @@ int main() {
                 dims, positions, frequencies, directions[injected_beam], 4.0F);
             const auto cpu =
                 beamformer::cpu_beamform_packed_intensity(packed, weights, dims);
-            const auto gpu =
-                beamformer::cuda_beamform_packed_intensity(packed, weights, dims);
 
-            const double maximum_absolute_error = compare_cpu_gpu(cpu, gpu);
-            const auto cpu_integrated = integrated_power(cpu, dims, 0, n_time);
-            const auto gpu_integrated = integrated_power(gpu, dims, 0, n_time);
-            require(peak_beam(cpu_integrated) == injected_beam,
-                    "CPU integrated peak does not match the injected beam");
-            require(peak_beam(gpu_integrated) == injected_beam,
-                    "GPU integrated peak does not match the injected beam");
+            for (const auto kernel : std::array{
+                     beamformer::CudaBeamformerKernel::Direct,
+                     beamformer::CudaBeamformerKernel::Tiled}) {
+                const auto& kernel_weights =
+                    kernel == beamformer::CudaBeamformerKernel::Direct
+                        ? static_cast<const beamformer::Weights&>(weights)
+                        : static_cast<const beamformer::Weights&>(tiled_weights);
+                const auto gpu = beamformer::cuda_beamform_packed_intensity(
+                    packed, kernel_weights, dims, nullptr, kernel);
+                const double maximum_absolute_error = compare_cpu_gpu(cpu, gpu);
+                const auto cpu_integrated = integrated_power(cpu, dims, 0, n_time);
+                const auto gpu_integrated = integrated_power(gpu, dims, 0, n_time);
+                require(peak_beam(cpu_integrated) == injected_beam,
+                        "CPU integrated peak does not match the injected beam");
+                require(peak_beam(gpu_integrated) == injected_beam,
+                        "GPU integrated peak does not match the injected beam");
 
-            for (std::size_t time = 0; time < n_time; ++time) {
-                require(peak_beam(integrated_power(cpu, dims, time, 1))
-                            == injected_beam,
-                        "CPU per-time peak does not match the injected beam");
-                require(peak_beam(integrated_power(gpu, dims, time, 1))
-                            == injected_beam,
-                        "GPU per-time peak does not match the injected beam");
+                for (std::size_t time = 0; time < n_time; ++time) {
+                    require(peak_beam(integrated_power(cpu, dims, time, 1))
+                                == injected_beam,
+                            "CPU per-time peak does not match the injected beam");
+                    require(peak_beam(integrated_power(gpu, dims, time, 1))
+                                == injected_beam,
+                            "GPU per-time peak does not match the injected beam");
+                }
+
+                const double cpu_contrast =
+                    peak_to_runner_up(cpu_integrated, injected_beam);
+                const double gpu_contrast =
+                    peak_to_runner_up(gpu_integrated, injected_beam);
+                std::cout << "point_source T=" << n_time
+                          << " kernel="
+                          << (kernel == beamformer::CudaBeamformerKernel::Direct
+                                  ? "Direct" : "Tiled")
+                          << " injected_beam=" << injected_beam
+                          << " cpu_peak=" << peak_beam(cpu_integrated)
+                          << " gpu_peak=" << peak_beam(gpu_integrated)
+                          << " cpu_peak_to_runner_up=" << cpu_contrast
+                          << " gpu_peak_to_runner_up=" << gpu_contrast
+                          << " max_abs_error=" << maximum_absolute_error << '\n';
             }
-
-            const double cpu_contrast =
-                peak_to_runner_up(cpu_integrated, injected_beam);
-            const double gpu_contrast =
-                peak_to_runner_up(gpu_integrated, injected_beam);
-            std::cout << "point_source T=" << n_time
-                      << " injected_beam=" << injected_beam
-                      << " cpu_peak=" << peak_beam(cpu_integrated)
-                      << " gpu_peak=" << peak_beam(gpu_integrated)
-                      << " cpu_peak_to_runner_up=" << cpu_contrast
-                      << " gpu_peak_to_runner_up=" << gpu_contrast
-                      << " max_abs_error=" << maximum_absolute_error << '\n';
         }
     } catch (const std::exception& error) {
         std::cerr << "test_cuda_point_source: " << error.what() << '\n';
