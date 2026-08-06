@@ -13,7 +13,7 @@ CUDA implementation are available:
 - signed complex `int4` packing and unpacking;
 - common voltage, weight, and intensity indexing and size contracts;
 - regular 4x8 and 8x8 array geometries with 0.6 m spacing in x and y;
-- 672 frequency centers `300 + 0.3*channel` MHz, spanning 300 to 501.3 MHz;
+- 336 local-frequency centers per shard; two shards map the full 672-channel band;
 - optional position and frequency overrides from text files;
 - deterministic zero-padded FFT-bin beam grids in direction cosines;
 - 1 to 128 beams for 32- or 64-element arrays;
@@ -24,8 +24,8 @@ CUDA implementation are available:
   `[time][frequency][beam]` order;
 - a CUDA beamformer with one thread per `[time][frequency][beam]` output and a direct
   complex sum over all elements;
-- CPU and CUDA paths that share the host-side signed `int4` unpacking and consume the
-  same `ComplexFloat` voltage and weight arrays;
+- packed-input CPU and CUDA references that decode signed `int4` samples inline and produce
+  `float32` intensity without a full unpacked voltage tensor or expanded H2D transfer;
 - strict binary-size validation and optional per-run CSV timing metrics.
 
 Compact CPU/CUDA validation, a repeatable GPU-only timing sweep, summary tables, and
@@ -86,7 +86,7 @@ tested RTX 4090. The CPU code remains serial as a transparent numerical referenc
 
 ## Generate synthetic voltage files
 
-Each command below writes exactly `n_time * 672 * n_ant` bytes:
+The single-shard commands below write exactly `n_time * 336 * n_ant` payload bytes:
 
 ```bash
 ./build/generate_fake_data \
@@ -108,6 +108,18 @@ Each command below writes exactly `n_time * 672 * n_ant` bytes:
     --type noise --n-time 32 --n-ant 64 --seed 1 \
     --output noise.bin
 ```
+
+For the production-shaped two-shard input, use a prefix. This writes two independent
+payloads, two one-byte-per-`[T][F_local]` loss masks, and one metadata file per shard:
+
+```bash
+./build/generate_fake_data \
+    --type noise --n-time 15360 --n-ant 64 --seed 1 \
+    --shard-output-prefix results/voltage
+```
+
+The files are `voltage.shard{0,1}.bin`, `.mask`, and `.meta`. Each payload is exactly
+`n_time * 336 * n_ant` bytes; the payloads are never concatenated.
 
 The point source uses
 `x_a[f] = A * exp(-j * 2*pi*frequency[f]*dot(position[a], direction)/c)`,
@@ -146,13 +158,14 @@ the default synthetic point source with the last beam:
     --output cuda_intensity.bin --metrics metrics.csv
 ```
 
-Both executables report the peak integrated beam and write the same output layout. CUDA
-timing separates device/context setup, host-to-device copies, kernel execution, and the
-device-to-host copy. In the common CSV, `compute_ms` means the serial loop for CPU and the
-kernel event time for CUDA; CPU rows store zero for CUDA-only stages. Throughput and
-complex GMAC/s are derived from `compute_ms`. Repeated invocations append rows to one
-table, but a proper benchmark should include warmup and repeated samples rather than use
-the first smoke run.
+Both executables report the peak integrated beam and write the same output layout. CPU and
+CUDA decode each packed byte inside their direct accumulation loops, so `unpack_ms` is zero
+rather than a separate full-tensor conversion stage. CUDA timing separates device/context
+setup, packed-byte host-to-device copies, kernel execution, and device-to-host copy. In the
+common CSV, `compute_ms` means the packed serial loop for CPU and the kernel event time for
+CUDA; CPU rows store zero for CUDA-only stages. Throughput and complex GMAC/s are derived
+from `compute_ms`. Repeated invocations append rows to one table, but a proper benchmark
+should include warmup and repeated samples rather than use the first smoke run.
 
 ## Binary products
 
@@ -162,6 +175,33 @@ the first smoke run.
 
 All products are headerless. Dimensions are supplied on the command line, and readers
 reject files whose byte count differs from the exact expected size.
+
+## Select buffer(s) in plots
+
+The plotting tools follow the local-shard contract. plot_results.py defaults to buffer 0
+with 336 channels. Select the other local buffer with --buffer 1; its default frequency
+origin is 400.8 MHz. Use --buffer both for the 672-channel band. For that mode, a single
+precombined intensity file is accepted, or two independent output files can be combined only
+inside the plotting step:
+
+```bash
+conda run -n kotekan_test python tools/plot_results.py \
+    --buffer 0 --input results/shard0_intensity.bin \
+    --n-time 32 --n-ant 64 --n-beams 64 \
+    --output results/shard0_validation.png
+
+conda run -n kotekan_test python tools/plot_results.py \
+    --buffer both \
+    --input results/shard0_intensity.bin \
+    --input-shard1 results/shard1_intensity.bin \
+    --n-time 32 --n-ant 64 --n-beams 64 \
+    --output results/full_band_validation.png
+```
+
+The same --input-shard1 and --compare-shard1 options apply to CPU/CUDA comparison
+plots. plot_benchmark.py --buffer 0 filters local-buffer rows (n_freq=336), while
+--buffer both filters full-band rows (n_freq=672). If a benchmark CSV contains only one
+frequency width, no filter is required.
 
 ## Visualize and compare results
 
@@ -252,18 +292,23 @@ conda run -n kotekan_test python tests/test_plot_results.py
 
 ## Input contract
 
-The PoC input is one headerless binary frame with one packed complex byte per sample:
+A production input is one headerless binary shard with one packed complex byte per sample:
 
 ```text
-voltage[time][frequency][element]
-index = (time * 672 + frequency) * n_elements + element
+voltage[time][local_frequency][element]
+index = (time * 336 + local_frequency) * n_elements + element
 ```
 
-The real handler creates two separate `[T][336][64]` buffers, one per NIC. The PoC
-combines them into a single `[T][672][64]` file:
+The real handler creates two independent `[T][336][64]` buffers, one per NIC. The PoC
+keeps them as separate allocations. Shard 0 maps local frequencies `0..335` to absolute
+frequencies `0..335`; shard 1 maps them to `336..671`. A downstream consumer may combine
+outputs using metadata, but no input file or H2D buffer concatenates the shards.
 
-- NIC 0 local frequencies `0..335` become global frequencies `0..335`;
-- NIC 1 local frequencies `0..335` become global frequencies `336..671`.
+The two-shard CLI writes payload files plus `.meta` and `.mask` sidecars. Metadata records
+shard identity, local width, absolute-frequency origin, timestamp start/step, and loss-mask
+identity. The loss mask has one byte per `[time][local_frequency]` frame (`1=valid`,
+`0=lost`) and is independent for each shard; payload bytes are not rewritten when a frame
+is marked lost.
 
 The element order reproduces the handler:
 
@@ -273,15 +318,11 @@ RFSoC 1 -> element 0..31
 RFSoC 0 -> element 32..63
 ```
 
-The handler copies payload bytes without changing their bits. For this PoC, each byte
-uses signed two's-complement `int4`, with real in the low nibble and imaginary in the
-high nibble. If firmware capture proves offset-binary encoding, only the packing helper
-must change; the `[T][F][E]` layout remains unchanged.
-
-Default positions are row-major `(x, y, z)` coordinates in metres and are indexed by
-the output `element` above. Position override files contain three whitespace- or
-comma-separated values per line. Frequency override files contain one positive frequency
-in hertz per line. Blank lines and `#` comments are accepted.
+Each byte uses signed two's-complement `int4`, with real in the low nibble and imaginary
+in the high nibble. The one-hot, constant, seeded-noise, and analytical point-source
+functions in `beamformer/synthetic_data.hpp` generate both shards without materializing
+an unpacked complex-float voltage tensor. The packed CPU and CUDA references use the same
+nibble rule at the point of accumulation and emit `float32` intensity in `[T][F][B]`.
 
 ## Initial CUDA smoke check
 
@@ -310,8 +351,8 @@ matrix and maximum allocations without creating a CUDA context or output files:
 ./build/benchmark_cpu_cuda --dry-run
 ```
 
-On the tested configuration this reports maximum host/GPU working sets of approximately
-14.79 GiB for 32 antennas and 19.73 GiB for 64 antennas. Then run and plot with:
+The dry run reports the current packed-input host/GPU working-set estimates. Then run and
+plot with:
 
 ```bash
 ./build/benchmark_cpu_cuda \
@@ -323,7 +364,7 @@ conda run -n kotekan_test python tools/plot_benchmark.py \
 
 The process generates one deterministic signed-`int4` noise spectrum per antenna count
 and repeats it over time outside timed regions. Compact CPU validation and all GPU runs
-consume the same unpacked prefix and FFT-grid weights. The principal steady-state metric
+consume the same packed prefix and FFT-grid weights. The principal steady-state metric
 keeps weights resident on the GPU. It reports resident CUDA kernel time and pipeline wall
 time containing voltage H2D, kernel, output D2H, and synchronization; context/buffer setup
 and the one-time weight upload are recorded separately.

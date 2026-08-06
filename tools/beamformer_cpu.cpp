@@ -26,7 +26,7 @@ struct Options {
     std::filesystem::path weights;
     std::filesystem::path output;
     std::optional<std::filesystem::path> metrics;
-    std::size_t n_time = 32;
+    std::size_t n_time = 15360;
     std::size_t n_ant = 64;
     std::size_t n_beams = 5;
 };
@@ -46,7 +46,7 @@ void print_usage(const char* program) {
     std::cout
         << "Usage: " << program
         << " --input FILE --weights FILE --output FILE [options]\n\n"
-        << "  --n-time N              default: 32\n"
+        << "  --n-time N              default: 15360\n"
         << "  --n-ant N               32 or 64; default: 64\n"
         << "  --n-beams N             1 to 128; default: 5\n"
         << "  --metrics FILE          append timing row to CSV\n";
@@ -168,17 +168,18 @@ int main(int argc, char** argv) {
         const auto packed = beamformer::read_packed_voltage(options.input, dims);
         const auto weights = beamformer::read_weights(options.weights, dims);
         const auto load_end = Clock::now();
-        const auto voltage = beamformer::unpack_voltage(packed, dims);
-        const auto unpack_end = Clock::now();
-        const auto intensity = beamformer::cpu_beamform_intensity(voltage, weights, dims);
+        const auto intensity =
+            beamformer::cpu_beamform_packed_intensity(packed, weights, dims);
         const auto compute_end = Clock::now();
         beamformer::write_intensities(options.output, intensity, dims);
         const auto write_end = Clock::now();
 
         Timings timings;
         timings.load_ms = elapsed_ms(total_start, load_end);
-        timings.unpack_ms = elapsed_ms(load_end, unpack_end);
-        timings.compute_ms = elapsed_ms(unpack_end, compute_end);
+        // The CSV field is retained for compatibility; decoding is fused into
+        // the CPU accumulation and is therefore not a separate stage.
+        timings.unpack_ms = 0.0;
+        timings.compute_ms = elapsed_ms(load_end, compute_end);
         timings.write_ms = elapsed_ms(compute_end, write_end);
         timings.total_ms = elapsed_ms(total_start, write_end);
 

@@ -1,6 +1,7 @@
 #include "beamformer/cuda_beamformer.hpp"
 
 #include "beamformer/formats.hpp"
+#include "beamformer/int4.hpp"
 
 #include <cuda_runtime.h>
 
@@ -102,8 +103,8 @@ class DeviceBuffer {
     Value* data_ = nullptr;
 };
 
-__global__ void direct_voltage_beamformer_kernel(
-    const ComplexFloat* voltage, const ComplexFloat* weights, float* intensity,
+__global__ void direct_packed_voltage_beamformer_kernel(
+    const std::uint8_t* packed_voltage, const ComplexFloat* weights, float* intensity,
     const std::size_t output_count, const std::size_t n_freq,
     const std::size_t n_ant, const std::size_t n_beams) {
     const std::size_t output_index =
@@ -121,10 +122,15 @@ __global__ void direct_voltage_beamformer_kernel(
     float sum_real = 0.0F;
     float sum_imag = 0.0F;
     for (std::size_t element = 0; element < n_ant; ++element) {
-        const ComplexFloat sample = voltage[voltage_offset + element];
+        // Decode at the point of use using the shared CHARTS int4x2
+        // convention: real in the low nibble, imaginary in the high nibble.
+        const ComplexInt4 packed_sample =
+            unpack_complex_int4(packed_voltage[voltage_offset + element]);
+        const float sample_real = static_cast<float>(packed_sample.real);
+        const float sample_imag = static_cast<float>(packed_sample.imag);
         const ComplexFloat weight = weights[weight_offset + element];
-        sum_real += weight.real * sample.real - weight.imag * sample.imag;
-        sum_imag += weight.real * sample.imag + weight.imag * sample.real;
+        sum_real += weight.real * sample_real - weight.imag * sample_imag;
+        sum_imag += weight.real * sample_imag + weight.imag * sample_real;
     }
     intensity[output_index] = sum_real * sum_real + sum_imag * sum_imag;
 }
@@ -136,7 +142,7 @@ float event_elapsed_ms(const CudaEvent& start, const CudaEvent& end) {
     return milliseconds;
 }
 
-void launch_direct_kernel(const ComplexFloat* voltage,
+void launch_direct_kernel(const std::uint8_t* packed_voltage,
                           const ComplexFloat* weights, float* intensity,
                           const Dimensions& dims, cudaStream_t stream) {
     constexpr std::size_t threads_per_block = 256;
@@ -146,12 +152,12 @@ void launch_direct_kernel(const ComplexFloat* voltage,
     if (block_count > std::numeric_limits<unsigned int>::max()) {
         throw std::overflow_error("CUDA grid exceeds the supported one-dimensional size");
     }
-    direct_voltage_beamformer_kernel<<<static_cast<unsigned int>(block_count),
-                                       static_cast<unsigned int>(threads_per_block), 0,
-                                       stream>>>(voltage, weights, intensity, output_count,
-                                                 dims.n_freq, dims.n_ant,
-                                                 dims.n_beams);
-    check_cuda(cudaGetLastError(), "direct_voltage_beamformer_kernel launch");
+    direct_packed_voltage_beamformer_kernel<<<static_cast<unsigned int>(block_count),
+                                              static_cast<unsigned int>(threads_per_block), 0,
+                                              stream>>>(packed_voltage, weights, intensity,
+                                                        output_count, dims.n_freq,
+                                                        dims.n_ant, dims.n_beams);
+    check_cuda(cudaGetLastError(), "direct_packed_voltage_beamformer_kernel launch");
 }
 
 } // namespace
@@ -159,7 +165,7 @@ void launch_direct_kernel(const ComplexFloat* voltage,
 struct CudaBeamformerWorkspace::Impl {
     explicit Impl(const Dimensions& requested_capacity)
         : capacity(requested_capacity),
-          device_voltage(voltage_sample_count(capacity)),
+          device_packed_voltage(voltage_sample_count(capacity)),
           device_weights(capacity.n_beams * capacity.n_freq * capacity.n_ant),
           device_intensity(capacity.n_time * capacity.n_freq * capacity.n_beams) {}
 
@@ -172,8 +178,8 @@ struct CudaBeamformerWorkspace::Impl {
     }
 
     void require_loaded(const Dimensions& dims) const {
-        if (loaded_voltage_samples < voltage_sample_count(dims)) {
-            throw std::logic_error("voltage has not been uploaded for these dimensions");
+        if (loaded_packed_voltage_samples < voltage_sample_count(dims)) {
+            throw std::logic_error("packed voltage has not been uploaded for these dimensions");
         }
         const std::size_t required_weights = dims.n_beams * dims.n_freq * dims.n_ant;
         if (loaded_weights != required_weights) {
@@ -182,7 +188,7 @@ struct CudaBeamformerWorkspace::Impl {
     }
 
     Dimensions capacity;
-    DeviceBuffer<ComplexFloat> device_voltage;
+    DeviceBuffer<std::uint8_t> device_packed_voltage;
     DeviceBuffer<ComplexFloat> device_weights;
     DeviceBuffer<float> device_intensity;
     CudaStream stream;
@@ -191,7 +197,7 @@ struct CudaBeamformerWorkspace::Impl {
     CudaEvent kernel_end;
     CudaEvent result_end;
     double measured_setup_ms = 0.0;
-    std::size_t loaded_voltage_samples = 0;
+    std::size_t loaded_packed_voltage_samples = 0;
     std::size_t loaded_weights = 0;
 };
 
@@ -226,25 +232,28 @@ double CudaBeamformerWorkspace::setup_ms() const {
     return impl_->measured_setup_ms;
 }
 
-double CudaBeamformerWorkspace::upload_voltage(const ComplexVoltage& voltage,
-                                               const Dimensions& dims) {
+std::size_t CudaBeamformerWorkspace::packed_voltage_capacity_bytes() const {
+    return voltage_sample_count(impl_->capacity);
+}
+
+double CudaBeamformerWorkspace::upload_packed_voltage(const PackedVoltage& packed,
+                                                      const Dimensions& dims) {
     impl_->validate_request(dims);
     const std::size_t count = voltage_sample_count(dims);
-    if (voltage.size() < count) {
-        throw std::invalid_argument("voltage count is smaller than dimensions");
+    if (packed.size() < count) {
+        throw std::invalid_argument("packed voltage is smaller than dimensions");
     }
 
     check_cuda(cudaEventRecord(impl_->start.get(), impl_->stream.get()),
-               "cudaEventRecord voltage start");
-    check_cuda(cudaMemcpyAsync(impl_->device_voltage.get(), voltage.data(),
-                               count * sizeof(ComplexFloat), cudaMemcpyHostToDevice,
-                               impl_->stream.get()),
-               "cudaMemcpyAsync voltage host to device");
+               "cudaEventRecord packed voltage start");
+    check_cuda(cudaMemcpyAsync(impl_->device_packed_voltage.get(), packed.data(), count,
+                               cudaMemcpyHostToDevice, impl_->stream.get()),
+               "cudaMemcpyAsync packed voltage host to device");
     check_cuda(cudaEventRecord(impl_->transfer_end.get(), impl_->stream.get()),
-               "cudaEventRecord voltage end");
+               "cudaEventRecord packed voltage end");
     check_cuda(cudaEventSynchronize(impl_->transfer_end.get()),
-               "cudaEventSynchronize voltage");
-    impl_->loaded_voltage_samples = count;
+               "cudaEventSynchronize packed voltage");
+    impl_->loaded_packed_voltage_samples = count;
     return event_elapsed_ms(impl_->start, impl_->transfer_end);
 }
 
@@ -275,7 +284,7 @@ double CudaBeamformerWorkspace::run_kernel(const Dimensions& dims) {
     impl_->require_loaded(dims);
     check_cuda(cudaEventRecord(impl_->start.get(), impl_->stream.get()),
                "cudaEventRecord kernel start");
-    launch_direct_kernel(impl_->device_voltage.get(), impl_->device_weights.get(),
+    launch_direct_kernel(impl_->device_packed_voltage.get(), impl_->device_weights.get(),
                          impl_->device_intensity.get(), dims, impl_->stream.get());
     check_cuda(cudaEventRecord(impl_->kernel_end.get(), impl_->stream.get()),
                "cudaEventRecord kernel end");
@@ -305,13 +314,13 @@ double CudaBeamformerWorkspace::download_intensity(Intensities& intensity,
 }
 
 CudaBeamformerTimings CudaBeamformerWorkspace::run_pipeline(
-    const ComplexVoltage& voltage, Intensities& intensity,
+    const PackedVoltage& packed, Intensities& intensity,
     const Dimensions& dims) {
     impl_->validate_request(dims);
-    const std::size_t voltage_count = voltage_sample_count(dims);
+    const std::size_t packed_count = voltage_sample_count(dims);
     const std::size_t output_count = dims.n_time * dims.n_freq * dims.n_beams;
-    if (voltage.size() < voltage_count) {
-        throw std::invalid_argument("voltage count is smaller than dimensions");
+    if (packed.size() < packed_count) {
+        throw std::invalid_argument("packed voltage is smaller than dimensions");
     }
     if (intensity.size() < output_count) {
         throw std::invalid_argument("intensity output is smaller than dimensions");
@@ -323,13 +332,12 @@ CudaBeamformerTimings CudaBeamformerWorkspace::run_pipeline(
 
     check_cuda(cudaEventRecord(impl_->start.get(), impl_->stream.get()),
                "cudaEventRecord pipeline start");
-    check_cuda(cudaMemcpyAsync(impl_->device_voltage.get(), voltage.data(),
-                               voltage_count * sizeof(ComplexFloat),
+    check_cuda(cudaMemcpyAsync(impl_->device_packed_voltage.get(), packed.data(), packed_count,
                                cudaMemcpyHostToDevice, impl_->stream.get()),
-               "cudaMemcpyAsync pipeline voltage host to device");
+               "cudaMemcpyAsync pipeline packed voltage host to device");
     check_cuda(cudaEventRecord(impl_->transfer_end.get(), impl_->stream.get()),
                "cudaEventRecord pipeline transfer end");
-    launch_direct_kernel(impl_->device_voltage.get(), impl_->device_weights.get(),
+    launch_direct_kernel(impl_->device_packed_voltage.get(), impl_->device_weights.get(),
                          impl_->device_intensity.get(), dims, impl_->stream.get());
     check_cuda(cudaEventRecord(impl_->kernel_end.get(), impl_->stream.get()),
                "cudaEventRecord pipeline kernel end");
@@ -341,7 +349,7 @@ CudaBeamformerTimings CudaBeamformerWorkspace::run_pipeline(
                "cudaEventRecord pipeline result end");
     check_cuda(cudaEventSynchronize(impl_->result_end.get()),
                "cudaEventSynchronize pipeline");
-    impl_->loaded_voltage_samples = voltage_count;
+    impl_->loaded_packed_voltage_samples = packed_count;
 
     CudaBeamformerTimings timings;
     timings.host_to_device_ms = event_elapsed_ms(impl_->start, impl_->transfer_end);
@@ -351,13 +359,13 @@ CudaBeamformerTimings CudaBeamformerWorkspace::run_pipeline(
     return timings;
 }
 
-Intensities cuda_beamform_intensity(const ComplexVoltage& voltage,
-                                    const Weights& weights,
-                                    const Dimensions& dims,
-                                    CudaBeamformerTimings* timings) {
+Intensities cuda_beamform_packed_intensity(const PackedVoltage& packed,
+                                           const Weights& weights,
+                                           const Dimensions& dims,
+                                           CudaBeamformerTimings* timings) {
     validate_dimensions(dims);
-    if (voltage.size() != voltage_sample_count(dims)) {
-        throw std::invalid_argument("voltage count does not match dimensions");
+    if (packed.size() != voltage_sample_count(dims)) {
+        throw std::invalid_argument("packed voltage size does not match dimensions");
     }
     if (weights.size() != dims.n_beams * dims.n_freq * dims.n_ant) {
         throw std::invalid_argument("weight count does not match dimensions");
@@ -367,7 +375,7 @@ Intensities cuda_beamform_intensity(const ComplexVoltage& voltage,
     CudaBeamformerWorkspace workspace(dims);
     CudaBeamformerTimings measured;
     measured.setup_ms = workspace.setup_ms();
-    measured.host_to_device_ms = workspace.upload_voltage(voltage, dims)
+    measured.host_to_device_ms = workspace.upload_packed_voltage(packed, dims)
                                  + workspace.upload_weights(weights, dims);
     measured.kernel_ms = workspace.run_kernel(dims);
     measured.device_to_host_ms = workspace.download_intensity(intensity, dims);

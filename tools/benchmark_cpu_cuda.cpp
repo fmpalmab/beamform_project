@@ -221,20 +221,19 @@ double rate_per_second(const double count, const double milliseconds) {
     return milliseconds > 0.0 ? count / (milliseconds / 1000.0) : 0.0;
 }
 
-beamformer::ComplexVoltage make_benchmark_voltage(const std::size_t n_ant,
-                                                  const std::size_t max_time,
-                                                  const std::uint32_t seed) {
+beamformer::PackedVoltage make_benchmark_voltage(const std::size_t n_ant,
+                                                 const std::size_t max_time,
+                                                 const std::uint32_t seed) {
     const beamformer::Dimensions one_time{
         1, beamformer::default_frequency_channels, n_ant, 1};
-    const auto packed = beamformer::make_noise(one_time, seed);
-    const auto spectrum = beamformer::unpack_voltage(packed, one_time);
-    beamformer::ComplexVoltage voltage(spectrum.size() * max_time);
+    const auto spectrum = beamformer::make_noise(one_time, seed);
+    beamformer::PackedVoltage packed(spectrum.size() * max_time);
     for (std::size_t time = 0; time < max_time; ++time) {
         std::copy(spectrum.begin(), spectrum.end(),
-                  voltage.begin()
+                  packed.begin()
                       + static_cast<std::ptrdiff_t>(time * spectrum.size()));
     }
-    return voltage;
+    return packed;
 }
 
 beamformer::Weights make_benchmark_weights(const std::size_t n_ant,
@@ -407,8 +406,8 @@ void print_memory_estimate(const std::size_t n_ant, const std::size_t max_time,
                            const std::size_t max_beams) {
     const beamformer::Dimensions capacity{
         max_time, beamformer::default_frequency_channels, n_ant, max_beams};
-    const double voltage_bytes = static_cast<double>(beamformer::voltage_sample_count(capacity)
-                                                      * sizeof(beamformer::ComplexFloat));
+    const double voltage_bytes = static_cast<double>(
+        beamformer::packed_voltage_bytes(capacity));
     const double weight_bytes = static_cast<double>(max_beams * capacity.n_freq * n_ant
                                                      * sizeof(beamformer::ComplexFloat));
     const double intensity_bytes = static_cast<double>(output_count(capacity)
@@ -431,9 +430,9 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
     const std::size_t max_beams = *std::max_element(beam_values.begin(),
                                                    beam_values.end());
     print_memory_estimate(n_ant, max_time, max_beams);
-    std::cout << "Preparing deterministic voltage prefix for n_ant=" << n_ant
+    std::cout << "Preparing deterministic packed-voltage prefix for n_ant=" << n_ant
               << "..." << std::endl;
-    auto voltage = make_benchmark_voltage(n_ant, max_time,
+    auto packed_voltage = make_benchmark_voltage(n_ant, max_time,
                                           options.seed + static_cast<std::uint32_t>(n_ant));
     const beamformer::Dimensions capacity{
         max_time, beamformer::default_frequency_channels, n_ant, max_beams};
@@ -457,11 +456,11 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
         beamformer::Intensities cpu_validation(validation_outputs);
         beamformer::Intensities gpu_validation(validation_outputs);
         const auto cpu_start = Clock::now();
-        beamformer::cpu_beamform_intensity_into(
-            voltage, weights, validation_dims, cpu_validation);
+        beamformer::cpu_beamform_packed_intensity_into(
+            packed_voltage, weights, validation_dims, cpu_validation);
         const auto cpu_end = Clock::now();
         const auto gpu_validation_timing =
-            workspace.run_pipeline(voltage, gpu_validation, validation_dims);
+            workspace.run_pipeline(packed_voltage, gpu_validation, validation_dims);
         const auto validation = compare_outputs(
             cpu_validation, gpu_validation, validation_dims,
             options.absolute_tolerance, options.relative_tolerance);
@@ -488,11 +487,11 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
                 n_time, beamformer::default_frequency_channels, n_ant, n_beams};
             const std::size_t outputs = static_cast<std::size_t>(output_count(dims));
             beamformer::Intensities gpu_output(outputs);
-            workspace.upload_voltage(voltage, dims);
+            workspace.upload_packed_voltage(packed_voltage, dims);
 
             for (std::size_t warmup = 0; warmup < options.warmup; ++warmup) {
                 const double kernel_ms = workspace.run_kernel(dims);
-                const auto pipeline = workspace.run_pipeline(voltage, gpu_output, dims);
+                const auto pipeline = workspace.run_pipeline(packed_voltage, gpu_output, dims);
                 std::cout << "gpu warmup " << warmup + 1 << '/' << options.warmup
                           << " A=" << n_ant << " B=" << n_beams
                           << " T=" << n_time << " kernel_ms=" << kernel_ms
@@ -510,7 +509,7 @@ void run_antenna_series(const Options& options, const std::size_t n_ant,
                 gpu_kernel_times[repeat] = workspace.run_kernel(dims);
                 const auto pipeline_start = Clock::now();
                 pipeline_times[repeat] =
-                    workspace.run_pipeline(voltage, gpu_output, dims);
+                    workspace.run_pipeline(packed_voltage, gpu_output, dims);
                 const auto pipeline_end = Clock::now();
                 pipeline_wall_times[repeat] = wall_ms(pipeline_start, pipeline_end);
                 write_timing_row(timings_output, dims, repeat, workspace.setup_ms(),
@@ -569,7 +568,7 @@ void write_metadata(const std::filesystem::path& path, const Options& options,
            << ",\n  \"cpu_validation_threads\": 1"
            << ",\n  \"beam_grid\": \"centered zero-padded rectangular FFT bins\""
            << ",\n  \"temporal_chunking\": false,\n"
-           << "  \"voltage_pattern\": \"one seeded int4 noise spectrum repeated over time\"\n"
+           << "  \"voltage_input\": \"packed int4x2; one seeded spectrum repeated over time\"\n"
            << "}\n";
 }
 

@@ -39,25 +39,30 @@ class CudaBeamformerWorkspace {
     CudaBeamformerWorkspace& operator=(const CudaBeamformerWorkspace&) = delete;
 
     double setup_ms() const;
-    double upload_voltage(const ComplexVoltage& voltage, const Dimensions& dims);
+    double upload_packed_voltage(const PackedVoltage& packed, const Dimensions& dims);
     double upload_weights(const Weights& weights, const Dimensions& dims);
     double run_kernel(const Dimensions& dims);
     double download_intensity(Intensities& intensity, const Dimensions& dims);
-    CudaBeamformerTimings run_pipeline(const ComplexVoltage& voltage,
+    CudaBeamformerTimings run_pipeline(const PackedVoltage& packed,
                                        Intensities& intensity,
                                        const Dimensions& dims);
+
+    // Structural validation guard: production input storage is one byte per
+    // packed complex sample, never a ComplexFloat voltage tensor.
+    std::size_t packed_voltage_capacity_bytes() const;
 
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-// Direct voltage beamformer with one CUDA thread per [time][frequency][beam]
-// output. Inputs and output use the same layouts and numerical conventions as
-// cpu_beamform_intensity.
-Intensities cuda_beamform_intensity(const ComplexVoltage& voltage,
-                                    const Weights& weights,
-                                    const Dimensions& dims,
-                                    CudaBeamformerTimings* timings = nullptr);
+// Direct packed-voltage beamformer with one CUDA thread per
+// [time][local_frequency][beam] output. Each thread decodes signed complex
+// int4 bytes inside its element loop; no full complex-float voltage tensor is
+// allocated or transferred. Weights and output remain float32.
+Intensities cuda_beamform_packed_intensity(const PackedVoltage& packed,
+                                           const Weights& weights,
+                                           const Dimensions& dims,
+                                           CudaBeamformerTimings* timings = nullptr);
 
 } // namespace beamformer

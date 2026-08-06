@@ -4,6 +4,7 @@
 #include "beamformer/io.hpp"
 #include "beamformer/synthetic_data.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -19,9 +20,10 @@ namespace {
 struct Options {
     std::string type = "point-source";
     std::filesystem::path output;
+    std::optional<std::filesystem::path> shard_output_prefix;
     std::optional<std::filesystem::path> positions_file;
     std::optional<std::filesystem::path> frequencies_file;
-    std::size_t n_time = 32;
+    std::size_t n_time = 15360;
     std::size_t n_ant = 64;
     std::size_t active_time = 0;
     std::size_t active_frequency = 0;
@@ -34,21 +36,25 @@ struct Options {
     float source_l = 0.04F;
     float source_m = 0.0F;
     float amplitude = 4.0F;
+    float loss_probability = 0.0F;
 };
 
 void print_usage(const char* program) {
     std::cout
         << "Usage: " << program << " --output FILE [options]\n"
+        << "       " << program << " --shard-output-prefix PREFIX [options]\n"
         << "\n"
         << "Data types: one-hot, constant, point-source, noise\n"
         << "\n"
         << "Common options:\n"
         << "  --type TYPE             default: point-source\n"
-        << "  --n-time N              default: 32\n"
+        << "  --n-time N              default: 15360\n"
         << "  --n-ant N               32 or 64; default: 64\n"
         << "  --value-real N          int4 value; default: 3\n"
         << "  --value-imag N          int4 value; default: -2\n"
         << "  --seed N                noise seed; default: 1\n"
+        << "  --shard-output-prefix P write P.shard{0,1}.{bin,meta,mask}\n"
+        << "  --loss-probability P    lost [T][F] frames; default: 0\n"
         << "\n"
         << "One-hot options:\n"
         << "  --active-time N --active-frequency N --active-element N\n"
@@ -96,6 +102,8 @@ Options parse_options(const int argc, char** argv) {
             std::exit(0);
         } else if (argument == "--output") {
             options.output = require_value(argc, argv, i);
+        } else if (argument == "--shard-output-prefix") {
+            options.shard_output_prefix = require_value(argc, argv, i);
         } else if (argument == "--type") {
             options.type = require_value(argc, argv, i);
         } else if (argument == "--n-time") {
@@ -127,6 +135,8 @@ Options parse_options(const int argc, char** argv) {
             options.source_m = std::stof(require_value(argc, argv, i));
         } else if (argument == "--amplitude") {
             options.amplitude = std::stof(require_value(argc, argv, i));
+        } else if (argument == "--loss-probability") {
+            options.loss_probability = std::stof(require_value(argc, argv, i));
         } else if (argument == "--positions") {
             options.positions_file = require_value(argc, argv, i);
         } else if (argument == "--frequencies") {
@@ -135,8 +145,11 @@ Options parse_options(const int argc, char** argv) {
             throw std::invalid_argument("unknown option: " + argument);
         }
     }
-    if (options.output.empty()) {
-        throw std::invalid_argument("--output is required");
+    if (options.output.empty() && !options.shard_output_prefix) {
+        throw std::invalid_argument("--output or --shard-output-prefix is required");
+    }
+    if (!options.output.empty() && options.shard_output_prefix) {
+        throw std::invalid_argument("choose --output or --shard-output-prefix, not both");
     }
     return options;
 }
@@ -173,6 +186,49 @@ beamformer::PackedVoltage generate(const Options& options,
     throw std::invalid_argument("unknown synthetic type: " + options.type);
 }
 
+
+beamformer::PackedShardSet generate_shards(
+    const Options& options, const beamformer::Dimensions& dims) {
+    if (options.frequencies_file || options.frequency_hz) {
+        throw std::invalid_argument(
+            "two-shard output uses canonical absolute frequency mapping; custom frequency overrides are not supported");
+    }
+    const std::array<std::uint32_t, beamformer::frequency_shard_count> loss_seeds{
+        options.seed, options.seed + 1U};
+    if (options.type == "one-hot") {
+        return beamformer::make_two_shard_one_hot(
+            dims, options.active_time, {options.active_frequency, options.active_frequency},
+            {options.active_element, options.active_element},
+            {options.value_real, options.value_imag}, loss_seeds,
+            options.loss_probability);
+    }
+    if (options.type == "constant") {
+        return beamformer::make_two_shard_constant(
+            dims, {options.value_real, options.value_imag}, loss_seeds,
+            options.loss_probability);
+    }
+    if (options.type == "noise") {
+        return beamformer::make_two_shard_noise(
+            dims, options.seed, options.loss_probability);
+    }
+    if (options.type == "point-source") {
+        const auto positions = options.positions_file
+                                   ? beamformer::load_positions(*options.positions_file, dims.n_ant)
+                                   : beamformer::default_positions(dims.n_ant, options.spacing_m);
+        return beamformer::make_two_shard_point_source(
+            dims, positions,
+            beamformer::direction_from_lm(options.source_l, options.source_m),
+            options.amplitude, loss_seeds, options.loss_probability);
+    }
+    throw std::invalid_argument("unknown synthetic type: " + options.type);
+}
+
+std::filesystem::path shard_file(const std::filesystem::path& prefix,
+                                 const std::size_t shard_id,
+                                 const char* suffix) {
+    return prefix.string() + ".shard" + std::to_string(shard_id) + suffix;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -185,12 +241,32 @@ int main(int argc, char** argv) {
             1,
         };
         beamformer::validate_dimensions(dims);
-        const auto voltage = generate(options, dims);
-        beamformer::write_packed_voltage(options.output, voltage, dims);
-
-        std::cout << "Wrote " << voltage.size() << " bytes to " << options.output << "\n"
-                  << "layout=[T=" << dims.n_time << "][F=" << dims.n_freq
-                  << "][E=" << dims.n_ant << "] type=" << options.type << "\n";
+        if (options.shard_output_prefix) {
+            const auto shards = generate_shards(options, dims);
+            for (std::size_t shard_id = 0;
+                 shard_id < beamformer::frequency_shard_count; ++shard_id) {
+                const auto payload = shard_file(*options.shard_output_prefix, shard_id, ".bin");
+                const auto metadata = shard_file(*options.shard_output_prefix, shard_id, ".meta");
+                const auto mask = shard_file(*options.shard_output_prefix, shard_id, ".mask");
+                beamformer::write_packed_shard(
+                    payload, metadata, mask, shards[shard_id], dims);
+                std::cout << "Wrote shard " << shard_id << ": "
+                          << shards[shard_id].payload.size() << " payload bytes, "
+                          << shards[shard_id].loss_mask.size() << " mask bytes\n"
+                          << "  payload=" << payload << "\n"
+                          << "  metadata=" << metadata << "\n"
+                          << "  loss-mask=" << mask << "\n";
+            }
+            std::cout << "layout=[T=" << dims.n_time << "][F_local=" << dims.n_freq
+                      << "][E=" << dims.n_ant << "] shards=2 type="
+                      << options.type << "\n";
+        } else {
+            const auto voltage = generate(options, dims);
+            beamformer::write_packed_voltage(options.output, voltage, dims);
+            std::cout << "Wrote " << voltage.size() << " bytes to " << options.output << "\n"
+                      << "layout=[T=" << dims.n_time << "][F_local=" << dims.n_freq
+                      << "][E=" << dims.n_ant << "] type=" << options.type << "\n";
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "generate_fake_data: " << error.what() << "\n";

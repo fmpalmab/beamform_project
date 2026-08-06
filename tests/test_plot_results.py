@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+from types import SimpleNamespace
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,9 +27,43 @@ class PlotResultsTest(unittest.TestCase):
 
     def test_default_frequency_centers(self):
         frequencies = plot_results.default_frequencies()
-        self.assertEqual(frequencies.shape, (672,))
+        self.assertEqual(frequencies.shape, (336,))
         self.assertEqual(frequencies[0], 300_000_000.0)
         self.assertEqual(frequencies[1], 300_300_000.0)
+        self.assertEqual(frequencies[-1], 400_500_000.0)
+
+    def test_buffer_frequency_configuration(self):
+        self.assertEqual(
+            plot_results.resolve_frequency_configuration(None, None), ("0", 336)
+        )
+        self.assertEqual(
+            plot_results.resolve_frequency_configuration("1", None), ("1", 336)
+        )
+        self.assertEqual(
+            plot_results.resolve_frequency_configuration("both", None), ("both", 672)
+        )
+        self.assertEqual(
+            plot_results.resolve_frequency_configuration(None, 672), ("both", 672)
+        )
+        with self.assertRaises(ValueError):
+            plot_results.resolve_frequency_configuration("0", 672)
+
+    def test_combine_intensity_shards_preserves_frequency_order(self):
+        shard0 = np.zeros((2, 336, 3), dtype=np.float32)
+        shard1 = np.ones((2, 336, 3), dtype=np.float32)
+        combined = plot_results.combine_intensity_shards(shard0, shard1)
+        self.assertEqual(combined.shape, (2, 672, 3))
+        np.testing.assert_array_equal(combined[:, :336], shard0)
+        np.testing.assert_array_equal(combined[:, 336:], shard1)
+
+    def test_buffer_one_uses_absolute_frequency_origin(self):
+        args = plot_results.build_parser().parse_args([
+            "--sky-output", "unused.png", "--buffer", "1", "--n-time", "1",
+        ])
+        plot_results.validate_args(args)
+        _, frequencies, _ = plot_results._load_geometry(args)
+        self.assertEqual(frequencies.shape, (336,))
+        self.assertEqual(frequencies[0], 400_800_000.0)
         self.assertEqual(frequencies[-1], 501_300_000.0)
 
     def test_default_beams_match_cpp_grid(self):
@@ -135,6 +170,35 @@ class PlotResultsTest(unittest.TestCase):
             np.testing.assert_array_equal(loaded, values)
             with self.assertRaisesRegex(ValueError, "expected"):
                 plot_results.load_intensity(invalid, 2, 672, 3)
+
+    def test_beam_plane_keeps_centers_and_draws_response_contours(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        directions = plot_results.generate_hex_targets_cropped_fov(7, 0.6, 0.4)
+        directions = np.column_stack((directions[0], directions[1], np.sqrt(
+            1.0 - directions[0] ** 2 - directions[1] ** 2)))
+        args = SimpleNamespace(
+            source_l=0.04,
+            source_m=0.0,
+            beam_l_step=0.02,
+            n_ant=64,
+            spacing_m=0.6,
+            design_frequency_hz=400e6,
+            synthetic_type="point-source",
+        )
+        figure, axis = plt.subplots()
+        plot_results._plot_beam_directions_and_power(
+            figure, axis, args, directions, np.linspace(0.2, 1.0, len(directions)))
+        self.assertEqual(axis.get_xlim(), (-1.0, 1.0))
+        self.assertEqual(axis.get_ylim(), (-1.0, 1.0))
+        center_collection = next(collection for collection in axis.collections
+                                 if collection.get_offsets().shape[0] == len(directions))
+        np.testing.assert_allclose(center_collection.get_offsets(), directions[:, :2])
+        self.assertGreaterEqual(len(axis.patches), 2)
+        self.assertGreater(len(axis.collections), len(directions))
+        plt.close(figure)
 
     def test_comparison_metrics(self):
         reference = np.asarray([1.0, 2.0, 4.0], dtype=np.float32)

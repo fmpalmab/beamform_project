@@ -25,11 +25,24 @@ constexpr std::size_t rfsoc_output_element(const std::size_t rfsoc_id,
     return (num_rfsocs - 1 - rfsoc_id) * elements_per_rfsoc + packet_element;
 }
 
-// The real deployment has 336 channels per NIC. The PoC stores both halves in
-// one 672-channel file: NIC 0 -> [0,335], NIC 1 -> [336,671].
+// A local shard remains a separate buffer. Absolute channel mapping is metadata,
+// not a concatenation operation: shard 0 normally starts at 0 and shard 1 at 336.
+constexpr std::size_t absolute_frequency(const ShardDescriptor& shard,
+                                          const std::size_t local_frequency) {
+    return shard.absolute_frequency_start + local_frequency;
+}
+
+constexpr std::size_t shard_voltage_index(const std::size_t time,
+                                          const std::size_t local_frequency,
+                                          const std::size_t element,
+                                          const Dimensions& dims,
+                                          const ShardDescriptor& /*shard*/) {
+    return voltage_index(time, local_frequency, element, dims);
+}
+
 constexpr std::size_t full_band_frequency(const std::size_t nic_id,
                                           const std::size_t local_frequency) {
-    return nic_id * rfsoc_channels_per_nic + local_frequency;
+    return nic_id * local_frequency_channels + local_frequency;
 }
 
 constexpr std::size_t weight_index(const std::size_t b, const std::size_t f,

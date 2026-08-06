@@ -48,6 +48,16 @@ class PlotBenchmarkTest(unittest.TestCase):
         self.assertEqual(record["speedup_pipeline"], 2.0)
         self.assertAlmostEqual(record["cpu_cmac_per_s"], 1_376_256.0 / 0.012)
 
+    def test_buffer_filter_keeps_frequency_modes_separate(self):
+        local = dict(timing_row(0, 0.0, 2.0, 5.0), n_freq=336.0)
+        full = timing_row(0, 0.0, 2.0, 5.0)
+        self.assertEqual(len(plot_benchmark.filter_records_for_buffer(
+            [local, full], "0")), 1)
+        self.assertEqual(len(plot_benchmark.filter_records_for_buffer(
+            [local, full], "both")), 1)
+        with self.assertRaises(ValueError):
+            plot_benchmark.filter_records_for_buffer([local, full], None)
+
     def test_gpu_only_summary_omits_cpu_and_speedup(self):
         rows = [timing_row(0, 10.0, 2.0, 5.0),
                 timing_row(1, 14.0, 4.0, 7.0)]

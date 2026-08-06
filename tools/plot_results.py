@@ -13,7 +13,9 @@ import numpy as np
 
 
 SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
-DEFAULT_N_FREQ = 672
+LOCAL_FREQUENCY_CHANNELS = 336
+FULL_BAND_FREQUENCY_CHANNELS = 672
+DEFAULT_N_FREQ = LOCAL_FREQUENCY_CHANNELS
 DEFAULT_FREQUENCY_START_HZ = 300_000_000.0
 DEFAULT_CHANNEL_WIDTH_HZ = 300_000.0
 BEAM_GRID_DESIGN_FREQUENCY_HZ = 400_000_000.0
@@ -24,6 +26,49 @@ ANTENNA_SPECS = {
     400e6: {"BW_E": 108.0, "BW_H": 74.0, "gain_dBi": 7.75},
     500e6: {"BW_E": 120.0, "BW_H": 87.0, "gain_dBi": 7.0},
 }
+
+def resolve_frequency_configuration(
+    buffer: str | None, requested_n_freq: int | None,
+) -> tuple[str, int]:
+    """Resolve a local buffer or full-band plotting configuration.
+
+    ``buffer=None`` keeps compatibility with the old ``--n-freq`` interface:
+    336 selects buffer 0 and 672 selects the full band. The explicit buffer
+    option is preferred because it also documents which local shard is being
+    plotted.
+    """
+    if buffer is None:
+        if requested_n_freq in (None, LOCAL_FREQUENCY_CHANNELS):
+            return "0", LOCAL_FREQUENCY_CHANNELS
+        if requested_n_freq == FULL_BAND_FREQUENCY_CHANNELS:
+            return "both", FULL_BAND_FREQUENCY_CHANNELS
+        raise ValueError("n_freq must be 336 or 672")
+
+    expected = (FULL_BAND_FREQUENCY_CHANNELS if buffer == "both"
+                else LOCAL_FREQUENCY_CHANNELS)
+    if requested_n_freq is not None and requested_n_freq != expected:
+        raise ValueError(
+            f"buffer={buffer} requires n_freq={expected}, got {requested_n_freq}"
+        )
+    return buffer, expected
+
+
+def buffer_label(buffer: str, n_freq: int) -> str:
+    if buffer == "both":
+        return f"full band ({n_freq} channels)"
+    return f"buffer {buffer} ({n_freq} local channels)"
+
+
+def combine_intensity_shards(shard0: np.ndarray, shard1: np.ndarray) -> np.ndarray:
+    """Combine two local output shards for plotting along frequency only."""
+    if shard0.ndim != 3 or shard1.ndim != 3:
+        raise ValueError("shard intensity arrays must have shape [T][F][B]")
+    if shard0.shape[0] != shard1.shape[0] or shard0.shape[2] != shard1.shape[2]:
+        raise ValueError("shard intensity dimensions differ in time or beams")
+    if shard0.shape[1] != LOCAL_FREQUENCY_CHANNELS \
+            or shard1.shape[1] != LOCAL_FREQUENCY_CHANNELS:
+        raise ValueError("both shard intensity arrays must contain 336 channels")
+    return np.concatenate((shard0, shard1), axis=1)
 
 
 def _text_rows(path: Path, columns: int) -> np.ndarray:
@@ -340,6 +385,17 @@ def load_intensity(path: Path, n_time: int, n_freq: int,
     return np.fromfile(path, dtype="<f4").reshape(n_time, n_freq, n_beams)
 
 
+def load_selected_intensity(primary: Path, secondary: Path | None,
+                            n_time: int, n_freq: int, n_beams: int,
+                            buffer: str) -> np.ndarray:
+    """Load one buffer, a precombined band, or two local output buffers."""
+    if buffer == "both" and secondary is not None:
+        shard0 = load_intensity(primary, n_time, LOCAL_FREQUENCY_CHANNELS, n_beams)
+        shard1 = load_intensity(secondary, n_time, LOCAL_FREQUENCY_CHANNELS, n_beams)
+        return combine_intensity_shards(shard0, shard1)
+    return load_intensity(primary, n_time, n_freq, n_beams)
+
+
 def baseline_uv(positions_m: np.ndarray, frequency_hz: float) -> np.ndarray:
     wavelength_m = SPEED_OF_LIGHT_M_PER_S / frequency_hz
     baselines = []
@@ -422,8 +478,11 @@ def _load_geometry(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np
     elif args.frequency_hz is not None:
         frequencies = np.full(args.n_freq, args.frequency_hz, dtype=np.float64)
     else:
+        frequency_start_hz = args.frequency_start_hz
+        if args.buffer == "1":
+            frequency_start_hz += LOCAL_FREQUENCY_CHANNELS * args.channel_width_hz
         frequencies = default_frequencies(
-            args.n_freq, args.frequency_start_hz, args.channel_width_hz)
+            args.n_freq, frequency_start_hz, args.channel_width_hz)
     if frequencies.shape != (args.n_freq,) or np.any(frequencies <= 0.0):
         raise ValueError(f"frequencies must contain exactly {args.n_freq} positive values")
 
@@ -470,6 +529,89 @@ def _beam_contours(ax: object, l_axis: np.ndarray, m_axis: np.ndarray,
                        levels=[threshold_linear], colors=[color], linewidths=0.65)
 
 
+def _plot_beam_directions_and_power(
+    fig: object,
+    ax: object,
+    args: argparse.Namespace,
+    directions: np.ndarray,
+    normalized_power: np.ndarray,
+) -> None:
+    """Plot beam centers over a local l/m response map."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Ellipse
+
+    centers = directions[:, :2]
+    source = np.asarray([args.source_l, args.source_m], dtype=np.float64)
+    # Keep the complete visible-sky context in this plot.
+    l_axis = np.linspace(-1.0, 1.0, 241)
+    m_axis = np.linspace(-1.0, 1.0, 241)
+
+    response = beam_power_cube(
+        l_axis, m_axis, directions, args.n_ant, args.spacing_m,
+        args.design_frequency_hz)
+    beam_peaks = np.nanmax(response, axis=(1, 2), keepdims=True)
+    response = response / np.maximum(beam_peaks, np.finfo(float).tiny)
+    finite_response = np.nan_to_num(response, nan=0.0)
+    maximum_response = np.max(finite_response, axis=0)
+    response_db = np.full_like(maximum_response, -24.0)
+    valid = np.any(np.isfinite(response), axis=0)
+    response_db[valid] = 10.0 * np.log10(
+        np.maximum(maximum_response[valid], 10.0 ** (-24.0 / 10.0)))
+    response_image = ax.contourf(
+        l_axis, m_axis, response_db,
+        levels=np.linspace(-24.0, 0.0, 13), cmap="inferno",
+        vmin=-24.0, vmax=0.0, alpha=0.88)
+
+    contour_colors = plt.colormaps["viridis"](
+        np.linspace(0.0, 1.0, len(directions)))
+    for beam, color in enumerate(contour_colors):
+        ax.contour(
+            l_axis, m_axis, response[beam],
+            levels=[10.0 ** (-3.0 / 10.0)], colors=[color],
+            linewidths=0.75, alpha=0.9)
+
+    bw_e, bw_h, _ = interpolated_antenna_specs(args.design_frequency_hz)
+    fov_u = min(1.0, np.sin(np.radians(float(bw_h) / 2.0)))
+    fov_v = min(1.0, np.sin(np.radians(float(bw_e) / 2.0)))
+    ax.add_patch(Ellipse(
+        (0.0, 0.0), width=2.0 * fov_u, height=2.0 * fov_v,
+        fill=False, edgecolor="white", linestyle="--", linewidth=1.0,
+        label="antenna 3 dB FoV", zorder=5))
+    ax.add_patch(plt.Circle(
+        (0.0, 0.0), 1.0, fill=False, color="white", linestyle=":",
+        linewidth=0.9, label="visible sky", zorder=5))
+
+    points = ax.scatter(
+        centers[:, 0], centers[:, 1], c=normalized_power,
+        s=45.0 + 240.0 * normalized_power, cmap="viridis", vmin=0.0,
+        vmax=1.0, edgecolor="black", linewidth=0.5, zorder=7)
+    label_count = min(len(centers), 12)
+    label_beams = np.argsort(normalized_power)[-label_count:]
+    for beam in label_beams:
+        l_value, m_value = centers[beam]
+        ax.annotate(
+            f"B{beam}", (l_value, m_value), xytext=(3, 3),
+            textcoords="offset points", fontsize=6, zorder=8)
+    if args.synthetic_type == "point-source":
+        ax.scatter(
+            [args.source_l], [args.source_m], marker="*", s=220,
+            color="red", edgecolor="black", label="injected source", zorder=9)
+
+    fig.colorbar(response_image, ax=ax, fraction=0.046, pad=0.03,
+                 label="maximum beam response [dB]")
+    fig.colorbar(points, ax=ax, fraction=0.046, pad=0.10,
+                 label="recovered power / maximum")
+    ax.set_xlim(-1.0, 1.0)
+    ax.set_ylim(-1.0, 1.0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set(
+        title=("Beam directions and recovered power\n"
+               f"response contours at {args.design_frequency_hz / 1e6:g} MHz"),
+        xlabel="l (H / x direction)", ylabel="m (E / y direction)")
+    ax.grid(alpha=0.25, zorder=1)
+    ax.legend(fontsize=7, loc="best")
+
+
 def plot_sky_coverage(args: argparse.Namespace, frequencies: np.ndarray,
                       directions: np.ndarray) -> Path:
     import matplotlib.pyplot as plt
@@ -482,14 +624,15 @@ def plot_sky_coverage(args: argparse.Namespace, frequencies: np.ndarray,
     visible = l_grid * l_grid + m_grid * m_grid <= 1.0
     threshold_linear = 10.0 ** (args.overlap_db / 10.0)
 
-    display_frequencies = (300e6, 400e6, 500e6)
+    display_frequencies = tuple(float(value) for value in np.linspace(
+        frequencies[0], frequencies[-1], 3))
     display_power = {
         frequency: beam_power_cube(
             l_axis, m_axis, directions, args.n_ant, args.spacing_m, frequency)
         for frequency in display_frequencies
     }
 
-    band_average = np.zeros_like(display_power[400e6])
+    band_average = np.zeros_like(display_power[display_frequencies[1]])
     for frequency in frequencies:
         band_average += np.nan_to_num(
             beam_power_cube(l_axis, m_axis, directions, args.n_ant,
@@ -499,7 +642,7 @@ def plot_sky_coverage(args: argparse.Namespace, frequencies: np.ndarray,
     band_average /= len(frequencies)
     band_average[:, ~visible] = np.nan
 
-    reference_power = display_power[400e6]
+    reference_power = display_power[display_frequencies[1]]
     normalized_reference = reference_power / np.nanmax(
         reference_power, axis=(1, 2), keepdims=True)
     overlap_count = np.sum(normalized_reference >= threshold_linear, axis=0).astype(float)
@@ -527,7 +670,7 @@ def plot_sky_coverage(args: argparse.Namespace, frequencies: np.ndarray,
         cmap="turbo", interpolation="nearest", vmin=0, vmax=args.n_beams - 1,
     )
     ax.scatter(directions[:, 0], directions[:, 1], s=12, color="black")
-    _sky_axes(ax, "Dominant beam at 400 MHz")
+    _sky_axes(ax, f"Dominant beam at {display_frequencies[1] / 1e6:.3f} MHz")
     fig.colorbar(dominant_image, ax=ax, label="beam index")
 
     for ax, frequency in zip(axes.flat[1:4], display_frequencies):
@@ -556,15 +699,69 @@ def plot_sky_coverage(args: argparse.Namespace, frequencies: np.ndarray,
     band_image = ax.imshow(band_gain_dbi, origin="lower", extent=(-1, 1, -1, 1),
                            cmap="viridis", vmin=0.0,
                            vmax=10.0 * np.log10(args.n_ant) + 9.0)
-    _sky_axes(ax, "Exact average over 672 channels | maximum absolute gain")
+    _sky_axes(ax, f"Exact average over {len(frequencies)} channels | {args.buffer_label} | maximum absolute gain")
     fig.colorbar(band_image, ax=ax, label="band-averaged gain [dBi]")
 
     ax = axes[1, 2]
     overlap_image = ax.imshow(overlap_count, origin="lower", extent=(-1, 1, -1, 1),
                               cmap="magma", interpolation="nearest", vmin=0)
     ax.scatter(directions[:, 0], directions[:, 1], s=8, color="cyan")
-    _sky_axes(ax, f"Beam overlap at 400 MHz | responses >= {args.overlap_db:g} dB")
+    _sky_axes(ax, f"Beam overlap at {display_frequencies[1] / 1e6:.3f} MHz | responses >= {args.overlap_db:g} dB")
     fig.colorbar(overlap_image, ax=ax, label="number of overlapping beams")
+
+    fig.savefig(output, dpi=args.dpi)
+    if args.show:
+        plt.show()
+    plt.close(fig)
+    return output
+
+
+def plot_geometry_and_uv(args: argparse.Namespace,
+                         positions: np.ndarray,
+                         frequencies: np.ndarray) -> Path:
+    import matplotlib.pyplot as plt
+
+    output = args.geometry_output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    uv_channel = args.uv_channel if args.uv_channel is not None else args.n_freq // 2
+    if not 0 <= uv_channel < args.n_freq:
+        raise ValueError("uv-channel is outside the frequency range")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
+    fig.suptitle(
+        f"Array configuration | {args.n_ant} elements | d={args.spacing_m:g} m\n"
+        f"{args.buffer_label}", fontsize=13)
+
+    first_block = min(32, args.n_ant)
+    axes[0].scatter(
+        positions[:first_block, 0], positions[:first_block, 1],
+        color="royalblue", s=45, edgecolor="black", linewidth=0.4,
+        label=f"E[0..{first_block - 1}]",
+    )
+    if args.n_ant > first_block:
+        axes[0].scatter(
+            positions[first_block:, 0], positions[first_block:, 1],
+            color="crimson", s=45, edgecolor="black", linewidth=0.4,
+            label=f"E[{first_block}..{args.n_ant - 1}]",
+        )
+    axes[0].set(title=f"Array geometry ({args.n_ant} elements)",
+                xlabel="x [m]", ylabel="y [m]")
+    axes[0].set_aspect("equal", adjustable="box")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(fontsize=8)
+
+    uv = baseline_uv(positions, float(frequencies[uv_channel]))
+    axes[1].scatter(uv[:, 0], uv[:, 1], s=8, alpha=0.55)
+    axes[1].scatter([0.0], [0.0], marker="+", color="black",
+                    label="autocorrelation")
+    axes[1].set(
+        title=(f"u-v baseline coverage | channel {uv_channel}, "
+               f"{frequencies[uv_channel] / 1e6:.3f} MHz"),
+        xlabel="u [wavelengths]", ylabel="v [wavelengths]",
+    )
+    axes[1].set_aspect("equal", adjustable="box")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(fontsize=8)
 
     fig.savefig(output, dpi=args.dpi)
     if args.show:
@@ -585,84 +782,43 @@ def plot_dashboard(args: argparse.Namespace, intensity: np.ndarray,
     comparison_integrated = (comparison.sum(axis=(0, 1), dtype=np.float64)
                              if comparison is not None else None)
 
-    fig, axes = plt.subplots(2, 3, figsize=(17, 10), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 11), constrained_layout=True)
     fig.suptitle(
         f"{args.label} beamforming validation | layout "
         f"[T={args.n_time}][F={args.n_freq}][B={args.n_beams}]\n"
+        f"{args.buffer_label}\n"
         f"{synthetic_description(args)}",
         fontsize=14,
     )
 
     ax = axes[0, 0]
-    first_block = min(32, args.n_ant)
-    ax.scatter(positions[:first_block, 0], positions[:first_block, 1], color="royalblue",
-               s=45, edgecolor="black", linewidth=0.4,
-               label=f"E[0..{first_block - 1}]")
-    if args.n_ant > first_block:
-        ax.scatter(positions[first_block:, 0], positions[first_block:, 1], color="crimson",
-                   s=45, edgecolor="black", linewidth=0.4,
-                   label=f"E[{first_block}..{args.n_ant - 1}]")
-    ax.set(title=f"Array geometry ({args.n_ant} elements)", xlabel="x [m]", ylabel="y [m]")
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(alpha=0.25)
-    ax.legend(fontsize=8)
+    normalized_power = integrated / max(float(np.max(integrated)), np.finfo(float).tiny)
+    _plot_beam_directions_and_power(
+        fig, ax, args, directions, normalized_power)
 
     ax = axes[0, 1]
-    uv_channel = args.uv_channel if args.uv_channel is not None else args.n_freq // 2
-    if not 0 <= uv_channel < args.n_freq:
-        raise ValueError("uv-channel is outside the frequency range")
-    uv = baseline_uv(positions, float(frequencies[uv_channel]))
-    ax.scatter(uv[:, 0], uv[:, 1], s=8, alpha=0.55)
-    ax.scatter([0.0], [0.0], marker="+", color="black", label="autocorrelation")
-    ax.set(title=(f"u-v baseline coverage | channel {uv_channel}, "
-                  f"{frequencies[uv_channel] / 1e6:.3f} MHz"),
-           xlabel="u [wavelengths]", ylabel="v [wavelengths]")
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(alpha=0.25)
-
-    ax = axes[0, 2]
-    normalized_power = integrated / max(float(np.max(integrated)), np.finfo(float).tiny)
-    points = ax.scatter(directions[:, 0], directions[:, 1], c=normalized_power,
-                        s=80 + 320 * normalized_power, cmap="viridis", vmin=0.0, vmax=1.0,
-                        edgecolor="black", linewidth=0.5)
-    for beam, (l_value, m_value) in enumerate(directions[:, :2]):
-        ax.annotate(f"B{beam}", (l_value, m_value), xytext=(4, 5),
-                    textcoords="offset points", fontsize=8)
-    if args.synthetic_type == "point-source":
-        ax.scatter([args.source_l], [args.source_m], marker="*", s=220, color="red",
-                   edgecolor="black", label="injected source")
-        ax.legend(loc="best")
-    fig.colorbar(points, ax=ax, label="integrated power / maximum")
-    l_padding = max(args.beam_l_step, 0.01)
-    m_padding = max(args.beam_l_step, 0.01)
-    ax.set_xlim(min(np.min(directions[:, 0]), args.source_l) - l_padding,
-                max(np.max(directions[:, 0]), args.source_l) + l_padding)
-    ax.set_ylim(min(np.min(directions[:, 1]), args.source_m) - m_padding,
-                max(np.max(directions[:, 1]), args.source_m) + m_padding)
-    ax.set(title="Beam directions and recovered power", xlabel="l", ylabel="m")
-    ax.grid(alpha=0.25)
-
-    ax = axes[1, 0]
-    beam_axis = np.arange(args.n_beams)
-    ax.plot(beam_axis, integrated, "o-", linewidth=2, label=args.label)
+    top_count = min(8, args.n_beams)
+    top_beams = np.argsort(integrated)[-top_count:][::-1]
+    top_labels = [f"B{beam}" for beam in top_beams]
+    top_values = integrated[top_beams]
+    ax.bar(np.arange(top_count) - 0.2,
+           top_values / max(top_values[0], 1.0e-30), width=0.4, label=args.label)
     if comparison_integrated is not None:
-        ax.plot(beam_axis, comparison_integrated, "s--", label=args.compare_label)
-    ax.axvline(peak_beam, color="tab:green", linestyle=":",
-               label=f"peak B{peak_beam}: l={directions[peak_beam, 0]:g}")
-    if args.synthetic_type == "point-source":
-        expected_beam = int(np.argmin(np.sum(
-            (directions[:, :2] - np.asarray([args.source_l, args.source_m])) ** 2, axis=1)))
-        ax.axvline(expected_beam, color="red", linestyle="--",
-                   label=f"closest to source: B{expected_beam}")
-    ax.set(title="Integrated intensity", xlabel="beam index", ylabel="sum over time and frequency")
-    ax.set_xticks(beam_axis)
-    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+        comparison_top = comparison_integrated[top_beams]
+        ax.bar(np.arange(top_count) + 0.2,
+               comparison_top / max(comparison_top[0], 1.0e-30),
+               width=0.4, label=args.compare_label)
+    ax.set(title="Top recovered beams", xlabel="beam",
+           ylabel="relative integrated power")
+    ax.set_xticks(np.arange(top_count), top_labels)
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8)
 
-    ax = axes[1, 1]
+    ax = axes[1, 0]
     spectrum = intensity.sum(axis=0, dtype=np.float64)
-    selected = list(dict.fromkeys([peak_beam, 0, args.n_beams - 1]))
+    comparison_spectrum = (comparison.sum(axis=0, dtype=np.float64)
+                           if comparison is not None else None)
+    selected = list(top_beams[:min(3, top_count)])
     frequencies_vary = not np.allclose(frequencies, frequencies[0])
     if frequencies_vary:
         spectrum_axis = frequencies / 1e6
@@ -677,8 +833,7 @@ def plot_dashboard(args: argparse.Namespace, intensity: np.ndarray,
     for beam in selected:
         ax.plot(spectrum_axis, normalized_db(spectrum[:, beam], spectrum_reference),
                 label=f"{args.label} B{beam} (l={directions[beam, 0]:g})")
-        if comparison is not None:
-            comparison_spectrum = comparison.sum(axis=0, dtype=np.float64)
+        if comparison_spectrum is not None:
             ax.plot(spectrum_axis,
                     normalized_db(comparison_spectrum[:, beam], spectrum_reference),
                     linestyle="--", alpha=0.8,
@@ -688,13 +843,16 @@ def plot_dashboard(args: argparse.Namespace, intensity: np.ndarray,
     ax.grid(alpha=0.25)
     ax.legend(fontsize=7, ncol=2)
 
-    ax = axes[1, 2]
+    ax = axes[1, 1]
     time_beam = intensity.sum(axis=1, dtype=np.float64)
     image = ax.imshow(normalized_db(time_beam), origin="lower", aspect="auto",
-                      cmap="magma", vmin=-80.0, vmax=0.0,
+                      cmap="magma",
                       extent=(-0.5, args.n_beams - 0.5, -0.5, args.n_time - 0.5))
     ax.set(title="Intensity versus time and beam", xlabel="beam index", ylabel="time index")
-    ax.set_xticks(beam_axis)
+    if args.n_beams <= 16:
+        ax.set_xticks(np.arange(args.n_beams))
+    else:
+        ax.set_xticks([])
     fig.colorbar(image, ax=ax, label="power relative to maximum [dB]")
 
     fig.savefig(output, dpi=args.dpi)
@@ -790,17 +948,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Visualize and optionally compare [T][F][B] beamformer intensity files."
     )
-    parser.add_argument("--input", type=Path, help="optional reference intensity file")
+    parser.add_argument("--input", type=Path, help="reference file; shard 0 when --buffer both")
+    parser.add_argument("--input-shard1", type=Path, help="optional shard 1 file when --buffer both")
     parser.add_argument("--compare", type=Path, help="optional second CPU/CUDA intensity file")
+    parser.add_argument("--compare-shard1", type=Path, help="optional shard 1 comparison file when --buffer both")
     parser.add_argument("--output", type=Path, help="validation dashboard PNG")
     parser.add_argument("--comparison-output", type=Path, help="CPU/GPU comparison PNG")
     parser.add_argument("--summary-json", type=Path, help="optional comparison metrics JSON")
     parser.add_argument("--sky-output", type=Path,
                         help="optional full-sky beam-grid coverage PNG")
+    parser.add_argument("--geometry-output", type=Path,
+                        help="optional array geometry and u-v coverage PNG")
     parser.add_argument("--label", default="CPU", help="reference dataset label")
     parser.add_argument("--compare-label", default="CUDA", help="second dataset label")
-    parser.add_argument("--n-time", type=int, default=32)
-    parser.add_argument("--n-freq", type=int, default=DEFAULT_N_FREQ)
+    parser.add_argument("--n-time", type=int, default=15360)
+    parser.add_argument("--buffer", choices=("0", "1", "both"),
+                        help="plot local buffer 0, local buffer 1, or both")
+    parser.add_argument("--n-freq", type=int,
+                        help="compatibility override: 336 for one buffer or 672 for both")
     parser.add_argument("--n-ant", type=int, default=32)
     parser.add_argument("--n-beams", type=int, default=5)
     parser.add_argument("--spacing-m", type=float, default=DEFAULT_SPACING_M)
@@ -845,8 +1010,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.n_time <= 0 or args.n_freq != DEFAULT_N_FREQ:
-        raise ValueError("n_time must be positive and this PoC requires n_freq=672")
+    if args.n_time <= 0:
+        raise ValueError("n_time must be positive")
+    args.buffer, args.n_freq = resolve_frequency_configuration(args.buffer, args.n_freq)
+    args.buffer_label = buffer_label(args.buffer, args.n_freq)
     valid_beam_count = 1 <= args.n_beams <= 128
     if args.n_ant not in (32, 64) or not valid_beam_count:
         raise ValueError("n_ant must be 32 or 64; n_beams must be 1 to 128")
@@ -861,10 +1028,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("comparison tolerances must be positive")
     if args.sky_resolution < 51 or args.overlap_db >= 0.0:
         raise ValueError("sky resolution must be at least 51 and overlap-db must be negative")
-    if args.input is None and args.sky_output is None:
-        raise ValueError("provide --input, --sky-output, or both")
+    if args.input is None and args.sky_output is None and args.geometry_output is None:
+        raise ValueError("provide --input, --geometry-output, --sky-output, or a combination")
     if args.compare is not None and args.input is None:
         raise ValueError("--compare requires --input")
+    if args.input_shard1 is not None and args.buffer != "both":
+        raise ValueError("--input-shard1 requires --buffer both")
+    if args.compare_shard1 is not None and args.buffer != "both":
+        raise ValueError("--compare-shard1 requires --buffer both")
+    if args.input_shard1 is not None and args.input is None:
+        raise ValueError("--input-shard1 requires --input as shard 0")
+    if args.compare_shard1 is not None and args.compare is None:
+        raise ValueError("--compare-shard1 requires --compare as shard 0")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -875,9 +1050,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         matplotlib.use("Agg")
 
     positions, frequencies, directions = _load_geometry(args)
-    intensity = (load_intensity(args.input, args.n_time, args.n_freq, args.n_beams)
+    intensity = (load_selected_intensity(
+        args.input, args.input_shard1, args.n_time, args.n_freq, args.n_beams, args.buffer)
                  if args.input else None)
-    comparison = (load_intensity(args.compare, args.n_time, args.n_freq, args.n_beams)
+    comparison = (load_selected_intensity(
+        args.compare, args.compare_shard1, args.n_time, args.n_freq, args.n_beams, args.buffer)
                   if args.compare else None)
     if intensity is not None:
         dashboard = plot_dashboard(
@@ -897,6 +1074,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Wrote comparison metrics: {args.summary_json}")
     elif args.summary_json:
         raise ValueError("--summary-json requires --compare")
+    if args.geometry_output:
+        geometry_plot = plot_geometry_and_uv(args, positions, frequencies)
+        print(f"Wrote geometry validation: {geometry_plot}")
     if args.sky_output:
         sky_plot = plot_sky_coverage(args, frequencies, directions)
         print(f"Wrote full-sky beam coverage: {sky_plot}")

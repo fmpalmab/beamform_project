@@ -28,6 +28,7 @@ add_library(beamformer_core
     src/geometry.cpp
     src/io.cpp
     src/synthetic_data.cpp
+    src/temporal_integration.cpp
     src/weights.cpp
 )
 target_include_directories(beamformer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -83,6 +84,11 @@ if(BUILD_TESTING)
     target_compile_options(test_cpu_beamformer PRIVATE -UNDEBUG)
     add_test(NAME cpu_beamformer COMMAND test_cpu_beamformer)
 
+    add_executable(test_temporal_integration tests/test_temporal_integration.cpp)
+    target_link_libraries(test_temporal_integration PRIVATE beamformer_core)
+    target_compile_options(test_temporal_integration PRIVATE -UNDEBUG)
+    add_test(NAME temporal_integration COMMAND test_temporal_integration)
+
     if(BEAMFORMER_HAS_CUDA)
         add_executable(test_cuda_point_source tests/test_cuda_point_source.cpp)
         target_link_libraries(test_cuda_point_source PRIVATE beamformer_cuda_core)
@@ -91,6 +97,26 @@ if(BUILD_TESTING)
         set_tests_properties(cuda_point_source PROPERTIES
             LABELS "cuda;physics"
             TIMEOUT 60
+        )
+
+        add_executable(test_cuda_packed tests/test_cuda_packed.cu)
+        target_link_libraries(test_cuda_packed PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_packed PRIVATE -UNDEBUG)
+        add_test(NAME cuda_packed COMMAND test_cuda_packed)
+        set_tests_properties(cuda_packed PROPERTIES
+            LABELS "cuda;packed;validation"
+            TIMEOUT 60
+        )
+
+        add_test(
+            NAME benchmark_config
+            COMMAND benchmark_cpu_cuda --dry-run
+                    --n-ant 32,64 --beams 16,32,64,128
+                    --times 15360,24576,30720 --validation-time 16
+        )
+        set_tests_properties(benchmark_config PROPERTIES
+            LABELS "cuda;benchmark"
+            TIMEOUT 10
         )
     endif()
 endif()

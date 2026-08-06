@@ -3,6 +3,7 @@
 #include "beamformer/config.hpp"
 #include "beamformer/complex.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -14,12 +15,28 @@ using ComplexVoltage = std::vector<ComplexFloat>;
 using Weights = std::vector<ComplexFloat>;
 using Intensities = std::vector<float>;
 
+// One validity byte per [time][local_frequency] frame. A zero marks a lost
+// frame; the payload remains byte-for-byte RFSoC data and is not rewritten.
+using LossMask = std::vector<std::uint8_t>;
+
+struct PackedShard {
+    ShardDescriptor descriptor;
+    PackedVoltage payload;
+    LossMask loss_mask;
+};
+
+using PackedShardSet = std::array<PackedShard, frequency_shard_count>;
+
 constexpr std::size_t voltage_sample_count(const Dimensions& dims) {
     return dims.n_time * dims.n_freq * dims.n_ant;
 }
 
 constexpr std::size_t packed_voltage_bytes(const Dimensions& dims) {
     return voltage_sample_count(dims);
+}
+
+constexpr std::size_t loss_mask_count(const Dimensions& dims) {
+    return dims.n_time * dims.n_freq;
 }
 
 // little-endian float32 [beam][frequency][antenna][real, imag]

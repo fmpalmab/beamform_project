@@ -35,7 +35,7 @@ int main() {
     assert(frequencies.size() == default_frequency_channels);
     assert(frequencies.front() == 300'000'000.0F);
     assert(frequencies[1] == 300'300'000.0F);
-    assert(frequencies.back() == 501'300'000.0F);
+    assert(frequencies.back() == 400'500'000.0F);
 
     const auto beams_1 = default_beam_grid(1);
     assert(beams_1.size() == 1);

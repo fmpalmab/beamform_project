@@ -1,5 +1,4 @@
 #include "beamformer/config.hpp"
-#include "beamformer/cpu_beamformer.hpp"
 #include "beamformer/cuda_beamformer.hpp"
 #include "beamformer/io.hpp"
 
@@ -27,7 +26,7 @@ struct Options {
     std::filesystem::path weights;
     std::filesystem::path output;
     std::optional<std::filesystem::path> metrics;
-    std::size_t n_time = 32;
+    std::size_t n_time = 15360;
     std::size_t n_ant = 64;
     std::size_t n_beams = 5;
 };
@@ -47,7 +46,7 @@ void print_usage(const char* program) {
     std::cout
         << "Usage: " << program
         << " --input FILE --weights FILE --output FILE [options]\n\n"
-        << "  --n-time N              default: 32\n"
+        << "  --n-time N              default: 15360\n"
         << "  --n-ant N               32 or 64; default: 64\n"
         << "  --n-beams N             1 to 128; default: 5\n"
         << "  --metrics FILE          append timing row to CSV\n";
@@ -169,18 +168,17 @@ int main(int argc, char** argv) {
         const auto packed = beamformer::read_packed_voltage(options.input, dims);
         const auto weights = beamformer::read_weights(options.weights, dims);
         const auto load_end = Clock::now();
-        const auto voltage = beamformer::unpack_voltage(packed, dims);
-        const auto unpack_end = Clock::now();
         beamformer::CudaBeamformerTimings cuda_timings;
-        const auto intensity =
-            beamformer::cuda_beamform_intensity(voltage, weights, dims, &cuda_timings);
+        const auto intensity = beamformer::cuda_beamform_packed_intensity(
+            packed, weights, dims, &cuda_timings);
         const auto compute_end = Clock::now();
         beamformer::write_intensities(options.output, intensity, dims);
         const auto write_end = Clock::now();
 
         Timings timings;
         timings.load_ms = elapsed_ms(total_start, load_end);
-        timings.unpack_ms = elapsed_ms(load_end, unpack_end);
+        // Packed bytes are decoded in the CUDA kernel, not on the host.
+        timings.unpack_ms = 0.0;
         timings.setup_ms = cuda_timings.setup_ms;
         timings.host_to_device_ms = cuda_timings.host_to_device_ms;
         timings.compute_ms = cuda_timings.kernel_ms;
@@ -194,7 +192,7 @@ int main(int argc, char** argv) {
         const double output_rate = compute_seconds > 0.0 ? outputs / compute_seconds : 0.0;
         const double gmac_rate =
             compute_seconds > 0.0 ? complex_macs / compute_seconds / 1.0e9 : 0.0;
-        const double cuda_call_ms = elapsed_ms(unpack_end, compute_end);
+        const double cuda_call_ms = elapsed_ms(load_end, compute_end);
         const double pipeline_ms = timings.host_to_device_ms + timings.compute_ms
                                    + timings.device_to_host_ms;
         const double pipeline_output_rate =

@@ -14,6 +14,8 @@ import numpy as np
 
 
 TIME_FIELDS = ("cpu_ms", "gpu_kernel_ms", "gpu_pipeline_wall_ms")
+LOCAL_FREQUENCY_CHANNELS = 336
+FULL_BAND_FREQUENCY_CHANNELS = 672
 
 
 def with_suffix(prefix: Path, suffix: str) -> Path:
@@ -34,18 +36,34 @@ def load_numeric_csv(path: Path) -> list[dict[str, float]]:
     return records
 
 
+def filter_records_for_buffer(records: Iterable[dict[str, float]],
+                              buffer: str | None) -> list[dict[str, float]]:
+    records = list(records)
+    available = {int(record["n_freq"]) for record in records}
+    if buffer is None:
+        if len(available) > 1:
+            raise ValueError("multiple n_freq values found; select --buffer")
+        return records
+    expected = FULL_BAND_FREQUENCY_CHANNELS if buffer == "both" else LOCAL_FREQUENCY_CHANNELS
+    selected = [record for record in records if int(record["n_freq"]) == expected]
+    if not selected:
+        raise ValueError(f"no benchmark records for buffer={buffer} (n_freq={expected})")
+    return selected
+
+
 def summarize_timings(records: Iterable[dict[str, float]]) -> list[dict[str, float]]:
-    groups: dict[tuple[int, int, int], list[dict[str, float]]] = defaultdict(list)
+    groups: dict[tuple[int, int, int, int], list[dict[str, float]]] = defaultdict(list)
     for record in records:
-        key = (int(record["n_ant"]), int(record["n_beams"]), int(record["n_time"]))
+        key = (int(record["n_ant"]), int(record["n_freq"]),
+               int(record["n_beams"]), int(record["n_time"]))
         groups[key].append(record)
 
     summary: list[dict[str, float]] = []
-    for (n_ant, n_beams, n_time), rows in sorted(groups.items()):
+    for (n_ant, n_freq, n_beams, n_time), rows in sorted(groups.items()):
         first = rows[0]
         result: dict[str, float] = {
             "n_ant": float(n_ant),
-            "n_freq": first["n_freq"],
+            "n_freq": float(n_freq),
             "n_beams": float(n_beams),
             "n_time": float(n_time),
             "n_outputs": first["n_outputs"],
@@ -218,9 +236,10 @@ def plot_performance(summary: list[dict[str, float]], metadata: dict,
 
     gpu_name = metadata.get("gpu_name", "GPU desconocida")
     repetitions = metadata.get("repetitions", "?")
+    n_freq = int(summary[0]["n_freq"])
     figure.suptitle(
         f"Beamformer {'CPU/CUDA' if has_cpu_timings else 'CUDA'} — "
-        f"{gpu_name}; {repetitions} repeticiones\n"
+        f"{gpu_name}; F={n_freq} channels; {repetitions} repeticiones\n"
         "Ncmac=T×F×B×A; FLOP estimados=8×Ncmac+3×Noutput",
         fontsize=14,
     )
@@ -386,6 +405,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-prefix", type=Path,
                         default=Path("results/gpu_benchmark_fft"))
     parser.add_argument("--output-prefix", type=Path)
+    parser.add_argument("--buffer", choices=("0", "1", "both"),
+                        help="filter local-buffer or full-band benchmark rows")
     return parser.parse_args()
 
 
@@ -401,6 +422,8 @@ def main() -> None:
     timings = load_numeric_csv(timings_path)
     validation = load_numeric_csv(validation_path)
     metadata = json.loads(metadata_path.read_text())
+    timings = filter_records_for_buffer(timings, args.buffer)
+    validation = filter_records_for_buffer(validation, args.buffer)
     summary = summarize_timings(timings)
 
     summary_path = with_suffix(output_prefix, "_summary.csv")

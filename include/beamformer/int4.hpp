@@ -5,18 +5,26 @@
 
 namespace beamformer {
 
+#if defined(__CUDACC__)
+#define BEAMFORMER_HOST_DEVICE __host__ __device__
+#else
+#define BEAMFORMER_HOST_DEVICE
+#endif
+
 struct ComplexInt4 {
     std::int8_t real;
     std::int8_t imag;
 };
 
-constexpr std::int8_t decode_signed_nibble(const std::uint8_t nibble) {
+BEAMFORMER_HOST_DEVICE constexpr std::int8_t decode_signed_nibble(
+    const std::uint8_t nibble) {
     const auto bits = static_cast<std::uint8_t>(nibble & 0x0F);
     return bits < 8 ? static_cast<std::int8_t>(bits)
                     : static_cast<std::int8_t>(static_cast<int>(bits) - 16);
 }
 
-constexpr ComplexInt4 unpack_complex_int4(const std::uint8_t packed) {
+BEAMFORMER_HOST_DEVICE constexpr ComplexInt4 unpack_complex_int4(
+    const std::uint8_t packed) {
     return {decode_signed_nibble(packed),
             decode_signed_nibble(static_cast<std::uint8_t>(packed >> 4))};
 }
@@ -29,5 +37,7 @@ inline std::uint8_t pack_complex_int4(const std::int8_t real, const std::int8_t 
     const auto imag_bits = static_cast<std::uint8_t>(imag) & 0x0F;
     return static_cast<std::uint8_t>(real_bits | (imag_bits << 4));
 }
+
+#undef BEAMFORMER_HOST_DEVICE
 
 } // namespace beamformer

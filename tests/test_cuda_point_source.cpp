@@ -111,11 +111,10 @@ int main() {
                 n_time, beamformer::default_frequency_channels, n_ant, n_beams};
             const auto packed = beamformer::make_point_source(
                 dims, positions, frequencies, directions[injected_beam], 4.0F);
-            const auto voltage = beamformer::unpack_voltage(packed, dims);
             const auto cpu =
-                beamformer::cpu_beamform_intensity(voltage, weights, dims);
+                beamformer::cpu_beamform_packed_intensity(packed, weights, dims);
             const auto gpu =
-                beamformer::cuda_beamform_intensity(voltage, weights, dims);
+                beamformer::cuda_beamform_packed_intensity(packed, weights, dims);
 
             const double maximum_absolute_error = compare_cpu_gpu(cpu, gpu);
             const auto cpu_integrated = integrated_power(cpu, dims, 0, n_time);

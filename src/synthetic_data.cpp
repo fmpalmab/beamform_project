@@ -118,4 +118,139 @@ PackedVoltage make_noise(const Dimensions& dims, const std::uint32_t seed) {
     return voltage;
 }
 
+
+LossMask make_loss_mask(const Dimensions& dims, const std::uint32_t seed,
+                        const float loss_probability) {
+    validate_dimensions(dims);
+    if (!std::isfinite(loss_probability) || loss_probability < 0.0F
+        || loss_probability > 1.0F) {
+        throw std::invalid_argument("loss probability must be in [0, 1]");
+    }
+
+    LossMask mask(loss_mask_count(dims), 1);
+    std::mt19937 random(seed);
+    std::bernoulli_distribution lost(loss_probability);
+    for (auto& valid : mask) {
+        valid = lost(random) ? 0U : 1U;
+    }
+    return mask;
+}
+
+void validate_packed_shard(const PackedShard& shard, const Dimensions& dims) {
+    validate_dimensions(dims);
+    validate_shard_descriptor(shard.descriptor);
+    if (shard.payload.size() != packed_voltage_bytes(dims)) {
+        throw std::invalid_argument("shard payload size does not match dimensions");
+    }
+    if (shard.loss_mask.size() != loss_mask_count(dims)) {
+        throw std::invalid_argument("loss mask size does not match dimensions");
+    }
+    for (const auto valid : shard.loss_mask) {
+        if (valid > 1U) {
+            throw std::invalid_argument("loss mask entries must be 0 or 1");
+        }
+    }
+}
+
+void validate_packed_shards(const PackedShardSet& shards, const Dimensions& dims) {
+    validate_dimensions(dims);
+    for (std::size_t index = 0; index < frequency_shard_count; ++index) {
+        validate_packed_shard(shards[index], dims);
+        if (shards[index].descriptor.shard_id != index) {
+            throw std::invalid_argument("shard IDs must identify their array slot");
+        }
+    }
+    if (shards[0].descriptor.absolute_frequency_start
+        == shards[1].descriptor.absolute_frequency_start) {
+        throw std::invalid_argument("the two shards must have distinct frequency origins");
+    }
+    if (shards[0].descriptor.loss_mask_id
+        == shards[1].descriptor.loss_mask_id) {
+        throw std::invalid_argument("the two shards must have independent loss masks");
+    }
+}
+
+namespace {
+
+PackedShardSet make_shard_set(
+    const Dimensions& dims,
+    const std::array<PackedVoltage, frequency_shard_count>& payloads,
+    const std::array<std::uint32_t, frequency_shard_count>& loss_seeds,
+    const float loss_probability) {
+    const auto descriptors = default_shard_descriptors();
+    PackedShardSet shards;
+    for (std::size_t shard_id = 0; shard_id < frequency_shard_count; ++shard_id) {
+        shards[shard_id] = PackedShard{
+            descriptors[shard_id], payloads[shard_id],
+            make_loss_mask(dims, loss_seeds[shard_id], loss_probability),
+        };
+    }
+    validate_packed_shards(shards, dims);
+    return shards;
+}
+
+} // namespace
+
+PackedShardSet make_two_shard_one_hot(
+    const Dimensions& dims, const std::size_t active_time,
+    const std::array<std::size_t, frequency_shard_count>& active_frequencies,
+    const std::array<std::size_t, frequency_shard_count>& active_elements,
+    const ComplexInt4 value,
+    const std::array<std::uint32_t, frequency_shard_count> loss_seeds,
+    const float loss_probability) {
+    validate_dimensions(dims);
+    std::array<PackedVoltage, frequency_shard_count> payloads;
+    for (std::size_t shard_id = 0; shard_id < frequency_shard_count; ++shard_id) {
+        payloads[shard_id] = make_one_hot(
+            dims, active_time, active_frequencies[shard_id],
+            active_elements[shard_id], value);
+    }
+    return make_shard_set(dims, payloads, loss_seeds, loss_probability);
+}
+
+PackedShardSet make_two_shard_constant(
+    const Dimensions& dims, const ComplexInt4 value,
+    const std::array<std::uint32_t, frequency_shard_count> loss_seeds,
+    const float loss_probability) {
+    validate_dimensions(dims);
+    std::array<PackedVoltage, frequency_shard_count> payloads;
+    for (auto& payload : payloads) {
+        payload = make_constant(dims, value);
+    }
+    return make_shard_set(dims, payloads, loss_seeds, loss_probability);
+}
+
+PackedShardSet make_two_shard_noise(const Dimensions& dims, const std::uint32_t seed,
+                                    const float loss_probability) {
+    validate_dimensions(dims);
+    std::array<PackedVoltage, frequency_shard_count> payloads;
+    std::array<std::uint32_t, frequency_shard_count> loss_seeds{seed, seed + 1U};
+    for (std::size_t shard_id = 0; shard_id < frequency_shard_count; ++shard_id) {
+        // Distinct stream IDs keep shard payloads independent while preserving
+        // reproducibility for a fixed base seed.
+        payloads[shard_id] = make_noise(dims, seed + 0x9E3779B9U * static_cast<std::uint32_t>(shard_id));
+    }
+    return make_shard_set(dims, payloads, loss_seeds, loss_probability);
+}
+
+PackedShardSet make_two_shard_point_source(
+    const Dimensions& dims, const std::vector<Vec3>& positions_m,
+    const Vec3& source_direction, const float amplitude,
+    const std::array<std::uint32_t, frequency_shard_count> loss_seeds,
+    const float loss_probability) {
+    validate_dimensions(dims);
+    const auto descriptors = default_shard_descriptors();
+    std::array<PackedVoltage, frequency_shard_count> payloads;
+    for (std::size_t shard_id = 0; shard_id < frequency_shard_count; ++shard_id) {
+        const float start_hz = default_frequency_start_hz
+            + static_cast<float>(descriptors[shard_id].absolute_frequency_start)
+                * default_channel_width_hz;
+        const auto frequencies = channelized_frequencies(
+            dims.n_freq, start_hz, default_channel_width_hz);
+        payloads[shard_id] = make_point_source(
+            dims, positions_m, frequencies, source_direction, amplitude);
+    }
+    return make_shard_set(dims, payloads, loss_seeds, loss_probability);
+}
+
 } // namespace beamformer
