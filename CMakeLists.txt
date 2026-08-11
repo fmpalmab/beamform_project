@@ -25,6 +25,7 @@ endif()
 
 add_library(beamformer_core
     src/cpu_beamformer.cpp
+    src/beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
     src/quantization.cpp
@@ -44,6 +45,9 @@ target_link_libraries(generate_weights PRIVATE beamformer_core)
 
 add_executable(beamformer_cpu tools/beamformer_cpu.cpp)
 target_link_libraries(beamformer_cpu PRIVATE beamformer_core)
+
+add_executable(beam_tracker_cpu tools/beam_tracker_cpu.cpp)
+target_link_libraries(beam_tracker_cpu PRIVATE beamformer_core)
 
 if(BEAMFORMER_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -92,6 +96,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_cpu_beamformer PRIVATE beamformer_core)
     target_compile_options(test_cpu_beamformer PRIVATE -UNDEBUG)
     add_test(NAME cpu_beamformer COMMAND test_cpu_beamformer)
+
+    add_executable(test_beam_tracker tests/test_beam_tracker.cpp)
+    target_link_libraries(test_beam_tracker PRIVATE beamformer_core)
+    target_compile_options(test_beam_tracker PRIVATE -UNDEBUG)
+    add_test(NAME beam_tracker COMMAND test_beam_tracker)
 
     add_executable(test_temporal_integration tests/test_temporal_integration.cpp)
     target_link_libraries(test_temporal_integration PRIVATE beamformer_core)
