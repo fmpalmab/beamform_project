@@ -99,4 +99,16 @@ void beam_tracker_cpu_packed_intensity_into(const PackedVoltage& packed,
                                             const TrackerConfig& tracker,
                                             Intensities& intensity);
 
+// Synthetic moving point source, the natural validation target for the tracker
+// beam. Mirrors make_point_source but advances the source direction along a
+// linear trajectory: direction(t) is recomputed and re-quantized per time
+// sample (amplitude and the int4 packing rule are identical to the fixed-grid
+// point source). The output is a single packed-int4 shard in the standard
+// voltage[time][freq][element] layout so beam_tracker_cpu can consume it
+// directly.
+PackedVoltage beam_tracker_make_moving_point_source(
+    const Dimensions& dims, const std::vector<Vec3>& positions_m,
+    const std::vector<float>& frequencies_hz,
+    const TrackerTrajectoryConfig& trajectory, float amplitude = 4.0F);
+
 } // namespace beamformer

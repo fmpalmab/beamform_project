@@ -145,4 +145,50 @@ void beam_tracker_cpu_packed_intensity_into(const PackedVoltage& packed,
     }
 }
 
+PackedVoltage beam_tracker_make_moving_point_source(
+    const Dimensions& dims, const std::vector<Vec3>& positions_m,
+    const std::vector<float>& frequencies_hz,
+    const TrackerTrajectoryConfig& trajectory, const float amplitude) {
+    validate_dimensions(dims);
+    if (positions_m.size() != dims.n_ant) {
+        throw std::invalid_argument("position count must match n_ant");
+    }
+    if (frequencies_hz.size() != dims.n_freq) {
+        throw std::invalid_argument("frequency count must match n_freq");
+    }
+    if (!std::isfinite(amplitude) || amplitude <= 0.0F || amplitude > 7.0F) {
+        throw std::invalid_argument("point-source amplitude must be in (0, 7]");
+    }
+    for (const float frequency : frequencies_hz) {
+        if (!std::isfinite(frequency) || frequency <= 0.0F) {
+            throw std::invalid_argument("frequencies must be positive and finite");
+        }
+    }
+
+    PackedVoltage voltage(voltage_sample_count(dims));
+    for (std::size_t time = 0; time < dims.n_time; ++time) {
+        const Vec3 direction = tracker_direction(trajectory, time);
+        for (std::size_t frequency = 0; frequency < dims.n_freq; ++frequency) {
+            const double wave_number =
+                two_pi * static_cast<double>(frequencies_hz[frequency])
+                / speed_of_light_m_per_s;
+            for (std::size_t element = 0; element < dims.n_ant; ++element) {
+                const auto& position = positions_m[element];
+                const double delay_m =
+                    static_cast<double>(position[0]) * direction[0]
+                    + static_cast<double>(position[1]) * direction[1]
+                    + static_cast<double>(position[2]) * direction[2];
+                const double phase = wave_number * delay_m;
+                const auto real = static_cast<std::int8_t>(std::lround(
+                    static_cast<double>(amplitude) * std::cos(phase)));
+                const auto imag = static_cast<std::int8_t>(std::lround(
+                    -static_cast<double>(amplitude) * std::sin(phase)));
+                voltage[voltage_index(time, frequency, element, dims)] =
+                    pack_complex_int4(real, imag);
+            }
+        }
+    }
+    return voltage;
+}
+
 } // namespace beamformer

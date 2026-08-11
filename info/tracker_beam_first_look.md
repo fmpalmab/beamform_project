@@ -1,9 +1,21 @@
-# CHARTS Tracker Beam — First Look and Starting Plan
+# CHARTS Tracker Beam — First Look, Plan, and v0 Realization
 
-> Status: exploratory design note. This is **not** an implementation; it records what the
-> cloned "normal" beamforming repository gives us as a base, and proposes a concrete path to
-> add a **tracker beam** (a single beam whose pointing direction follows a tracked source
-> over time) on top of it.
+> This note has two parts:
+>
+> 1. The original **first-look and plan** (sections 1–8) — kept verbatim for history.
+> 2. The **realized v0** addendum below (section 9 onward), describing the components that
+>    were actually implemented, the resolved design decisions, the build/test status, the CLIs,
+>    the visualization workflow, and an end-to-end example.
+>
+> The v0 implementation follows the plan's **Strategy A** (blockwise re-launch over the single
+> tracked beam) and adds `beam_tracker_*` files without modifying any existing tested component.
+>
+> ---
+>
+> **Original exploratory note (kept verbatim).** This section records what the cloned
+> "normal" beamforming repository gives us as a base, and the path it proposed to add a
+> **tracker beam** (a single beam whose pointing direction follows a tracked source over time)
+> on top of it.
 
 ---
 
@@ -329,3 +341,123 @@ whether B or C is needed based on measured launch/transfer overhead.
   `n_beams=1`, per-block weights from the existing `generate_weights`), validate with a
   new CPU tracker reference and a moving synthetic point source, then measure whether
   launch/transfer overhead justifies a device-side or fully-fused kernel.
+
+---
+
+# 9. Realized v0 — design, components, build, and visualization
+
+> This section documents the implementation that was built on top of the plan above. It is
+> kept separate from the original exploratory text (sections 1–8) so the history of the
+> analysis is preserved.
+
+## 9.1 Resolved design decisions (from the open questions in §6)
+
+| Question | Decision realized in v0 |
+|----------|--------------------------|
+| Direction update granularity | **One direction per integration window** (default 320 spectra ≈ 1.07 ms). The direction used for a window is the one at the window's first time sample. |
+| Trackable source model | **Linear parametric placeholder**: `dir(t)` advances `(l, m)` by `t * (dl, dm)` and re-projects onto the unit disk via `direction_from_lm`. A zero rate reproduces a stationary beam. |
+| Number of tracked beams | **One** (`n_beams == 1`, `tracker_beam_count`). Tiled-kernel padding waste is accepted for later reuse, but v0 uses the direct single-beam loop. |
+| Output product | **float32 intensity in the same `[time][freq][beam]` layout** as the fixed-grid beamformer (with `beam` of size 1), so downstream stages and `write_intensities`/`read_weights` IO stay unchanged. |
+| Single shard vs full band | The tracker **runs per node on a single local shard** (buffer 0 or 1, 336 channels). Shards are combined downstream at the classification node; the v0 CLI and plotter operate one shard at a time. |
+
+## 9.2 Components added (all `beam_tracker_*` prefixed)
+
+| File | Role |
+|------|------|
+| [`include/beamformer/beam_tracker.hpp`](include/beamformer/beam_tracker.hpp:1) | `TrackerTrajectoryConfig`, `TrackerConfig`, `tracker_beam_count`, `tracker_direction`, `tracker_window_direction`, `tracker_window_count`, `beam_tracker_cpu_packed_intensity[_into]`, `beam_tracker_make_moving_point_source`. |
+| [`src/beam_tracker.cpp`](src/beam_tracker.cpp:1) | Naive CPU tracker (Strategy A): one `n_beams==1` weight set per window via the existing `generate_weights`, inline int4 decode, `[t][f][0]` intensity. Linear trajectory projection. Moving point-source generator (per-`t` re-quantized spectrum). |
+| [`tools/beam_tracker_cpu.cpp`](tools/beam_tracker_cpu.cpp:1) | CLI: reads a packed shard, runs `beam_tracker_cpu_packed_intensity`, writes float32 `[T][F][B=1]`, optional metrics CSV. Accepts `--track-l0/m0`, `--dl/dm-per-sample`, `--integration-spectra`. |
+| [`tools/plot_tracker_results.py`](tools/plot_tracker_results.py:1) | Tracker dashboard (sky-map trajectory + per-window steering + moving-source overlay, freq-integrated power vs time with optional overlay, single-beam spectrum, `[time,freq]` dB heatmap). Reuses geometry/response helpers from `plot_results.py`. |
+| [`tools/generate_fake_data.cpp`](tools/generate_fake_data.cpp:1) | Extended with a single-shard `moving-point-source` synthetic type and tracker trajectory parsing; the two-shard path rejects it (tracker is per shard). |
+| [`tests/test_beam_tracker.cpp`](tests/test_beam_tracker.cpp:1) | C++ unit tests: trajectory projection, window cadence, stationary==fixed-grid equivalence, per-window decode match, moving-source recovery, validation rejections. |
+| [`tests/test_plot_tracker_results.py`](tests/test_plot_tracker_results.py:1) | Python unit tests: trajectory math, resolution/buffer validation, intensity load round-trip, dashboard PNG render. |
+| [`CMakeLists.txt`](CMakeLists.txt:1) | `src/beam_tracker.cpp` added to `beamformer_core`; `beam_tracker_cpu` executable; `test_beam_tracker` CTest target. |
+
+No existing tested file (`cpu_beamformer.*`, `cuda_beamformer.*`, `synthetic_data.*`, `weights.*`, `geometry.*`, `io.*`) was modified to add behavior — the only edited existing files are `tools/generate_fake_data.cpp` (new single-shard `moving-point-source` branch, additive) and `CMakeLists.txt` (new targets, additive).
+
+## 9.3 Build and test status
+
+Built on GCC 12.3.1 with `BEAMFORMER_ENABLE_CUDA=OFF`. The C++ test passes:
+
+```text
+Start 5: beam_tracker
+1/1 Test #5: beam_tracker .....................   Passed    0.01 sec
+100% tests passed, 0 tests failed out of 1
+```
+
+The Python plotting helper module is covered by `tests/test_plot_tracker_results.py` (run
+under the project's conda env, see §9.5).
+
+## 9.4 End-to-end example (single shard)
+
+```bash
+# 1. Build (CPU-only is sufficient for the v0 tracker).
+cmake -S . -B build -DBEAMFORMER_ENABLE_CUDA=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# 2. Generate a moving point source:: straight-line drift in l.
+./build/generate_fake_data \
+    --type moving-point-source \
+    --n-time 320 --n-ant 32 \
+    --track-l0 0.0  --track-m0 0.0 \
+    --dl-per-sample 1.0e-4 --dm-per-sample 0.0 \
+    --amplitude 4 \
+    --output results/moving_source.bin
+
+# 3. Run the CPU tracker aligned with the source trajectory.
+./build/beam_tracker_cpu \
+    --input results/moving_source.bin \
+    --output results/tracker_aligned.bin \
+    --n-time 320 --n-ant 32 \
+    --track-l0 0.0  --track-m0 0.0 \
+    --dl-per-sample 1.0e-4 --dm-per-sample 0.0 \
+    --integration-spectra 320 \
+    --metrics results/tracker_metrics.csv
+
+# 4. Render the tracker dashboard.
+conda run -n kotekan_test python tools/plot_tracker_results.py \
+    --input results/tracker_aligned.bin \
+    --output results/tracker_dashboard.png \
+    --n-time 320 --n-ant 32 \
+    --track-l0 0.0 --track-m0 0.0 \
+    --dl-per-sample 1.0e-4 --dm-per-sample 0.0 \
+    --integration-spectra 320 \
+    --source-l0 0.0 --source-m0 0.0 \
+    --source-dl-per-sample 1.0e-4 --source-dm-per-sample 0.0
+```
+
+The fourth panel of the dashboard is a `[time, frequency]` dB heatmap of the single tracker
+beam; for an aligned source it stays bright across the whole run. A deliberately misaligned
+tracker (e.g. `--dl-per-sample 0`) run on the same moving source and overlaid via
+`--compare` produces a dimming power-vs-time curve as the source drifts out of the
+stationary beam — a visual confirmation that per-window steering tracks the source.
+
+## 9.5 Tests for the plotting helper
+
+```bash
+conda run -n kotekan_test python tests/test_plot_tracker_results.py
+```
+
+These cover trajectory projection, window steering, off-disk rejection, intensity loading,
+and an actual dashboard PNG render (Agg backend, no display required).
+
+## 9.6 What is deliberately *not* in v0
+
+- No CUDA tracker kernel yet — the v0 is a naive CPU reference and Strategy-A orchestrator.
+- No quantized int8 tracker output, no offline frame-streaming runner variant.
+- No two-shard / full-band tracker (per-node single shard only).
+- No ephemeris loader — the linear model is the placeholder until the final trajectory format
+  is defined.
+- No upchannelizer; the `integration_spectra` knob mirrors the existing temporal-integration
+  direct path (320 spectra for Direct).
+
+## 9.7 Next steps after v0
+
+- Port the per-window loop to a CUDA tracker stage (Strategy A on the existing Direct kernel
+  with `n_beams=1`), then measure per-block launch/transfer overhead to decide between
+  host-orchestrated re-launch (A), device-side weight generation (B), or a fully-fused
+  time-varying kernel (C).
+- Add a moving-source recovery test analogous to `test_cuda_point_source`.
+- Replace the linear trajectory with the production ephemeris format once defined.
+- Optionally add an int8 tracker output by reusing the existing quantization stage on the
+  single-beam `[T_int][F]` tensor.

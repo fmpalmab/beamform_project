@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Unit tests for the tracker-beam plotting helper (tools/plot_tracker_results.py)."""
+
+import importlib.util
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+SCRIPT = Path(__file__).parents[1] / "tools" / "plot_tracker_results.py"
+SPEC = importlib.util.spec_from_file_location("plot_tracker_results", SCRIPT)
+plot_tracker = importlib.util.module_from_spec(SPEC)
+assert SPEC.loader is not None
+SPEC.loader.exec_module(plot_tracker)
+
+
+class TrackerTrajectoryTest(unittest.TestCase):
+    def test_stationary_trajectory_repeats_start(self):
+        directions = plot_tracker.tracker_directions(0.0, 0.0, 0.0, 0.0, 10)
+        self.assertEqual(directions.shape, (10, 3))
+        np.testing.assert_allclose(directions[:, 0], 0.0)
+        np.testing.assert_allclose(directions[:, 1], 0.0)
+        np.testing.assert_allclose(np.linalg.norm(directions, axis=1), 1.0)
+
+    def test_linear_drift_matches_closed_form(self):
+        n_time = 5
+        directions = plot_tracker.tracker_directions(
+            0.02, -0.03, 1.0e-4, -2.0e-4, n_time)
+        t = np.arange(n_time, dtype=np.float64)
+        expected_l = 0.02 + t * 1.0e-4
+        expected_m = -0.03 + t * -2.0e-4
+        np.testing.assert_allclose(directions[:, 0], expected_l)
+        np.testing.assert_allclose(directions[:, 1], expected_m)
+        np.testing.assert_allclose(
+            directions[:, 2], np.sqrt(1.0 - expected_l**2 - expected_m**2))
+
+    def test_off_disk_trajectory_raises(self):
+        with self.assertRaises(ValueError):
+            plot_tracker.tracker_directions(0.9, 0.0, 0.01, 0.0, 20)
+
+    def test_window_steering_uses_first_sample(self):
+        n_time = 8
+        window_dirs = plot_tracker.window_steering_directions(
+            0.0, 0.0, 0.001, 0.0, n_time, integration_spectra=2)
+        self.assertEqual(window_dirs.shape, (4, 3))
+        # Window w starts at sample w * integration_spectra.
+        np.testing.assert_allclose(window_dirs[:, 0], [0.0, 0.002, 0.004, 0.006])
+        # All on the unit disk.
+        np.testing.assert_allclose(np.linalg.norm(window_dirs, axis=1), 1.0)
+
+    def test_moving_point_source_overlay_matches_trajectory(self):
+        n_time = 3
+        source = plot_tracker.moving_point_source_directions(
+            0.0, 0.0, 0.005, -0.01, n_time)
+        traj = plot_tracker.tracker_directions(0.0, 0.0, 0.005, -0.01, n_time)
+        np.testing.assert_allclose(source, traj)
+
+    def test_resolution_and_buffer_validation(self):
+        args = plot_tracker.build_parser().parse_args([
+            "--input", "x.bin", "--output", "out.png", "--n-time", "4",
+        ])
+        plot_tracker.validate_args(args)
+        self.assertEqual(plot_tracker.resolve_frequency_channels("0", None), 336)
+        self.assertEqual(plot_tracker.resolve_frequency_channels("both", None), 672)
+        with self.assertRaises(ValueError):
+            plot_tracker.resolve_frequency_channels("0", 672)
+
+    def test_load_intensity_round_trip(self):
+        # A tiny [2][2][1] float32 file should load unchanged.
+        expected = np.arange(4, dtype="<f4").reshape(2, 2, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tracker.bin"
+            expected.tofile(path)
+            loaded = plot_tracker.load_intensity(path, 2, 2, 1)
+        np.testing.assert_array_equal(loaded, expected)
+
+
+class TrackerDashboardRenderTest(unittest.TestCase):
+    def test_dashboard_writes_png(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        # The buffer contract fixes n_freq at 336; the intensity file must match.
+        n_time, n_freq, n_ant = 4, 336, 32
+        intensity = np.arange(n_time * n_freq, dtype="<f4").reshape(
+            n_time, n_freq, 1) + 1.0
+        with tempfile.TemporaryDirectory() as tmp:
+            intensity_path = Path(tmp) / "tracker_intensity.bin"
+            compare_path = Path(tmp) / "tracker_compare.bin"
+            output_path = Path(tmp) / "tracker_dashboard.png"
+            intensity.tofile(intensity_path)
+            intensity.tofile(compare_path)
+            rc = plot_tracker.main([
+                "--input", str(intensity_path),
+                "--compare", str(compare_path),
+                "--output", str(output_path),
+                "--n-time", str(n_time),
+                "--n-ant", str(n_ant),
+                "--track-l0", "0.0",
+                "--track-m0", "0.0",
+                "--dl-per-sample", "0.001",
+                "--dm-per-sample", "0.0",
+                "--integration-spectra", "1",
+                "--source-l0", "0.0",
+                "--source-m0", "0.0",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertTrue(output_path.exists())
+        self.assertGreater(output_path.stat().st_size, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

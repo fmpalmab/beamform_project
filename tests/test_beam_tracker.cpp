@@ -217,5 +217,51 @@ int main() {
                                            stationary);
     }));
 
+    // --- Moving point source generator -----------------------------------
+    // A tracker aligned with the source's linear track must recover the bulk of
+    // the integrated power; a deliberately misaligned (zero-drift) tracker must
+    // recover less. This exercises beam_tracker_make_moving_point_source and
+    // confirms the tracker actually "follows" the source.
+    const Dimensions move_dims{4, default_frequency_channels, 32, 1};
+    const auto move_positions = default_positions(move_dims.n_ant);
+    const auto move_frequencies = channelized_frequencies(move_dims.n_freq);
+
+    TrackerTrajectoryConfig source_traj{
+        direction_from_lm(0.0F, 0.0F), {0.01F, 0.0F}};
+    const auto moving_voltage = beam_tracker_make_moving_point_source(
+        move_dims, move_positions, move_frequencies, source_traj, 4.0F);
+    assert(moving_voltage.size() == voltage_sample_count(move_dims));
+
+    TrackerConfig aligned;
+    aligned.trajectory = source_traj;
+    aligned.integration_spectra = 1; // recompute steering every spectrum
+    const auto aligned_intensity =
+        beam_tracker_cpu_packed_intensity(moving_voltage, move_dims, aligned);
+
+    TrackerConfig misaligned;
+    misaligned.trajectory.direction_start = direction_from_lm(-0.2F, 0.2F);
+    misaligned.trajectory.direction_rate_per_sample = {0.0F, 0.0F};
+    misaligned.integration_spectra = 1;
+    const auto misaligned_intensity =
+        beam_tracker_cpu_packed_intensity(moving_voltage, move_dims, misaligned);
+
+    double aligned_total = 0.0;
+    double misaligned_total = 0.0;
+    for (std::size_t index = 0; index < aligned_intensity.size(); ++index) {
+        aligned_total += aligned_intensity[index];
+        misaligned_total += misaligned_intensity[index];
+    }
+    assert(aligned_total > misaligned_total);
+
+    // A zero-drift moving source must byte-match the fixed-grid point source,
+    // since direction(t) is constant and the per-t recompute collapses to one
+    // repeated spectrum (same as make_point_source's behavior).
+    TrackerTrajectoryConfig static_traj{
+        direction_from_lm(0.04F, 0.0F), {0.0F, 0.0F}};
+    const auto static_moving = beam_tracker_make_moving_point_source(
+        grid_dims, positions, frequencies, static_traj, 4.0F);
+    assert(make_point_source(grid_dims, positions, frequencies,
+                             static_traj.direction_start, 4.0F) == static_moving);
+
     return 0;
 }

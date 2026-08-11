@@ -1,3 +1,4 @@
+#include "beamformer/beam_tracker.hpp"
 #include "beamformer/config.hpp"
 #include "beamformer/geometry.hpp"
 #include "beamformer/int4.hpp"
@@ -37,6 +38,11 @@ struct Options {
     float source_m = 0.0F;
     float amplitude = 4.0F;
     float loss_probability = 0.0F;
+    // Moving point source (synthetic tracker validation target).
+    float track_l0 = 0.0F;
+    float track_m0 = 0.0F;
+    float dl_per_sample = 0.0F;
+    float dm_per_sample = 0.0F;
 };
 
 void print_usage(const char* program) {
@@ -44,8 +50,9 @@ void print_usage(const char* program) {
         << "Usage: " << program << " --output FILE [options]\n"
         << "       " << program << " --shard-output-prefix PREFIX [options]\n"
         << "\n"
-        << "Data types: one-hot, constant, point-source, noise\n"
+        << "Data types: one-hot, constant, point-source, moving-point-source, noise\n"
         << "\n"
+-------
         << "Common options:\n"
         << "  --type TYPE             default: point-source\n"
         << "  --n-time N              default: 15360\n"
@@ -59,13 +66,19 @@ void print_usage(const char* program) {
         << "One-hot options:\n"
         << "  --active-time N --active-frequency N --active-element N\n"
         << "\n"
-        << "Point-source options:\n"
+        << "Point-source options (and moving-point-source base options):\n"
         << "  --source-l L --source-m M --amplitude A\n"
         << "  --spacing-m M           default geometry spacing: 0.6 m\n"
         << "  --frequency-hz HZ       optional constant-frequency override\n"
         << "                          default centers: 300 + 0.3*channel MHz\n"
         << "  --positions FILE        optional x,y,z rows indexed by output element\n"
-        << "  --frequencies FILE      optional one-Hz-value-per-line override\n";
+        << "  --frequencies FILE      optional one-Hz-value-per-line override\n"
+        << "\n"
+        << "Moving-point-source options (single shard only):\n"
+        << "  --track-l0 L --track-m0 M   source direction at t=0\n"
+        << "  --dl-per-sample D         linear drift in l per time sample\n"
+        << "  --dm-per-sample D         linear drift in m per time sample\n"
+        << "                            (the source re-projects onto the unit disk per t)\n";
 }
 
 const char* require_value(const int argc, char** argv, int& index) {
@@ -137,6 +150,14 @@ Options parse_options(const int argc, char** argv) {
             options.amplitude = std::stof(require_value(argc, argv, i));
         } else if (argument == "--loss-probability") {
             options.loss_probability = std::stof(require_value(argc, argv, i));
+        } else if (argument == "--track-l0") {
+            options.track_l0 = std::stof(require_value(argc, argv, i));
+        } else if (argument == "--track-m0") {
+            options.track_m0 = std::stof(require_value(argc, argv, i));
+        } else if (argument == "--dl-per-sample") {
+            options.dl_per_sample = std::stof(require_value(argc, argv, i));
+        } else if (argument == "--dm-per-sample") {
+            options.dm_per_sample = std::stof(require_value(argc, argv, i));
         } else if (argument == "--positions") {
             options.positions_file = require_value(argc, argv, i);
         } else if (argument == "--frequencies") {
@@ -183,12 +204,40 @@ beamformer::PackedVoltage generate(const Options& options,
         return beamformer::make_point_source(dims, positions, frequencies, direction,
                                              options.amplitude);
     }
+    if (options.type == "moving-point-source") {
+        // Single-shard moving source: the natural validation target for the
+        // tracker beam. Positions/frequencies resolution matches point-source.
+        const auto positions = options.positions_file
+                                   ? beamformer::load_positions(*options.positions_file, dims.n_ant)
+                                   : beamformer::default_positions(dims.n_ant, options.spacing_m);
+        const auto frequencies = options.frequencies_file
+                                     ? beamformer::load_frequencies(
+                                           *options.frequencies_file, dims.n_freq)
+                                 : options.frequency_hz
+                                     ? beamformer::constant_frequencies(
+                                           dims.n_freq, *options.frequency_hz)
+                                     : beamformer::channelized_frequencies(dims.n_freq);
+        beamformer::TrackerTrajectoryConfig trajectory;
+        trajectory.direction_start =
+            beamformer::direction_from_lm(options.track_l0, options.track_m0);
+        trajectory.direction_rate_per_sample = {options.dl_per_sample,
+                                                 options.dm_per_sample};
+        return beamformer::beam_tracker_make_moving_point_source(
+            dims, positions, frequencies, trajectory, options.amplitude);
+    }
     throw std::invalid_argument("unknown synthetic type: " + options.type);
 }
 
 
 beamformer::PackedShardSet generate_shards(
     const Options& options, const beamformer::Dimensions& dims) {
+    // The tracker runs per node on a single local shard; the moving point source
+    // is therefore a single-shard-only synthetic. The two-shard path keeps the
+    // pre-existing one-hot/constant/noise/point-source catalog untouched.
+    if (options.type == "moving-point-source") {
+        throw std::invalid_argument(
+            "moving-point-source is single-shard only; use --output, not --shard-output-prefix");
+    }
     if (options.frequencies_file || options.frequency_hz) {
         throw std::invalid_argument(
             "two-shard output uses canonical absolute frequency mapping; custom frequency overrides are not supported");
