@@ -22,6 +22,7 @@
 #include "beamformer/config.hpp"
 #include "beamformer/formats.hpp"
 #include "beamformer/geometry.hpp"
+#include "beamformer/temporal_integration.hpp"
 
 #include <cstddef>
 #include <cstdint>
