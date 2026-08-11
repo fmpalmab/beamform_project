@@ -52,7 +52,6 @@ void print_usage(const char* program) {
         << "\n"
         << "Data types: one-hot, constant, point-source, moving-point-source, noise\n"
         << "\n"
--------
         << "Common options:\n"
         << "  --type TYPE             default: point-source\n"
         << "  --n-time N              default: 15360\n"
