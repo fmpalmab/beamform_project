@@ -17,6 +17,7 @@ using Weights = std::vector<ComplexFloat>;
 // when passed to the Tiled CUDA kernel. The final beam tile is zero-padded.
 using TiledWeights = std::vector<ComplexFloat>;
 using Intensities = std::vector<float>;
+using QuantizedIntensities = std::vector<std::int8_t>;
 
 // One validity byte per [time][local_frequency] frame. A zero marks a lost
 // frame; the payload remains byte-for-byte RFSoC data and is not rewritten.
@@ -66,6 +67,12 @@ constexpr std::size_t tiled_weight_bytes(const Dimensions& dims) {
 // little-endian float32 [time][frequency][beam]
 constexpr std::size_t intensity_bytes(const Dimensions& dims) {
     return dims.n_time * dims.n_freq * dims.n_beams * sizeof(float);
+}
+
+// Signed int8 [time][frequency][beam] output. Quantization parameters are
+// stored separately because CHIME-style scaling is local to each chunk.
+constexpr std::size_t quantized_intensity_bytes(const Dimensions& dims) {
+    return dims.n_time * dims.n_freq * dims.n_beams * sizeof(std::int8_t);
 }
 
 } // namespace beamformer

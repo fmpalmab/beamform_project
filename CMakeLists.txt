@@ -27,6 +27,7 @@ add_library(beamformer_core
     src/cpu_beamformer.cpp
     src/geometry.cpp
     src/io.cpp
+    src/quantization.cpp
     src/synthetic_data.cpp
     src/temporal_integration.cpp
     src/weights.cpp
@@ -45,11 +46,16 @@ add_executable(beamformer_cpu tools/beamformer_cpu.cpp)
 target_link_libraries(beamformer_cpu PRIVATE beamformer_core)
 
 if(BEAMFORMER_HAS_CUDA)
-    add_library(beamformer_cuda_core src/cuda_beamformer.cu)
+    find_package(CUDAToolkit REQUIRED)
+    add_library(beamformer_cuda_core
+        src/cuda_beamformer.cu
+        src/cuda_offline_runner.cu
+        src/cuda_quantize_int8.cu
+    )
     target_include_directories(beamformer_cuda_core
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
-    target_link_libraries(beamformer_cuda_core PUBLIC beamformer_core)
+    target_link_libraries(beamformer_cuda_core PUBLIC beamformer_core CUDA::cudart)
     set_target_properties(beamformer_cuda_core PROPERTIES
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
@@ -60,6 +66,9 @@ if(BEAMFORMER_HAS_CUDA)
 
     add_executable(benchmark_cpu_cuda tools/benchmark_cpu_cuda.cpp)
     target_link_libraries(benchmark_cpu_cuda PRIVATE beamformer_cuda_core)
+
+    add_executable(benchmark_cuda_quantized tools/benchmark_cuda_quantized.cpp)
+    target_link_libraries(benchmark_cuda_quantized PRIVATE beamformer_cuda_core)
 endif()
 
 include(CTest)
@@ -89,6 +98,17 @@ if(BUILD_TESTING)
     target_compile_options(test_temporal_integration PRIVATE -UNDEBUG)
     add_test(NAME temporal_integration COMMAND test_temporal_integration)
 
+    add_executable(test_quantization tests/test_quantization.cpp)
+    target_link_libraries(test_quantization PRIVATE beamformer_core)
+    target_compile_options(test_quantization PRIVATE -UNDEBUG)
+    add_test(NAME quantization COMMAND test_quantization)
+
+    add_executable(test_cuda_frame_contract tests/test_cuda_frame_contract.cpp)
+    target_link_libraries(test_cuda_frame_contract PRIVATE beamformer_core)
+    target_compile_options(test_cuda_frame_contract PRIVATE -UNDEBUG)
+    add_test(NAME cuda_frame_contract COMMAND test_cuda_frame_contract)
+    set_tests_properties(cuda_frame_contract PROPERTIES LABELS "contract")
+
     if(BEAMFORMER_HAS_CUDA)
         add_executable(test_cuda_point_source tests/test_cuda_point_source.cpp)
         target_link_libraries(test_cuda_point_source PRIVATE beamformer_cuda_core)
@@ -105,6 +125,47 @@ if(BUILD_TESTING)
         add_test(NAME cuda_packed COMMAND test_cuda_packed)
         set_tests_properties(cuda_packed PROPERTIES
             LABELS "cuda;packed;validation"
+            TIMEOUT 60
+        )
+
+        add_executable(test_cuda_temporal_integration
+                       tests/test_cuda_temporal_integration.cpp)
+        target_link_libraries(test_cuda_temporal_integration PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_temporal_integration PRIVATE -UNDEBUG)
+        add_test(NAME cuda_temporal_integration COMMAND test_cuda_temporal_integration)
+        set_tests_properties(cuda_temporal_integration PROPERTIES
+            LABELS "cuda;temporal-integration;validation"
+            TIMEOUT 60
+        )
+
+        add_executable(test_cuda_quantization tests/test_cuda_quantization.cpp)
+        target_link_libraries(test_cuda_quantization PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_quantization PRIVATE -UNDEBUG)
+        add_test(NAME cuda_quantization COMMAND test_cuda_quantization)
+        set_tests_properties(cuda_quantization PROPERTIES
+            LABELS "cuda;quantization;validation"
+            TIMEOUT 60
+        )
+
+        add_executable(test_cuda_frame_pipeline
+                       tests/test_cuda_frame_pipeline.cpp)
+        set_source_files_properties(
+            tests/test_cuda_frame_pipeline.cpp PROPERTIES LANGUAGE CUDA)
+        target_link_libraries(test_cuda_frame_pipeline PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_frame_pipeline PRIVATE -UNDEBUG)
+        add_test(NAME cuda_frame_pipeline COMMAND test_cuda_frame_pipeline)
+        set_tests_properties(cuda_frame_pipeline PROPERTIES
+            LABELS "cuda;contract;validation"
+            TIMEOUT 60
+        )
+
+        add_executable(test_cuda_offline_runner
+                       tests/test_cuda_offline_runner.cpp)
+        target_link_libraries(test_cuda_offline_runner PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_offline_runner PRIVATE -UNDEBUG)
+        add_test(NAME cuda_offline_runner COMMAND test_cuda_offline_runner)
+        set_tests_properties(cuda_offline_runner PROPERTIES
+            LABELS "cuda;contract;validation"
             TIMEOUT 60
         )
 

@@ -407,11 +407,11 @@ For a short functional check before a full run:
 The existing `results/cpu_cuda_benchmark_*` files are the archived pre-change CPU/CUDA
 sweep. The new default prefix deliberately avoids overwriting them.
 
-## Medir Direct frente a Tiled
+## Measure Direct versus Tiled
 
-Para comparar ambos kernels en la configuración objetivo (`64` antenas, `336` frecuencias
-locales, `64` beams y `15360` tiempos), usa prefijos distintos para no mezclar las
-mediciones:
+To compare both kernels in the target configuration (`64` antennas, `336` local
+frequencies, `64` beams, and `15360` time samples), use different prefixes so the
+measurements remain separate:
 
 ```bash
 ./build-cuda/benchmark_cpu_cuda \
@@ -427,8 +427,8 @@ mediciones:
     --output-prefix /tmp/beamformer_tiled
 ```
 
-El benchmark genera internamente los pesos en el layout correspondiente. Para generar
-además el archivo tiled que consume `beamformer_cuda`, ejecuta:
+The benchmark internally generates weights in the layout required by each kernel. To also
+generate the tiled file consumed by `beamformer_cuda`, run:
 
 ```bash
 ./build-cuda/generate_weights \
@@ -438,6 +438,49 @@ además el archivo tiled que consume `beamformer_cuda`, ejecuta:
     --output results/weights_hex64_tiled.bin
 ```
 
-Las mediciones quedan en `*_timings.csv`, `*_validation.csv` y `*_metadata.json`. El
-kernel `Direct` usa pesos `[beam][frequency][antenna]`; `Tiled` usa
-`[frequency][beam_tile][antenna][local_beam]`, con tiles de 32 beams.
+Measurements are written to `*_timings.csv`, `*_validation.csv`, and `*_metadata.json`.
+The `Direct` kernel uses weights in `[beam][frequency][antenna]` order; `Tiled` uses
+`[frequency][beam_tile][antenna][local_beam]`, with 32 beams per tile.
+
+## CUDA temporal integration
+
+The CUDA executable fuses float32 temporal integration into the selected beamforming kernel
+before D2H. This is still separate from the upchannelizer: Tiled supports 10 and 320 spectra,
+while Direct supports 320 only for debugging. The output file is
+`[ceil(T / integration_spectra)][336][beam]` float32.
+
+```bash
+./build-cuda/beamformer_cuda \
+    --kernel tiled \
+    --input results/fake_data.bin \
+    --weights results/weights_hex64_tiled.bin \
+    --output /tmp/beamformed_tiled_integrated_320.bin \
+    --n-time 15360 --n-ant 64 --n-beams 64 \
+    --integration-spectra 320
+```
+
+For a separate post-upchannelizer tensor with `T=480`, change `--n-time 480` and use
+`--integration-spectra 10`. Both cases produce 48 output time intervals. Omitting
+`--integration-spectra` preserves the unintegrated float32 debug output.
+
+## Quantized int8 integrated output
+
+To quantize on the GPU after temporal integration, use `--output-format int8` and provide
+sidecar paths for the local `(offset, scale)` parameters and metadata. The codes remain in
+`[integration_window][336][beam]` order; `-128` is reserved for non-finite values.
+
+```bash
+./build-cuda/beamformer_cuda \
+    --kernel tiled \
+    --input results/temporal_15360_noise_hex64/voltage.bin \
+    --weights results/weights_hex64_tiled.bin \
+    --output /tmp/beamformed_tiled_int8.bin \
+    --quantization-params /tmp/beamformed_tiled_int8.params.bin \
+    --quantization-metadata /tmp/beamformed_tiled_int8.meta \
+    --shard-id 0 \
+    --n-time 15360 --n-ant 64 --n-beams 64 \
+    --integration-spectra 320 --output-format int8
+```
+
+At `[48][336][64]`, the codes consume 1,032,192 bytes and the parameter sidecar consumes
+32,256 bytes, versus 4,128,768 bytes for integrated float32.

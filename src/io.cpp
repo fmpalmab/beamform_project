@@ -112,6 +112,135 @@ void write_intensities(const std::filesystem::path& path,
     write_binary(path, intensities);
 }
 
+QuantizedIntensities read_quantized_intensities(const std::filesystem::path& path,
+                                                const Dimensions& dims) {
+    validate_dimensions(dims);
+    return read_binary<std::int8_t>(
+        path, dims.n_time * dims.n_freq * dims.n_beams);
+}
+
+void write_quantized_intensities(const std::filesystem::path& path,
+                                 const QuantizedIntensities& intensities,
+                                 const Dimensions& dims) {
+    validate_dimensions(dims);
+    const std::size_t count = dims.n_time * dims.n_freq * dims.n_beams;
+    if (intensities.size() != count) {
+        throw std::invalid_argument("quantized intensity count does not match dimensions");
+    }
+    write_binary(path, intensities);
+}
+
+std::vector<Int8QuantizationParameters> read_quantization_parameters(
+    const std::filesystem::path& path, const Dimensions& integrated_dims) {
+    return read_binary<Int8QuantizationParameters>(
+        path, quantization_parameter_count(integrated_dims));
+}
+
+void write_quantization_parameters(
+    const std::filesystem::path& path,
+    const std::vector<Int8QuantizationParameters>& parameters,
+    const Dimensions& integrated_dims) {
+    if (parameters.size() != quantization_parameter_count(integrated_dims)) {
+        throw std::invalid_argument("quantization parameter count does not match dimensions");
+    }
+    write_binary(path, parameters);
+}
+
+void write_quantized_output_metadata(const std::filesystem::path& path,
+                                     const QuantizedOutputMetadata& metadata) {
+    validate_quantized_output_metadata(metadata);
+    std::ofstream output(path, std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("cannot open quantized metadata file: " + path.string());
+    }
+    output << "format=beamformer-quantized-int8-v1\n"
+           << "n_time=" << metadata.output_dims.n_time << '\n'
+           << "n_freq=" << metadata.output_dims.n_freq << '\n'
+           << "n_ant=" << metadata.output_dims.n_ant << '\n'
+           << "n_beams=" << metadata.output_dims.n_beams << '\n'
+           << "input_n_time=" << metadata.input_n_time << '\n'
+           << "integration_spectra="
+           << metadata.temporal_integration.integration_spectra << '\n'
+           << "chunk_time=" << quantization_chunk_time << '\n'
+           << "chunk_frequency=" << quantization_chunk_frequency << '\n'
+           << "chunk_beam=" << quantization_chunk_beam << '\n'
+           << "invalid_code=" << static_cast<int>(quantized_invalid_code) << '\n'
+           << "parameters_format=little-endian-float32[offset,scale]\n"
+           << "parameters_file=" << metadata.parameters_file << '\n'
+           << "parameters_count=" << quantization_parameter_count(metadata.output_dims) << '\n'
+           << "shard_id=" << metadata.shard.shard_id << '\n'
+           << "shard_count=" << metadata.shard.shard_count << '\n'
+           << "local_frequency_count=" << metadata.shard.local_frequency_count << '\n'
+           << "absolute_frequency_start=" << metadata.shard.absolute_frequency_start << '\n'
+           << "timestamp_start=" << metadata.shard.timestamp_start << '\n'
+           << "timestamp_step=" << metadata.shard.timestamp_step << '\n'
+           << "loss_mask_id=" << metadata.shard.loss_mask_id << '\n'
+           << "loss_mask_independent=" << (metadata.shard.loss_mask_independent ? 1 : 0)
+           << '\n';
+    if (!output) {
+        throw std::runtime_error("failed to write quantized metadata file: " + path.string());
+    }
+}
+
+QuantizedOutputMetadata read_quantized_output_metadata(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("cannot open quantized metadata file: " + path.string());
+    }
+    std::map<std::string, std::string> fields;
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto separator = line.find('=');
+        if (separator == std::string::npos || separator == 0) {
+            throw std::runtime_error("invalid quantized metadata line in: " + path.string());
+        }
+        fields[line.substr(0, separator)] = line.substr(separator + 1);
+    }
+    const auto require = [&fields, &path](const char* name) -> const std::string& {
+        const auto found = fields.find(name);
+        if (found == fields.end()) {
+            throw std::runtime_error("missing quantized metadata field "
+                                     + std::string(name) + " in: " + path.string());
+        }
+        return found->second;
+    };
+    const auto number = [&require](const char* name) {
+        return static_cast<std::size_t>(std::stoull(require(name)));
+    };
+    if (require("format") != "beamformer-quantized-int8-v1"
+        || require("parameters_format") != "little-endian-float32[offset,scale]"
+        || number("chunk_time") != quantization_chunk_time
+        || number("chunk_frequency") != quantization_chunk_frequency
+        || number("chunk_beam") != quantization_chunk_beam
+        || std::stoi(require("invalid_code")) != quantized_invalid_code) {
+        throw std::runtime_error("unsupported quantized metadata format: " + path.string());
+    }
+    const auto loss_mask_independent = [&require]() {
+        const auto& value = require("loss_mask_independent");
+        if (value != "0" && value != "1") {
+            throw std::runtime_error("invalid loss_mask_independent metadata value");
+        }
+        return value == "1";
+    };
+    QuantizedOutputMetadata metadata{
+        Dimensions{number("n_time"), number("n_freq"), number("n_ant"), number("n_beams")},
+        number("input_n_time"),
+        TemporalIntegrationConfig{number("integration_spectra")},
+        ShardDescriptor{number("shard_id"), number("shard_count"),
+                        number("local_frequency_count"), number("absolute_frequency_start"),
+                        static_cast<std::uint64_t>(std::stoull(require("timestamp_start"))),
+                        static_cast<std::uint64_t>(std::stoull(require("timestamp_step"))),
+                        static_cast<std::uint64_t>(std::stoull(require("loss_mask_id"))),
+                        loss_mask_independent()},
+        require("parameters_file"),
+    };
+    if (number("parameters_count") != quantization_parameter_count(metadata.output_dims)) {
+        throw std::runtime_error("quantization parameter count is inconsistent: " + path.string());
+    }
+    validate_quantized_output_metadata(metadata);
+    return metadata;
+}
+
 void write_packed_shard(const std::filesystem::path& payload_path,
                         const std::filesystem::path& metadata_path,
                         const std::filesystem::path& loss_mask_path,
