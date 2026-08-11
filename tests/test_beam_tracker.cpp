@@ -79,12 +79,14 @@ int main() {
     assert(tracker_direction(traj_zero, 0) == direction_from_lm(0.0F, 0.0F));
     assert(tracker_direction(traj_zero, 123) == direction_from_lm(0.0F, 0.0F));
 
+    // Rate is small enough that the trajectory stays on the unit disk even when
+    // evaluated at the 320-spectrum window offsets used below (t up to 640).
     TrackerTrajectoryConfig traj_drift{
-        direction_from_lm(0.02F, -0.03F), {0.001F, -0.002F}};
+        direction_from_lm(0.02F, -0.03F), {1.0e-4F, -2.0e-4F}};
     assert(tracker_direction(traj_drift, 0) == direction_from_lm(0.02F, -0.03F));
     assert(tracker_direction(traj_drift, 10) ==
-           direction_from_lm(0.02F + 10.0F * 0.001F,
-                             -0.03F + 10.0F * -0.002F));
+           direction_from_lm(0.02F + 10.0F * 1.0e-4F,
+                             -0.03F + 10.0F * -2.0e-4F));
 
     // Per-window direction uses the first sample of each window.
     const std::size_t spectra = 320;
