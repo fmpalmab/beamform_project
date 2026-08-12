@@ -102,7 +102,8 @@ class TrackerDashboardRenderTest(unittest.TestCase):
         self.assertIn("8x8", text)
         self.assertIn("n_ant=64", text)
         self.assertIn("windows=1", text)
-        self.assertIn("rate=(0.0001,0.0)/sample", text)
+        # :g formatting renders 0.0 as "0".
+        self.assertIn("rate=(0.0001,0)/sample", text)
 
     def test_dashboard_writes_png(self):
         import matplotlib
@@ -128,9 +129,10 @@ class TrackerDashboardRenderTest(unittest.TestCase):
                 "--source-l0", "0.0",
                 "--source-m0", "0.0",
             ])
-        self.assertEqual(rc, 0)
-        self.assertTrue(output_path.exists())
-        self.assertGreater(output_path.stat().st_size, 0)
+            # Assert inside the with-block: the temp dir is removed on exit.
+            self.assertEqual(rc, 0)
+            self.assertTrue(output_path.exists())
+            self.assertGreater(output_path.stat().st_size, 0)
 
     def test_frames_dir_emits_zero_padded_pngs(self):
         import matplotlib
@@ -158,16 +160,16 @@ class TrackerDashboardRenderTest(unittest.TestCase):
                 "--source-m0", "0.0",
                 "--source-dl-per-sample", "1.0e-4",
             ])
-        self.assertEqual(rc, 0)
-        self.assertTrue(frames_dir.is_dir())
-        written = sorted(frames_dir.glob("frame_*.png"))
-        self.assertEqual(len(written), 4)
-        # Zero-padded sequential names, all non-empty.
-        names = [p.name for p in written]
-        self.assertEqual(names, ["frame_0.png", "frame_1.png",
-                                 "frame_2.png", "frame_3.png"])
-        for p in written:
-            self.assertGreater(p.stat().st_size, 0)
+            self.assertEqual(rc, 0)
+            self.assertTrue(frames_dir.is_dir())
+            written = sorted(frames_dir.glob("frame_*.png"))
+            self.assertEqual(len(written), 4)
+            # Zero-padded sequential names, all non-empty.
+            names = [p.name for p in written]
+            self.assertEqual(names, ["frame_0.png", "frame_1.png",
+                                     "frame_2.png", "frame_3.png"])
+            for p in written:
+                self.assertGreater(p.stat().st_size, 0)
 
     def test_frames_stride_downsamples(self):
         import matplotlib
@@ -187,9 +189,9 @@ class TrackerDashboardRenderTest(unittest.TestCase):
                 "--integration-spectra", "80",
                 "--frames-stride", "2",
             ])
-        self.assertEqual(rc, 0)
-        written = sorted(frames_dir.glob("frame_*.png"))
-        self.assertEqual(len(written), 2)  # windows 0 and 2
+            self.assertEqual(rc, 0)
+            written = sorted(frames_dir.glob("frame_*.png"))
+            self.assertEqual(len(written), 2)  # windows 0 and 2
 
     def test_frames_max_caps_emitted_count(self):
         import matplotlib

@@ -487,7 +487,7 @@ def render_frames(args, intensity, frequencies, positions,
     per_window_power = (
         intensity.reshape(total_windows, args.integration_spectra,
                           args.n_freq, TRACKER_BEAM_COUNT)
-        .sum(axis=(1, 3)) if total_windows * args.integration_spectra == args.n_time
+        .sum(axis=(1, 2, 3)) if total_windows * args.integration_spectra == args.n_time
         else None
     )
     for idx, window_index in enumerate(selected):
