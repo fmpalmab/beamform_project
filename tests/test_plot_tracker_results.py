@@ -164,10 +164,10 @@ class TrackerDashboardRenderTest(unittest.TestCase):
             self.assertTrue(frames_dir.is_dir())
             written = sorted(frames_dir.glob("frame_*.png"))
             self.assertEqual(len(written), 4)
-            # Zero-padded sequential names, all non-empty.
+            # Zero-padded sequential names (min width 4 for clean scp -r order).
             names = [p.name for p in written]
-            self.assertEqual(names, ["frame_0.png", "frame_1.png",
-                                     "frame_2.png", "frame_3.png"])
+            self.assertEqual(names, ["frame_0000.png", "frame_0001.png",
+                                     "frame_0002.png", "frame_0003.png"])
             for p in written:
                 self.assertGreater(p.stat().st_size, 0)
 
