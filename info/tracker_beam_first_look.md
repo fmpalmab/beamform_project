@@ -461,3 +461,56 @@ and an actual dashboard PNG render (Agg backend, no display required).
 - Replace the linear trajectory with the production ephemeris format once defined.
 - Optionally add an int8 tracker output by reusing the existing quantization stage on the
   single-beam `[T_int][F]` tensor.
+
+## 9.8 Visualizations: array metadata and per-window frames
+
+[`tools/plot_tracker_results.py`](tools/plot_tracker_results.py:1) was extended with two
+improvements (run on Trillium with plain `python`, no conda required as long as numpy +
+matplotlib are available):
+
+1. **Array/run metadata legend** on every panel: array shape (`rows×cols`), `n_ant`, spacing,
+   aperture size, channel count, centre frequency, `n_time`, `integration_spectra`, window
+   count, and the tracker trajectory parameters — so each PNG is self-describing.
+2. **Per-integration-window frame export** via `--frames-dir DIR`: one PNG per window, each
+   showing the steered-beam footprint (magenta `-3 dB` contour), the antenna 3 dB FoV
+   ellipse, the tracker trajectory, the moving-source track, the current window's source
+   position, and a per-window recorded-power histogram with the current frame highlighted.
+   Files are zero-padded (`frame_0000.png`, `frame_0001.png`, …) inside a single folder so
+   `scp -r` brings the whole sequence over and frame order is preserved.
+
+The frame count is the **number of integration windows**, not the number of time samples
+(`(n_time + integration_spectra - 1) // integration_spectra`). For the §9.4 example that is
+1 frame; for `n_time=15360, integration_spectra=320` it is 48 frames. `--frames-stride N`
+emits every Nth window and `--frames-max` is a safety cap. The default dashboard (`--output`)
+and the frames mode (`--frames-dir`) can be used together or independently.
+
+### Per-window frame example (Trillium, plain python)
+
+```bash
+# Bigger window count: 16 integration windows of 320 spectra -> 16 frames.
+./build/beam_tracker_cpu \
+    --input results/moving_source.bin \
+    --output results/tracker_aligned.bin \
+    --n-time 5120 --n-ant 64 \
+    --track-l0 0.0 --track-m0 0.0 \
+    --dl-per-sample 1.0e-4 --dm-per-sample 0.0 \
+    --integration-spectra 320 --metrics results/tracker_metrics.csv
+
+python tools/plot_tracker_results.py \
+    --input results/tracker_aligned.bin \
+    --frames-dir results/tracker_frames \
+    --n-time 5120 --n-ant 64 \
+    --track-l0 0.0 --track-m0 0.0 \
+    --dl-per-sample 1.0e-4 --dm-per-sample 0.0 \
+    --integration-spectra 320 \
+    --source-l0 0.0 --source-m0 0.0 \
+    --source-dl-per-sample 1.0e-4 --source-dm-per-sample 0.0
+
+# Copy the whole sequence back to this PC:
+#   scp -r <trillium_user>@<login>:beamform_project/results/tracker_frames .
+# Then page through frame_0000.png .. frame_0015.png to watch the tracker follow the source.
+```
+
+To also emit the single-PNG dashboard alongside the frames, pass both `--output` and
+`--frames-dir`. To downsample large runs for a quick preview, use `--frames-stride 4` (one
+frame every 4 windows) and/or raise `--frames-max`.

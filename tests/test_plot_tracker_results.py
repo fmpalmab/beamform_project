@@ -86,6 +86,24 @@ class TrackerTrajectoryTest(unittest.TestCase):
 
 
 class TrackerDashboardRenderTest(unittest.TestCase):
+    def test_metadata_block_contains_run_geometry(self):
+        args = plot_tracker.build_parser().parse_args([
+            "--input", "x.bin", "--output", "out.png", "--n-time", "320",
+            "--n-ant", "64", "--integration-spectra", "320",
+            "--track-l0", "0.0", "--dl-per-sample", "1.0e-4",
+        ])
+        args.n_freq = plot_tracker.resolve_frequency_channels(args.buffer,
+                                                              args.n_freq)
+        positions = plot_tracker.default_positions(args.n_ant, args.spacing_m)
+        frequencies = plot_tracker.default_frequencies(
+            args.n_freq, plot_tracker.DEFAULT_FREQUENCY_START_HZ,
+            args.channel_width_hz)
+        text = plot_tracker.array_metadata_text(args, frequencies, positions)
+        self.assertIn("8x8", text)
+        self.assertIn("n_ant=64", text)
+        self.assertIn("windows=1", text)
+        self.assertIn("rate=(0.0001,0.0)/sample", text)
+
     def test_dashboard_writes_png(self):
         import matplotlib
         matplotlib.use("Agg")
@@ -95,13 +113,10 @@ class TrackerDashboardRenderTest(unittest.TestCase):
             n_time, n_freq, 1) + 1.0
         with tempfile.TemporaryDirectory() as tmp:
             intensity_path = Path(tmp) / "tracker_intensity.bin"
-            compare_path = Path(tmp) / "tracker_compare.bin"
             output_path = Path(tmp) / "tracker_dashboard.png"
             intensity.tofile(intensity_path)
-            intensity.tofile(compare_path)
             rc = plot_tracker.main([
                 "--input", str(intensity_path),
-                "--compare", str(compare_path),
                 "--output", str(output_path),
                 "--n-time", str(n_time),
                 "--n-ant", str(n_ant),
@@ -116,6 +131,85 @@ class TrackerDashboardRenderTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(output_path.exists())
         self.assertGreater(output_path.stat().st_size, 0)
+
+    def test_frames_dir_emits_zero_padded_pngs(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        # 4 windows (n_time=320, integration_spectra=80); emit every window.
+        n_time, n_freq, n_ant = 320, 336, 32
+        intensity = (np.arange(n_time * n_freq, dtype="<f4")
+                     .reshape(n_time, n_freq, 1) + 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            intensity_path = Path(tmp) / "tracker_intensity.bin"
+            frames_dir = Path(tmp) / "frames"
+            intensity.tofile(intensity_path)
+            rc = plot_tracker.main([
+                "--input", str(intensity_path),
+                "--frames-dir", str(frames_dir),
+                "--n-time", str(n_time),
+                "--n-ant", str(n_ant),
+                "--track-l0", "0.0",
+                "--track-m0", "0.0",
+                "--dl-per-sample", "1.0e-4",
+                "--dm-per-sample", "0.0",
+                "--integration-spectra", "80",
+                "--frames-stride", "1",
+                "--source-l0", "0.0",
+                "--source-m0", "0.0",
+                "--source-dl-per-sample", "1.0e-4",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertTrue(frames_dir.is_dir())
+        written = sorted(frames_dir.glob("frame_*.png"))
+        self.assertEqual(len(written), 4)
+        # Zero-padded sequential names, all non-empty.
+        names = [p.name for p in written]
+        self.assertEqual(names, ["frame_0.png", "frame_1.png",
+                                 "frame_2.png", "frame_3.png"])
+        for p in written:
+            self.assertGreater(p.stat().st_size, 0)
+
+    def test_frames_stride_downsamples(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        n_time, n_freq, n_ant = 320, 336, 32
+        intensity = (np.arange(n_time * n_freq, dtype="<f4")
+                     .reshape(n_time, n_freq, 1) + 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            intensity_path = Path(tmp) / "tracker_intensity.bin"
+            frames_dir = Path(tmp) / "frames_stride"
+            intensity.tofile(intensity_path)
+            rc = plot_tracker.main([
+                "--input", str(intensity_path),
+                "--frames-dir", str(frames_dir),
+                "--n-time", str(n_time),
+                "--n-ant", str(n_ant),
+                "--integration-spectra", "80",
+                "--frames-stride", "2",
+            ])
+        self.assertEqual(rc, 0)
+        written = sorted(frames_dir.glob("frame_*.png"))
+        self.assertEqual(len(written), 2)  # windows 0 and 2
+
+    def test_frames_max_caps_emitted_count(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        n_time, n_freq, n_ant = 320, 336, 32
+        intensity = (np.arange(n_time * n_freq, dtype="<f4")
+                     .reshape(n_time, n_freq, 1) + 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            intensity_path = Path(tmp) / "tracker_intensity.bin"
+            frames_dir = Path(tmp) / "frames_cap"
+            intensity.tofile(intensity_path)
+            with self.assertRaises(ValueError):
+                plot_tracker.main([
+                    "--input", str(intensity_path),
+                    "--frames-dir", str(frames_dir),
+                    "--n-time", str(n_time),
+                    "--n-ant", str(n_ant),
+                    "--integration-spectra", "80",
+                    "--frames-max", "2",
+                ])
 
 
 if __name__ == "__main__":
