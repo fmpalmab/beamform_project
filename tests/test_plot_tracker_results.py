@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
+
 """Unit tests for the tracker-beam plotting helper (tools/plot_tracker_results.py)."""
 
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
+# plot_tracker_results.py imports shared helpers from plot_results via a
+# bare module import, so the tools/ directory must be importable before we
+# exec the script under test.
+TOOLS_DIR = Path(__file__).parents[1] / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
-SCRIPT = Path(__file__).parents[1] / "tools" / "plot_tracker_results.py"
+SCRIPT = TOOLS_DIR / "plot_tracker_results.py"
 SPEC = importlib.util.spec_from_file_location("plot_tracker_results", SCRIPT)
 plot_tracker = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
+sys.modules["plot_tracker_results"] = plot_tracker
 SPEC.loader.exec_module(plot_tracker)
-
 
 class TrackerTrajectoryTest(unittest.TestCase):
     def test_stationary_trajectory_repeats_start(self):

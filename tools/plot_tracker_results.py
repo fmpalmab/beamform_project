@@ -58,7 +58,7 @@ def tracker_directions(
     l0: float, m0: float, dl_per_sample: float, dm_per_sample: float,
     n_time: int,
 ) -> np.ndarray:
-    """Per-sample tracker directions (n, m, l) for the linear model.
+    """Per-sample tracker directions as columns (l, m, n) for the linear model.
 
     Matches tracker_direction() in src/beam_tracker.cpp: l(t) = l0 + t*dl,
     m(t) = m0 + t*dm, then n = sqrt(1 - l*l - m*m). Raises if any sample
