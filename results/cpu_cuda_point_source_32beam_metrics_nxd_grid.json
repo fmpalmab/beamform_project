@@ -1,9 +1,0 @@
-{
-  "max_absolute_error": 0.0078125,
-  "mean_relative_error": 3.5079844405116567e-07,
-  "p99_relative_error": 4.2450006517539795e-06,
-  "max_relative_error": 9.159146289198819e-05,
-  "correlation": 0.9999999999999969,
-  "outside_tolerance": 0,
-  "total_values": 86016
-}
