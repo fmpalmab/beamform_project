@@ -1560,31 +1560,25 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         Cfloat* __restrict capon_b = impl_->capon_b_scratch.data();
 
         // ---- Phase 3 steering-vector preload (trig kill for coplanar arrays).
-        // `centre = coarse[mid]` is the per-window search centre (the prior's
-        // clamped grid anchor — bit-identical to `build_centred_grid`'s centre
-        // cell, so any horizon clamp the centre incurred is preserved). The
-        // centre phasor `centre_phasor[f][a] = exp(-j*k*(px*l0+py*m0))` is
+        // The relative phasor table `rel_coarse` was built in the Impl ctor
+        // around the grid's TRUE geometric centre index `mid = (G-1)/2` (kept
+        // fractional so it works for even G, where no integer cell sits at the
+        // prior). The natural anchor for the additive decomposition is therefore
+        // the prior `prev_estimate` itself (its (l,m) sit exactly at the grid
+        // range centre by construction of build_centred_grid), NOT any grid
+        // cell — for even G there is no centre cell. So:
+        //   a(cell)[a] = centre_phasor(f,a) * rel_coarse(cell,f,a)
+        // with `centre_phasor(f,a) = exp(-j*k(f)*(px*prev_l + py*prev_m))`,
         // computed ONCE per window per frequency (n_freq*M_eff trig). Each
-        // candidate cell's steering vector is then a single complex multiply
-        // per antenna: `a[cell][a] = centre_phasor[f][a] * rel_coarse[cell][f][a]`,
-        // exact for planar apertures because the phase (linear in l,m) composes
-        // additively. `cell_clamped` flags cells whose nominal lattice offset
-        // was horizon-clamped by `build_centred_grid` (their actual offset no
-        // longer matches the precomputed lattice phasor → steer_one fallback,
-        // preserving exactitude; the tested FoV never clamps so this is dead).
+        // candidate cell drops from 2 trig/antenna to 1 complex multiply/antenna.
+        // `cell_clamped` flags cells whose nominal lattice point lay outside
+        // the unit disk (so build_centred_grid horizon-clamped it — the actual
+        // coarse[cell] then no longer matches the precomputed lattice phasor,
+        // and the cell uses the exact steer_one fallback; the tested FoV never
+        // clamps so this branch is dead in practice).
         const bool phasor_fast = impl_->phasor_fast_path;
-        const std::size_t mid_cell =
-            ((G - 1) / 2) * G + ((G - 1) / 2);  // centre lattice index
-        const float centre_l = phasor_fast ? coarse[mid_cell][0] : 0.0F;
-        const float centre_m = phasor_fast ? coarse[mid_cell][1] : 0.0F;
-        // Nominal lattice offset per cell centre (used to detect clamp): an
-        // unclamped coarse cell satisfies
-        //   coarse[cell] == direction_from_lm(centre_l + (u-mid)*step_l,
-        //                                     centre_m + (v-mid)*step_m)
-        // so its (l,m) equals the nominal planar point exactly; a clamped cell
-        // has been scaled onto the 0.999-radius disk so its (l,m) differs.
-        // `cell_clamped` is true iff the cell's nominal point lay outside the
-        // unit disk (the only trigger for the clamp in build_centred_grid).
+        const float centre_l = phasor_fast ? prev_estimate[0] : 0.0F;
+        const float centre_m = phasor_fast ? prev_estimate[1] : 0.0F;
         std::vector<char> cell_clamped;
         const double step_l =
             phasor_fast ? ((G == 1) ? 0.0
