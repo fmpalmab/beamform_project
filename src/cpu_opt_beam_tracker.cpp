@@ -670,6 +670,62 @@ struct CpuOptBeamTracker::Impl {
     std::size_t coarse_cells_per_axis = 0;
     std::size_t M_eff = 0;
 
+    // --- Phase 3: precomputed relative-grid phasor tables (O6, trig kill). ---
+    // The steering phase is `phi_a(l,m) = k(f) * (p_x*l + p_y*m + p_z*n(l,m))`
+    // (see `steer_one` above). For a PLANAR array lying in the z=0 plane every
+    // antenna has p_z == 0, so the nonlinear n(l,m)=sqrt(1-l*l-m*m) term never
+    // enters the phase: `phi_a(l,m) = k(f)*(p_x*l + p_y*m)` — LINEAR in (l,m).
+    // The additive phase decomposition then holds exactly:
+    //   phi_a(u0 + du) = phi_a(u0) + k(f)*(p_x*du_l + p_y*du_m)
+    // so the absolute steering phasor factors as
+    //   a_a(u0+du) = centre_phasor_a(f) * rel_phasor_a(f, du)
+    // The relative lattice offsets `du` are IDENTICAL for every window (only
+    // the coarse pitch / refinement pitches and antenna geometry set them, all
+    // static), so `rel_phasor` is built ONCE in the constructor — the entire
+    // coarse scan + every refinement candidate drops from 2 trig calls/antenna
+    // to a single complex multiply/antenna. This is the Phase 3 objective.
+    //
+    // `phasor_fast_path` is false iff the array is not coplanar (some |p_z|>eps):
+    // the additive decomposition is then not exact, so the hot path keeps the
+    // original `steer_one` trig call per cell (no regression — `default_positions`
+    // is planar so tests take the fast path).
+    bool phasor_fast_path = false;
+
+    // Coarse-grid relative phasor per frequency: `rel_coarse[f][cell][a]`, flat
+    // layout `rel_coarse[cell * n_freq * M_eff + f * M_eff + a]`
+    // = exp(-j * k(f) * (p_x*du_l[cell] + p_y*du_m[cell])).
+    // `du_l[cell] = (u-(G-1)/2)*step_l`, `du_m[cell] = (v-(G-1)/2)*step_m`: the
+    // offset of cell (v,u) from the grid centre (the prior). At the centre cell
+    // the offset is exactly zero so the phasor is +1 — matching the identity
+    // `a == centre_phasor` there. Sized in the ctor only when the fast path is
+    // taken; left empty otherwise.
+    std::vector<Cfloat> rel_coarse;
+
+    // Refinement relative phasors per level per frequency:
+    // `rel_refine[L][o][f][a]`, flat `rel_refine[L][o * n_freq * M_eff + f*M_eff + a]`,
+    // `o = (dv+1)*3 + (du+1) in [0,9)` for the 3x3 candidate pattern at the
+    // parent-cell pitch. At level `L` (1-indexed) the candidate offset from the
+    // parent centre is `(du*half_L, dv*half_L)` with
+    // `half_L = (search_fov*/G) / 2^L`. `rel_refine[L][4]` (centre) is +1.
+    std::vector<std::vector<Cfloat>> rel_refine;  // size: L_refine, each 9*n_freq*M
+    // Per-level half-cell pitch cached at build time (1-indexed levels). Read by
+    // the scan to detect the (rare) unit-disk clamp that invalidates the static
+    // offset and triggers the trig fallback for that candidate only.
+    std::vector<float> refine_half_l;  // size: L_refine
+    std::vector<float> refine_half_m;  // size: L_refine
+
+    // Per-window centre phasor scratch: `centre_phasor[f][a]`
+    // = exp(-j * k(f) * (p_x*l0 + p_y*m0)) for the current search centre (l0,m0).
+    // Recomputed ONCE per window per frequency (n_freq*M_eff trig calls), stored
+    // flat as `centre_phasor[f * M_eff + a]`. Sized in the ctor (fast path only).
+    std::vector<Cfloat> centre_phasor;
+
+    // Per-antenna planar position components (copies of the first M_eff rows of
+    // positions_m_), cached so the hot path indexes a tight contiguous buffer
+    // when smoothing truncates the aperture to M_eff antennas.
+    std::vector<float> pos_x;  // size: M_eff
+    std::vector<float> pos_y;  // size: M_eff
+
     // --- Phase 1 preallocated scratchpad buffers (zero-allocation hot path) ---
     // Sized once in the constructor from the configured dimensions; the
     // `run_into` hot path reuses these slices instead of allocating per
@@ -843,24 +899,143 @@ CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
                                       Cfloat{0.0F, 0.0F});
     }
 
-    // Precompute the coarse steering table (O6) if a scan is requested.
-    // Van Veen & Buckley 1988 (beam-space preprocessing); Van Trees 2002 §6.8.
+    // Phase 3: precompute the O6 relative-grid phasor tables (off the hot
+    // path) when a scan is requested AND the aperture is coplanar (every
+    // antenna z within float eps of 0). For a planar array the steering phase
+    // `phi_a = k(f)*(p_x*l + p_y*m + p_z*n(l,m))` collapses to a function LINEAR
+    // in (l,m) (p_z==0 kills the n term), so `phi_a(u0+du)=phi_a(u0)+phi_a(du)`
+    // exactly and each candidate's steering vector is `centre * rel` with no
+    // per-cell trig. A non-coplanar aperture keeps the original `steer_one` path
+    // (`phasor_fast_path` stays false) — numerically identical to before.
     const bool scan_enabled = config_.coarse_grid_resolution > 1;
     if (scan_enabled) {
         impl_->coarse_cells_per_axis = config_.coarse_grid_resolution;
         const std::size_t G = impl_->coarse_cells_per_axis;
-        const std::size_t total = G * G * dims_.n_freq * M_eff;
-        impl_->coarse_table.assign(total, Cfloat{0.0F, 0.0F});
-        // The table is centre-agnostic until we know the per-window centre; we
-        // build it lazily around each window's prior centre using the cached
-        // pitch / geometry. To keep the O6 amortization exact we cache an
-        // *identity*-steering baseline and rotate per window — but the
-        // dominant cost is the sincos, which would be paid per-window either
-        // way. For v1 we build the table on demand per window (still reused
-        // across refinement levels and the per-frequency sweep within a
-        // window) and cache across windows for stationary centres. The
-        // deferred FFT-fold (spec O6 note) removes this entirely.
-        // -> Left empty; per-window build below reuses declared capacity.
+
+        // Coplanarity guard: the fast phase-decomposition path is exact iff no
+        // antenna has a meaningful z component (otherwise the nonlinear
+        // n=sqrt(1-l*l-m*m) term contributes and per-offset tabulation would
+        // not reproduce steer_one to float tolerance). Use the first M_eff
+        // antennas — exactly those the sub-array aperture steers with.
+        const float coplanar_eps = 1.0e-6F;
+        bool coplanar = true;
+        for (std::size_t a = 0; a < M_eff; ++a) {
+            if (std::fabs(positions_m_[a][2]) > coplanar_eps) {
+                coplanar = false;
+                break;
+            }
+        }
+        impl_->phasor_fast_path = coplanar;
+
+        // Cache the planar position components used by both the table build
+        // (here, off-hot-path) and the centre-phasor recompute (per window).
+        impl_->pos_x.assign(M_eff, 0.0F);
+        impl_->pos_y.assign(M_eff, 0.0F);
+        for (std::size_t a = 0; a < M_eff; ++a) {
+            impl_->pos_x[a] = positions_m_[a][0];
+            impl_->pos_y[a] = positions_m_[a][1];
+        }
+
+        if (coplanar) {
+            const double two_pi_over_c = two_pi / speed_of_light_m_per_s;
+
+            // --- Coarse relative phasors: rel_coarse[cell][f][a] ---
+            // `du_l[u] = (u - (G-1)/2) * step_l`, `step_l = 2*fov_l/(G-1)`; same
+            // for m. The coarse grid centres on the prior, so the centre cell
+            // offset is exactly 0 => rel phasor +1 (matches a == centre there).
+            const double step_l =
+                (G == 1) ? 0.0 : (2.0 * static_cast<double>(config_.search_fov_l))
+                                 / static_cast<double>(G - 1);
+            const double step_m =
+                (G == 1) ? 0.0 : (2.0 * static_cast<double>(config_.search_fov_m))
+                                 / static_cast<double>(G - 1);
+            const double mid =
+                static_cast<double>(G - 1) * 0.5;  // fractional centre index
+            impl_->rel_coarse.assign(G * G * dims_.n_freq * M_eff,
+                                     Cfloat{0.0F, 0.0F});
+            for (std::size_t v = 0; v < G; ++v) {
+                const double du_m = (static_cast<double>(v) - mid) * step_m;
+                for (std::size_t u = 0; u < G; ++u) {
+                    const double du_l =
+                        (static_cast<double>(u) - mid) * step_l;
+                    const std::size_t cell = v * G + u;
+                    Cfloat* __restrict cell_base =
+                        impl_->rel_coarse.data()
+                        + cell * dims_.n_freq * M_eff;
+                    for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+                        const double k =
+                            two_pi_over_c
+                            * static_cast<double>(frequencies_hz_[f]);
+                        Cfloat* __restrict f_base =
+                            cell_base + f * M_eff;
+                        for (std::size_t a = 0; a < M_eff; ++a) {
+                            const double phi =
+                                k * (static_cast<double>(impl_->pos_x[a]) * du_l
+                                     + static_cast<double>(impl_->pos_y[a])
+                                       * du_m);
+                            // steer_one sign convention: imag = -sin.
+                            f_base[a] = Cfloat{
+                                static_cast<float>(std::cos(phi)),
+                                static_cast<float>(-std::sin(phi))};
+                        }
+                    }
+                }
+            }
+
+            // --- Refinement relative phasors: rel_refine[L][o][f][a] ---
+            // Level L (1-indexed) half-cell pitch `half = (fov/G) / 2^L`. The
+            // 3x3 candidate offsets are `(du*half, dv*half)` with o=(dv+1)*3+(du+1).
+            const std::size_t L_refine = config_.refinement_levels;
+            impl_->rel_refine.assign(L_refine, {});
+            impl_->refine_half_l.assign(L_refine, 0.0F);
+            impl_->refine_half_m.assign(L_refine, 0.0F);
+            const float base_half_l = config_.search_fov_l / static_cast<float>(G);
+            const float base_half_m = config_.search_fov_m / static_cast<float>(G);
+            for (std::size_t L = 1; L <= L_refine; ++L) {
+                const float half_l =
+                    base_half_l / static_cast<float>(1u << L);  // /2^L
+                const float half_m =
+                    base_half_m / static_cast<float>(1u << L);
+                impl_->refine_half_l[L - 1] = half_l;
+                impl_->refine_half_m[L - 1] = half_m;
+                std::vector<Cfloat>& tbl = impl_->rel_refine[L - 1];
+                tbl.assign(9 * dims_.n_freq * M_eff, Cfloat{0.0F, 0.0F});
+                for (std::int64_t dv = -1; dv <= 1; ++dv) {
+                    for (std::int64_t du = -1; du <= 1; ++du) {
+                        const std::size_t o =
+                            static_cast<std::size_t>((dv + 1) * 3 + (du + 1));
+                        const double du_l =
+                            static_cast<double>(du) * static_cast<double>(half_l);
+                        const double du_m =
+                            static_cast<double>(dv) * static_cast<double>(half_m);
+                        Cfloat* __restrict o_base =
+                            tbl.data() + o * dims_.n_freq * M_eff;
+                        for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+                            const double k =
+                                two_pi_over_c
+                                * static_cast<double>(frequencies_hz_[f]);
+                            Cfloat* __restrict f_base = o_base + f * M_eff;
+                            for (std::size_t a = 0; a < M_eff; ++a) {
+                                const double phi =
+                                    k
+                                    * (static_cast<double>(impl_->pos_x[a]) * du_l
+                                       + static_cast<double>(impl_->pos_y[a])
+                                         * du_m);
+                                f_base[a] = Cfloat{
+                                    static_cast<float>(std::cos(phi)),
+                                    static_cast<float>(-std::sin(phi))};
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Per-window centre-phasor scratch (sized once; written per window).
+            impl_->centre_phasor.assign(dims_.n_freq * M_eff,
+                                        Cfloat{0.0F, 0.0F});
+        }
+        // (The legacy `coarse_table` slot is left empty — Phase 3 supersedes it.
+        // It remains declared for ABI/back-compat with any external reader.)
         impl_->coarse_table.clear();
         impl_->coarse_table.shrink_to_fit();
     }
@@ -1383,6 +1558,76 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // work buffer — none allocated per cell.
         Cfloat* __restrict steer_buf = impl_->steer_scratch.data();
         Cfloat* __restrict capon_b = impl_->capon_b_scratch.data();
+
+        // ---- Phase 3 steering-vector preload (trig kill for coplanar arrays).
+        // `centre = coarse[mid]` is the per-window search centre (the prior's
+        // clamped grid anchor — bit-identical to `build_centred_grid`'s centre
+        // cell, so any horizon clamp the centre incurred is preserved). The
+        // centre phasor `centre_phasor[f][a] = exp(-j*k*(px*l0+py*m0))` is
+        // computed ONCE per window per frequency (n_freq*M_eff trig). Each
+        // candidate cell's steering vector is then a single complex multiply
+        // per antenna: `a[cell][a] = centre_phasor[f][a] * rel_coarse[cell][f][a]`,
+        // exact for planar apertures because the phase (linear in l,m) composes
+        // additively. `cell_clamped` flags cells whose nominal lattice offset
+        // was horizon-clamped by `build_centred_grid` (their actual offset no
+        // longer matches the precomputed lattice phasor → steer_one fallback,
+        // preserving exactitude; the tested FoV never clamps so this is dead).
+        const bool phasor_fast = impl_->phasor_fast_path;
+        const std::size_t mid_cell =
+            ((G - 1) / 2) * G + ((G - 1) / 2);  // centre lattice index
+        const float centre_l = phasor_fast ? coarse[mid_cell][0] : 0.0F;
+        const float centre_m = phasor_fast ? coarse[mid_cell][1] : 0.0F;
+        // Nominal lattice offset per cell centre (used to detect clamp): an
+        // unclamped coarse cell satisfies
+        //   coarse[cell] == direction_from_lm(centre_l + (u-mid)*step_l,
+        //                                     centre_m + (v-mid)*step_m)
+        // so its (l,m) equals the nominal planar point exactly; a clamped cell
+        // has been scaled onto the 0.999-radius disk so its (l,m) differs.
+        // `cell_clamped` is true iff the cell's nominal point lay outside the
+        // unit disk (the only trigger for the clamp in build_centred_grid).
+        std::vector<char> cell_clamped;
+        const double step_l =
+            phasor_fast ? ((G == 1) ? 0.0
+                                    : (2.0 * static_cast<double>(fov_l))
+                                      / static_cast<double>(G - 1))
+                        : 0.0;
+        const double step_m =
+            phasor_fast ? ((G == 1) ? 0.0
+                                    : (2.0 * static_cast<double>(fov_m))
+                                      / static_cast<double>(G - 1))
+                        : 0.0;
+        const double mid_idx = static_cast<double>(G - 1) * 0.5;
+        if (phasor_fast) {
+            cell_clamped.assign(G * G, 0);
+            for (std::size_t v = 0; v < G; ++v) {
+                for (std::size_t u = 0; u < G; ++u) {
+                    const double nl =
+                        centre_l + (static_cast<double>(u) - mid_idx) * step_l;
+                    const double nm =
+                        centre_m + (static_cast<double>(v) - mid_idx) * step_m;
+                    cell_clamped[v * G + u] =
+                        (nl * nl + nm * nm > 0.999) ? 1 : 0;
+                }
+            }
+            // Compute the centre phasor once per (freq, antenna) — the only
+            // per-window trig on this path.
+            const double two_pi_over_c = two_pi / speed_of_light_m_per_s;
+            const float* __restrict px = impl_->pos_x.data();
+            const float* __restrict py = impl_->pos_y.data();
+            Cfloat* __restrict cp = impl_->centre_phasor.data();
+            for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+                const double k =
+                    two_pi_over_c * static_cast<double>(frequencies_hz_[f]);
+                Cfloat* __restrict cpf = cp + f * M_eff;
+                for (std::size_t a = 0; a < M_eff; ++a) {
+                    const double phi =
+                        k * (static_cast<double>(px[a]) * centre_l
+                             + static_cast<double>(py[a]) * centre_m);
+                    cpf[a] = Cfloat{static_cast<float>(std::cos(phi)),
+                                    static_cast<float>(-std::sin(phi))};
+                }
+            }
+        }
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         std::vector<float> P_coarse_dbg(G * G, 0.0F);
         impl_->dbg_coarse_centres.push_back(coarse);
@@ -1404,14 +1649,35 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
             Cfloat* __restrict work = impl_->L_factors.data()
                 + f * M_eff * M_eff;  // mutable fallback scratch (per-cell solve)
             const bool factor_ok = impl_->capon_factor_ok[f] != 0;
+            // Phase 3: on the fast path the centre phasor and the per-cell
+            // relative phasor are precomputed; the steering vector is a single
+            // complex multiply per antenna (no cos/sin per cell). Otherwise the
+            // original `steer_one` trig path is used verbatim.
+            const Cfloat* __restrict cpf =
+                phasor_fast ? (impl_->centre_phasor.data() + f * M_eff)
+                            : nullptr;
+            const Cfloat* __restrict rcf =
+                phasor_fast ? impl_->rel_coarse.data() : nullptr;
+            const std::size_t cell_freq_stride = dims_.n_freq * M_eff;
             for (std::size_t cell = 0; cell < G * G; ++cell) {
                 // M_eff steering vector for this (frequency, cell). When
                 // smoothing reduces M_eff, the sub-array steering uses the
                 // first M_eff antenna positions with their phases relative to
                 // the cell direction — a consistent truncation.
-                for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
-                    steer_buf[a_idx] = steer_one(positions_m_, wave_number,
-                                                 coarse[cell], a_idx);
+                if (phasor_fast && !cell_clamped[cell]) {
+                    // Fast path: a = centre_phasor * rel_coarse (one cmul/ant).
+                    const Cfloat* __restrict rel =
+                        rcf + cell * cell_freq_stride + f * M_eff;
+                    for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                        steer_buf[a_idx] = cpf[a_idx] * rel[a_idx];
+                    }
+                } else {
+                    // Non-coplanar aperture or horizon-clamped cell: exact
+                    // direct trig construction (matches the pre-Phase-3 path).
+                    for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                        steer_buf[a_idx] = steer_one(positions_m_, wave_number,
+                                                     coarse[cell], a_idx);
+                    }
                 }
                 float p;
                 if (!capon) {
@@ -1479,6 +1745,58 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
             impl_->dbg_refine_cands[window].emplace_back(cand, cand + 9);
             impl_->dbg_refine_power[window].emplace_back(Pcand, Pcand + 9);
 #endif
+            // Phase 3: precompute a per-level parent phasor once per frequency
+            // for the running `centre` (the linear decomposition's anchor). The
+            // 9 candidates then reuse `parent_phasor * rel_refine[L][o]` — one
+            // complex multiply per antenna — instead of 9 trig-constructions.
+            // A candidate whose nominal offset left the unit disk (clamped by
+            // `direction_from_lm_one` below) falls back to `steer_one` so the
+            // result stays bit-identical. The centre's recomputed phasor is the
+            // running anchor even when O4 moved `centre` off the lattice.
+            const Cfloat* __restrict rel_refine_L = nullptr;
+            char cand_clamped[9];
+            if (phasor_fast && level - 1 < impl_->rel_refine.size()) {
+                rel_refine_L = impl_->rel_refine[level - 1].data();
+                const float hl = impl_->refine_half_l[level - 1];
+                const float hm = impl_->refine_half_m[level - 1];
+                const float cl = centre[0];
+                const float cm = centre[1];
+                for (std::int64_t dv = -1; dv <= 1; ++dv) {
+                    for (std::int64_t du = -1; du <= 1; ++du) {
+                        const std::size_t idx =
+                            static_cast<std::size_t>((dv + 1) * 3 + (du + 1));
+                        const float nl = cl + static_cast<float>(du) * hl;
+                        const float nm = cm + static_cast<float>(dv) * hm;
+                        cand_clamped[idx] = (nl * nl + nm * nm > 0.999F) ? 1 : 0;
+                    }
+                }
+            } else {
+                for (std::size_t i = 0; i < 9; ++i) cand_clamped[i] = 1;
+            }
+            // Parent phasor = steering vector at the running centre (computed
+            // with trig, once per level per freq — uses the centre's actual
+            // (l,m) which may be an O4-interpolated off-lattice point). Stored
+            // in the reused centre_phasor scratch.
+            if (phasor_fast) {
+                const double two_pi_over_c = two_pi / speed_of_light_m_per_s;
+                const float cl = centre[0];
+                const float cm = centre[1];
+                const float* __restrict px = impl_->pos_x.data();
+                const float* __restrict py = impl_->pos_y.data();
+                Cfloat* __restrict cp = impl_->centre_phasor.data();
+                for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+                    const double k =
+                        two_pi_over_c * static_cast<double>(frequencies_hz_[f]);
+                    Cfloat* __restrict cpf = cp + f * M_eff;
+                    for (std::size_t a = 0; a < M_eff; ++a) {
+                        const double phi =
+                            k * (static_cast<double>(px[a]) * cl
+                                 + static_cast<double>(py[a]) * cm);
+                        cpf[a] = Cfloat{static_cast<float>(std::cos(phi)),
+                                        static_cast<float>(-std::sin(phi))};
+                    }
+                }
+            }
             for (std::size_t f = 0; f < dims_.n_freq; ++f) {
                 const Cfloat* __restrict R_f = impl_->R_freq[f].data();
                 const double wave_number =
@@ -1493,10 +1811,26 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                 Cfloat* __restrict work = impl_->L_factors.data()
                     + f * M_eff * M_eff;
                 const bool factor_ok = impl_->capon_factor_ok[f] != 0;
+                const Cfloat* __restrict ppf =
+                    phasor_fast ? (impl_->centre_phasor.data() + f * M_eff)
+                                : nullptr;
+                const std::size_t o_freq_stride = dims_.n_freq * M_eff;
                 for (std::size_t i = 0; i < 9; ++i) {
-                    for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
-                        steer_buf[a_idx] =
-                            steer_one(positions_m_, wave_number, cand[i], a_idx);
+                    if (phasor_fast && !cand_clamped[i]) {
+                        // Fast path: a = parent_phasor * rel_refine (one cmul/ant).
+                        const Cfloat* __restrict rel =
+                            rel_refine_L + i * o_freq_stride + f * M_eff;
+                        for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                            steer_buf[a_idx] = ppf[a_idx] * rel[a_idx];
+                        }
+                    } else {
+                        // Non-coplanar aperture or nested horizon clamp: exact
+                        // direct trig construction (matches pre-Phase-3 path).
+                        for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                            steer_buf[a_idx] =
+                                steer_one(positions_m_, wave_number,
+                                          cand[i], a_idx);
+                        }
                     }
                     float p;
                     if (!capon) {
