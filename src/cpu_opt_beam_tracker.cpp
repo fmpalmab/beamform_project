@@ -1262,5 +1262,3 @@ void cpu_opt_beam_tracker_packed_intensity_into(
     tracker.seed_trajectory(trajectory.trajectory);
     tracker.run_into(packed, intensity);
 }
-
-}  // namespace beamformer
