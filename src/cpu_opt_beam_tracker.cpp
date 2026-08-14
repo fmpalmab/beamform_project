@@ -1,27 +1,3 @@
-// Optimized CPU beam tracker implementation.
-//
-// Implements the six algorithmic optimizations (O1–O6) from
-// `include/beamformer/cpu_opt_beam_tracker.md`. Algorithmic only — no
-// SIMD/AVX, no threading, no FFT libraries. Plain portable C++17.
-//
-// Back-compatibility anchor: with `CpuOptTrackerConfig` default-constructed
-// (`coarse_grid_resolution <= 1` => scan disabled), `run_into` reproduces the
-// naive `beam_tracker_cpu_packed_intensity_into` output to within float
-// rounding by running the *exact* naive delay-and-sum path with the
-// trajectory-supplied per-window direction (no covariance/search is touched
-// in that mode). This preserves the `grid_intensity == tracker_intensity` and
-// per-spectrum `close(actual, expected, 1e-4)` guarantees in
-// `tests/test_beam_tracker.cpp`.
-
-#include "beamformer/cpu_opt_beam_tracker.hpp"
-
-#include "beamformer/indexing.hpp"
-#include "beamformer/int4.hpp"
-#include "beamformer/physics.hpp"
-#include "beamformer/weights.hpp"
-
-#include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -1024,7 +1000,6 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                     R[i] = lambda * R[i] + a_comp * R_block[i];
                 }
             }
-        }
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         dbg_w_R[f] = impl_->R_freq[f];
         dbg_w_snaps[f] = snaps;
@@ -1262,3 +1237,5 @@ void cpu_opt_beam_tracker_packed_intensity_into(
     tracker.seed_trajectory(trajectory.trajectory);
     tracker.run_into(packed, intensity);
 }
+
+}  // namespace beamformer
