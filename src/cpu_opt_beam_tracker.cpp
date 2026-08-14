@@ -232,7 +232,8 @@ void apply_diagonal_load(std::vector<Cfloat>& R, std::size_t M,
 // Output is P×P, row-major. `snapshots` are the K length-M snapshots (each a
 // length-M complex vector). When smoothing is disabled (P == 0 or P >= M),
 // returns the plain full-array covariance scaled by 1/K.
-std::vector<std::vector<Cfloat>> spatial_smoothed_covariance(
+std::pair<std::vector<Cfloat>, std::vector<Cfloat>>
+spatial_smoothed_covariance(
     const std::vector<std::vector<Cfloat>>& snapshots, std::size_t M,
     std::size_t P_sub) {
     const std::size_t K = snapshots.size();
@@ -594,15 +595,16 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
 
     const bool scan_enabled = config_.coarse_grid_resolution > 1;
     const float lambda = config_.forgetting_factor;
-    const std::size_t M_eff = impl_->M_eff;
-    const bool smoothing = (config_.spatial_smoothing_subarray_size != 0
-                             && config_.spatial_smoothing_subarray_size < dims_.n_ant);
+    const std::size_t M_eff = impl_->M_eff;  // full n_ant, or sub-array size if
+                                             // O2 smoothing was enabled in the
+                                             // constructor (smoothing decision
+                                             // is baked into M_eff there).
 
 #if defined(BEAMFORMER_TRACKER_PERF)
     impl_->window_ms.reserve(window_count);
     using PerfClock = std::chrono::steady_clock;
 #define BEAMFORMER_TRACKER_PERF_START(name) \
-        auto (name##_start) = PerfClock::now()
+        auto name##_start = PerfClock::now()
 #define BEAMFORMER_TRACKER_PERF_STOP(name)                                   \
     impl_->window_ms.push_back(                                              \
         std::chrono::duration<double, std::milli>(PerfClock::now()           \
