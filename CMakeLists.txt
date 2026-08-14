@@ -26,6 +26,7 @@ endif()
 add_library(beamformer_core
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
+    src/cpu_opt_beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
     src/quantization.cpp
@@ -36,6 +37,35 @@ add_library(beamformer_core
 target_include_directories(beamformer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(beamformer_core PUBLIC BEAMFORMER_HAS_CUDA=$<BOOL:${BEAMFORMER_HAS_CUDA}>)
 target_compile_options(beamformer_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>)
+
+# Performance build of the whole CPU core: the optimized tracker TU is compiled
+# with BEAMFORMER_TRACKER_PERF defined (which populates the per-window latency
+# vector inside run_into) and -O3, *and* every other CPU TU is compiled at -O3
+# too so the headline per-frame numbers are measured at release optimisation
+# rather than a Debug default. This is a *separate* static library so it never
+# clashes with the default beamformer_core symbols; the benchmark links *only*
+# against this perf core (it contains both the naive and optimized tracker).
+add_library(beamformer_core_perf STATIC
+    src/cpu_beamformer.cpp
+    src/beam_tracker.cpp
+    src/cpu_opt_beam_tracker.cpp
+    src/geometry.cpp
+    src/io.cpp
+    src/quantization.cpp
+    src/synthetic_data.cpp
+    src/temporal_integration.cpp
+    src/weights.cpp
+)
+target_include_directories(beamformer_core_perf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(beamformer_core_perf PUBLIC
+    BEAMFORMER_HAS_CUDA=$<BOOL:${BEAMFORMER_HAS_CUDA}>
+)
+target_compile_definitions(beamformer_core_perf PRIVATE
+    BEAMFORMER_TRACKER_PERF
+)
+target_compile_options(beamformer_core_perf PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-Wall;-Wextra;-Wpedantic>
+)
 
 add_executable(generate_fake_data tools/generate_fake_data.cpp)
 target_link_libraries(generate_fake_data PRIVATE beamformer_core)
@@ -48,6 +78,17 @@ target_link_libraries(beamformer_cpu PRIVATE beamformer_core)
 
 add_executable(beam_tracker_cpu tools/beam_tracker_cpu.cpp)
 target_link_libraries(beam_tracker_cpu PRIVATE beamformer_core)
+
+# Benchmark for the optimized CPU tracker. Built against the perf-enabled core
+# so per-frame timings (BEAMFORMER_TRACKER_PERF) and -O3 optimisation are in
+# effect; links ONLY against beamformer_core_perf to avoid duplicate symbols
+# with the default beamformer_core.
+add_executable(benchmark_cpu_opt_beam_tracker
+    tools/benchmark_cpu_opt_beam_tracker.cpp)
+target_link_libraries(benchmark_cpu_opt_beam_tracker PRIVATE beamformer_core_perf)
+target_compile_options(benchmark_cpu_opt_beam_tracker PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-Wall;-Wextra;-Wpedantic>
+)
 
 if(BEAMFORMER_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -101,6 +142,17 @@ if(BUILD_TESTING)
     target_link_libraries(test_beam_tracker PRIVATE beamformer_core)
     target_compile_options(test_beam_tracker PRIVATE -UNDEBUG)
     add_test(NAME beam_tracker COMMAND test_beam_tracker)
+
+    # Extensive tests for the optimized CPU tracker (O1–O6 + back-compat).
+    add_executable(test_cpu_opt_beam_tracker
+                   tests/test_cpu_opt_beam_tracker.cpp)
+    target_link_libraries(test_cpu_opt_beam_tracker PRIVATE beamformer_core)
+    target_compile_options(test_cpu_opt_beam_tracker PRIVATE -UNDEBUG)
+    add_test(NAME cpu_opt_beam_tracker COMMAND test_cpu_opt_beam_tracker)
+    set_tests_properties(cpu_opt_beam_tracker PROPERTIES
+        LABELS "tracker;optimization;validation"
+        TIMEOUT 120
+    )
 
     add_executable(test_temporal_integration tests/test_temporal_integration.cpp)
     target_link_libraries(test_temporal_integration PRIVATE beamformer_core)

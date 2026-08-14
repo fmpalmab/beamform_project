@@ -110,6 +110,20 @@ public:
     const Dimensions& dimensions() const noexcept;
     const CpuOptTrackerConfig& config() const noexcept;
 
+    // Seed the trajectory prior (the open-loop initial guess used as the
+    // per-window direction when scanning is disabled, and as the level-0
+    // coarse-grid centre for the first window when scanning is enabled).
+    // This is the public counterpart of the stateful free-function overload's
+    // implicit seeding; callers that own a `CpuOptBeamTracker` and `run_into`
+    // directly must seed it before the first run.
+    void seed_trajectory(const TrackerTrajectoryConfig& trajectory);
+
+    // Per-window ("per-frame") kernel latencies in milliseconds, populated by
+    // the last `run_into` call. Empty unless the translation unit was compiled
+    // with `-DBEAMFORMER_TRACKER_PERF` (the benchmark does this; production
+    // builds keep the vector empty → zero overhead). Read-only view.
+    const std::vector<double>& per_frame_ms() const noexcept;
+
     // Stateful free-function overload seeds the trajectory prior here.
     friend void cpu_opt_beam_tracker_packed_intensity_into(
         const PackedVoltage& packed, const TrackerConfig& trajectory,

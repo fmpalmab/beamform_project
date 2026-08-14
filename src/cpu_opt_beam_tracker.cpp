@@ -21,6 +21,7 @@
 #include "beamformer/weights.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
@@ -176,33 +177,16 @@ bool cholesky_solve(std::vector<Cfloat>& R, std::vector<Cfloat>& b) {
     return true;
 }
 
-// Capon/MVDR power: `1 / (a^H R^{-1} a)`. `R` is squared Hermitian M×M; the
-// caller supplies the diagonal-loaded matrix. If the Cholesky solve fails
-// the function falls back to the Bartlett power (per the spec's "Add a small
-// fallback to Bartlett power if R is singular"). `a` is a copy because we
-// solve into it as the right-hand side b = a, then compute a^H R^{-1} a =
-// a^H w (w = R^{-1} a). We do *not* reuse `R` outside; a working copy is
-// taken to keep the caller's `R` intact.
-inline float capon_power(const std::vector<Cfloat>& R_loaded,
-                         std::vector<Cfloat> a) {
-    const std::size_t M = a.size();
-    std::vector<Cfloat> work = R_loaded;  // destroyed by factorization
-    if (!cholesky_solve(work, a)) {
-        // Singular: fall back to Bartlett (O1 spec fallback).
-        return bartlett_power(R_loaded, a);
-    }
-    // a now holds w = R^{-1} a; a^H R^{-1} a = a_orig^H w. We need the
-    // original `a` (steering vector) conjugated against w. Reconstruct by
-    // re-evaluating is not feasible here — instead compute the pre-step inner
-    // products: note cholesky_solve solved R w = a using `a` as both b and the
-    // output, so `a` is now *w*, and the original steering vector was the RHS
-    // b. We stored b *into* a, so we lost it. To avoid this, redo: re-solve
-    // using a separate copy of b. (Kept simple/correct over clever.)
-    return bartlett_power(R_loaded, a);  // placeholder path; replaced below
-}
-
-// Corrected Capon: as above but keeps the steering vector separate so we can
-// compute a^H R^{-1} a = a^H w.
+// Capon/MVDR power (O1): `1 / (a^H R^{-1} a)`. `R_loaded` is the diagonal-
+// loaded Hermitian M×M covariance (caller applies the `R + εI` load from the
+// spec). `a_steer` is the steering vector `a(θ)` for the candidate cell.
+//
+// Computes `w = R^{-1} a` by an in-place Cholesky solve on a *scratch copy* of
+// R (the caller's R is left intact), then the scalar `a^H w` (real for a
+// Hermitian R). If R is not numerically positive-definite the Cholesky
+// factorization fails and per the O1 spec the function falls back to the
+// Bartlett power `a^H R a` on the *original* loaded R. J. Capon, Proc. IEEE
+// 1969; diagonal-load safety following Tikhonov-loaded MVDR.
 float capon_power_correct(const std::vector<Cfloat>& R_loaded,
                            const std::vector<Cfloat>& a_steer) {
     // Add an extra diagonal load if the caller did not — Capon *requires*
@@ -441,6 +425,17 @@ struct CpuOptBeamTracker::Impl {
     std::size_t coarse_cells_per_axis = 0;
     std::size_t M_eff = 0;
 
+    // Optional per-window timing, populated only when the translation unit is
+    // compiled with -DBEAMFORMER_TRACKER_PERF (the benchmark defines this).
+    // Production builds compile with the macro undefined, so this branch is
+    // eliminated and the vectors stay empty — zero runtime overhead.
+#if defined(BEAMFORMER_TRACKER_PERF)
+    std::vector<double> window_ms;  // ms per integration window (one frame)
+    void reset_perf() { window_ms.clear(); }
+#else
+    void reset_perf() {}
+#endif
+
     void reset_R(std::size_t n_freq, std::size_t M_eff_in) {
         M_eff = M_eff_in;
         R_freq.assign(n_freq, std::vector<Cfloat>(M_eff * M_eff, Cfloat{0.0F, 0.0F}));
@@ -528,6 +523,40 @@ Vec3 CpuOptBeamTracker::window_direction(std::size_t window) const {
     return Vec3{0.0F, 0.0F, 1.0F};
 }
 
+void CpuOptBeamTracker::seed_trajectory(
+    const TrackerTrajectoryConfig& trajectory) {
+    // Validate the start direction is a finite unit vector, mirroring the
+    // naive validate_tracker_config guard so bad priors surface here rather
+    // than producing a silently-degenerate scan.
+    const auto& start = trajectory.direction_start;
+    const double norm_squared =
+        static_cast<double>(start[0]) * start[0]
+        + static_cast<double>(start[1]) * start[1]
+        + static_cast<double>(start[2]) * start[2];
+    if (!std::isfinite(norm_squared) || std::abs(norm_squared - 1.0) > 1.0e-3) {
+        throw std::invalid_argument(
+            "seed_trajectory direction_start must be a finite unit vector");
+    }
+    for (const float c : trajectory.direction_rate_per_sample) {
+        if (!std::isfinite(c)) {
+            throw std::invalid_argument(
+                "seed_trajectory direction_rate_per_sample must be finite");
+        }
+    }
+    impl_->trajectory = trajectory;
+    impl_->trajectory_set = true;
+}
+
+const std::vector<double>& CpuOptBeamTracker::per_frame_ms()
+    const noexcept {
+#if defined(BEAMFORMER_TRACKER_PERF)
+    return impl_->window_ms;
+#else
+    static const std::vector<double> empty;
+    return empty;
+#endif
+}
+
 // =====================================================================
 // run_into
 // =====================================================================
@@ -561,12 +590,27 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         tracker_window_count(dims_.n_time, config_.integration_spectra);
 
     impl_->window_dirs.assign(window_count, Vec3{0.0F, 0.0F, 1.0F});
+    impl_->reset_perf();
 
     const bool scan_enabled = config_.coarse_grid_resolution > 1;
     const float lambda = config_.forgetting_factor;
     const std::size_t M_eff = impl_->M_eff;
     const bool smoothing = (config_.spatial_smoothing_subarray_size != 0
                              && config_.spatial_smoothing_subarray_size < dims_.n_ant);
+
+#if defined(BEAMFORMER_TRACKER_PERF)
+    impl_->window_ms.reserve(window_count);
+    using PerfClock = std::chrono::steady_clock;
+#define BEAMFORMER_TRACKER_PERF_START(name) \
+        auto (name##_start) = PerfClock::now()
+#define BEAMFORMER_TRACKER_PERF_STOP(name)                                   \
+    impl_->window_ms.push_back(                                              \
+        std::chrono::duration<double, std::milli>(PerfClock::now()           \
+                                                  - (name##_start)).count())
+#else
+#define BEAMFORMER_TRACKER_PERF_START(name) (void)0
+#define BEAMFORMER_TRACKER_PERF_STOP(name) (void)0
+#endif
 
     if (!scan_enabled) {
         // ============================================================
@@ -578,6 +622,7 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // (No covariance, no search, no recursion.)
         // ============================================================
         for (std::size_t window = 0; window < window_count; ++window) {
+            BEAMFORMER_TRACKER_PERF_START(disabled);
             const Vec3 direction = tracker_window_direction(
                 prior, window, config_.integration_spectra);
             impl_->window_dirs[window] = direction;
@@ -586,6 +631,7 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                 std::min(first_time + config_.integration_spectra, dims_.n_time);
             emit_window_das(packed, dims_, positions_m_, frequencies_hz_,
                             direction, first_time, last_time, intensity);
+            BEAMFORMER_TRACKER_PERF_STOP(disabled);
         }
         return;
     }
@@ -603,11 +649,12 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
     const std::size_t L_refine = config_.refinement_levels;
 
     for (std::size_t window = 0; window < window_count; ++window) {
+        BEAMFORMER_TRACKER_PERF_START(scan);
         const std::size_t first_time = window * config_.integration_spectra;
         const std::size_t last_time =
             std::min(first_time + config_.integration_spectra, dims_.n_time);
         const std::size_t K = last_time - first_time;
-        if (K == 0) continue;
+        if (K == 0) { BEAMFORMER_TRACKER_PERF_STOP(scan); continue; }
 
         // ---- O5: recursive covariance update over this window's snapshots.
         //   Haykin, Adaptive Filter Theory, Ch.10 (RLS with forgetting).
@@ -810,7 +857,10 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // only the direction changes). Reuses generate_weights exactly.
         emit_window_das(packed, dims_, positions_m_, frequencies_hz_, centre,
                         first_time, last_time, intensity);
+        BEAMFORMER_TRACKER_PERF_STOP(scan);
     }
+#undef BEAMFORMER_TRACKER_PERF_START
+#undef BEAMFORMER_TRACKER_PERF_STOP
 }
 
 // =====================================================================
@@ -838,8 +888,7 @@ void cpu_opt_beam_tracker_packed_intensity_into(
     // below is the persistent streaming entry point).
     CpuOptBeamTracker tracker(default_positions(dims.n_ant),
                               channelized_frequencies(dims.n_freq), dims, opt);
-    tracker.impl_->trajectory = trajectory.trajectory;
-    tracker.impl_->trajectory_set = true;
+    tracker.seed_trajectory(trajectory.trajectory);
     tracker.run_into(packed, intensity);
 }
 
@@ -849,8 +898,7 @@ void cpu_opt_beam_tracker_packed_intensity_into(
 void cpu_opt_beam_tracker_packed_intensity_into(
     const PackedVoltage& packed, const TrackerConfig& trajectory,
     CpuOptBeamTracker& tracker, Intensities& intensity) {
-    tracker.impl_->trajectory = trajectory.trajectory;
-    tracker.impl_->trajectory_set = true;
+    tracker.seed_trajectory(trajectory.trajectory);
     tracker.run_into(packed, intensity);
 }
 
