@@ -223,6 +223,104 @@ void apply_diagonal_load(std::vector<Cfloat>& R, std::size_t M,
     }
 }
 
+// ------------------------------------------------------- pointer overloads
+// Phase 1: the per-window hot path calls these over the preallocated
+// `R_block_scratch` / `steer_scratch` / `L_factors` scratchpads so no
+// std::vector is constructed per candidate cell. The arithmetic is identical
+// to the vector-based references above (same indexing, same numerics).
+inline void apply_diagonal_load_into(Cfloat* __restrict R, std::size_t M,
+                                    float diagonal_load) {
+    if (diagonal_load <= 0.0F || M == 0) return;
+    float trace = 0.0F;
+    for (std::size_t i = 0; i < M; ++i) trace += R[i * M + i].real();
+    const float eps = diagonal_load * trace / static_cast<float>(M);
+    for (std::size_t i = 0; i < M; ++i) {
+        R[i * M + i] += Cfloat{eps, 0.0F};
+    }
+}
+
+inline float bartlett_power_into(const Cfloat* __restrict R,
+                                const Cfloat* __restrict a, std::size_t M) {
+    Cfloat acc{0.0F, 0.0F};
+    for (std::size_t r = 0; r < M; ++r) {
+        Cfloat row_sum{0.0F, 0.0F};
+        for (std::size_t c = 0; c < M; ++c) {
+            row_sum += R[r * M + c] * a[c];
+        }
+        acc += std::conj(a[r]) * row_sum;
+    }
+    return acc.real();
+}
+
+// In-place Cholesky solve `R w = b` operating on a *copy* of R passed in
+// `work` (M×M row-major) and writing the solution back into `b`. Returns true
+// on success, false if R is not numerically positive-definite. Identical
+// arithmetic to the vector `cholesky_solve` above.
+inline bool cholesky_solve_into(Cfloat* __restrict work, Cfloat* __restrict b,
+                                std::size_t M) {
+    for (std::size_t i = 0; i < M; ++i) {
+        for (std::size_t j = 0; j <= i; ++j) {
+            Cfloat sum = work[i * M + j];
+            for (std::size_t k = 0; k < j; ++k) {
+                sum -= work[i * M + k] * std::conj(work[j * M + k]);
+            }
+            if (i == j) {
+                if (sum.real() <= 0.0F) {
+                    return false;  // not positive-definite
+                }
+                const float d = std::sqrt(sum.real());
+                work[i * M + j] = Cfloat{d, 0.0F};
+            } else {
+                const Cfloat& diag = work[j * M + j];
+                const float inv = (diag.real() != 0.0F) ? 1.0F / diag.real() : 0.0F;
+                work[i * M + j] = Cfloat{sum.real() * inv, sum.imag() * inv};
+            }
+        }
+    }
+    for (std::size_t i = 0; i < M; ++i) {
+        Cfloat sum = b[i];
+        for (std::size_t k = 0; k < i; ++k) {
+            sum -= work[i * M + k] * b[k];
+        }
+        const float d = work[i * M + i].real();
+        b[i] = Cfloat{sum.real() / d, sum.imag() / d};
+    }
+    for (std::size_t i = M; i-- > 0;) {
+        Cfloat sum = b[i];
+        for (std::size_t k = i + 1; k < M; ++k) {
+            sum -= std::conj(work[k * M + i]) * b[k];
+        }
+        const float d = work[i * M + i].real();
+        b[i] = Cfloat{sum.real() / d, sum.imag() / d};
+    }
+    return true;
+}
+
+// Capon/MVDR power using preallocated scratch: copies the (already
+// diagonal-loaded) R into `work` (M×M), seeds `b` = a, solves R w = a, and
+// returns 1 / (a^H w). Falls back to Bartlett on the loaded R if the Cholesky
+// factorization fails (matches capon_power_correct semantics). `a` is read
+// only; `work` and `b` are caller-owned scratch (typically steer_scratch as b
+// and L_factors as work).
+inline float capon_power_into(const Cfloat* __restrict R_loaded,
+                              const Cfloat* __restrict a, std::size_t M,
+                              Cfloat* __restrict work, Cfloat* __restrict b) {
+    std::copy(R_loaded, R_loaded + M * M, work);
+    for (std::size_t i = 0; i < M; ++i) b[i] = a[i];
+    if (!cholesky_solve_into(work, b, M)) {
+        return bartlett_power_into(R_loaded, a, M);  // fallback (O1 spec)
+    }
+    Cfloat acc{0.0F, 0.0F};
+    for (std::size_t i = 0; i < M; ++i) {
+        acc += std::conj(a[i]) * b[i];
+    }
+    const float denom = acc.real();
+    if (!std::isfinite(denom) || denom <= 1.0e-12F) {
+        return bartlett_power_into(R_loaded, a, M);
+    }
+    return 1.0F / denom;
+}
+
 // ----------------------------------------------------------- spatial smooth
 // Spatial smoothing + forward-backward averaging (O2).
 //   Shan/Wax/Kailath 1985 (spatial smoothing),
@@ -299,6 +397,87 @@ inline std::vector<Cfloat> decode_snapshot(const PackedVoltage& packed,
                           static_cast<float>(sample.imag)};
     }
     return x;
+}
+
+// ----------------------------------------------------- decode a snapshot (into)
+// Phase 1: zero-allocation counterpart that decodes one (time, freq) snapshot
+// into a caller-provided destination rather than returning a heap-allocated
+// vector. Used by the `run_into` hot path against the preallocated
+// `snapshot_buffer` slice so the per-window covariance build does no heap
+// allocation. Indexing matches `decode_snapshot` exactly (uses `voltage_index`).
+inline void decode_snapshot_into(const PackedVoltage& packed,
+                                 const Dimensions& dims,
+                                 std::size_t time, std::size_t freq,
+                                 Cfloat* __restrict out) {
+    for (std::size_t a_idx = 0; a_idx < dims.n_ant; ++a_idx) {
+        const auto sample = unpack_complex_int4(
+            packed[voltage_index(time, freq, a_idx, dims)]);
+        out[a_idx] = Cfloat{static_cast<float>(sample.real),
+                            static_cast<float>(sample.imag)};
+    }
+}
+
+// Compute the spatially-smoothed + forward-backward-averaged covariance of the
+// K length-M snapshots that are laid out contiguously in `snap_flat` (each
+// snapshot strided by `snap_stride` floats) directly into `R_out` (an
+// M_eff x M_eff row-major buffer). When smoothing is disabled (P_sub == 0 or
+// P_sub >= M) `M_eff == M` and the plain 1/K sample covariance is written.
+//
+// This is the allocation-free reimplementation of
+// `spatial_smoothed_covariance` above: it reuses the caller-provided
+// `R_out` / `per_sub_scratch` buffers instead of allocating a vector of
+// vectors per call, so the per-window hot path performs zero heap allocations.
+// The numeric result is identical (same averaging order, same 1/K and 1/L
+// scaling, same forward-backward J R̃* J fold).
+inline void spatial_smoothed_covariance_into(
+    const Cfloat* __restrict snap_flat, std::size_t K, std::size_t M,
+    std::size_t snap_stride, std::size_t P_sub, std::size_t M_eff,
+    Cfloat* __restrict R_out,
+    std::vector<Cfloat>& per_sub_scratch) {
+    const bool smoothing = (P_sub != 0 && P_sub < M && P_sub >= 1);
+    const std::size_t L = smoothing ? (M - P_sub + 1) : 1;
+    const float inv_K = 1.0F / static_cast<float>(K);
+    const float inv_L = 1.0F / static_cast<float>(L);
+
+    // Zero the per-subarray accumulation scratch once (capacity is L * M_eff^2).
+    per_sub_scratch.assign(L * M_eff * M_eff, Cfloat{0.0F, 0.0F});
+
+    for (std::size_t sub = 0; sub < L; ++sub) {
+        Cfloat* __restrict sub_R =
+            per_sub_scratch.data() + sub * M_eff * M_eff;
+        for (std::size_t k = 0; k < K; ++k) {
+            const Cfloat* __restrict x =
+                snap_flat + k * snap_stride + sub;
+            for (std::size_t r = 0; r < M_eff; ++r) {
+                const Cfloat xr = x[r];
+                for (std::size_t c = 0; c < M_eff; ++c) {
+                    sub_R[r * M_eff + c] += xr * std::conj(x[c]) * inv_K;
+                }
+            }
+        }
+    }
+    // Average the L forward sub-arrays into R_out (the forward R̃).
+    for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
+        Cfloat acc{0.0F, 0.0F};
+        for (std::size_t sub = 0; sub < L; ++sub) {
+            acc += per_sub_scratch[sub * M_eff * M_eff + i] * inv_L;
+        }
+        R_out[i] = acc;
+    }
+    if (!smoothing) {
+        return;  // R_out already holds the full-array sample covariance.
+    }
+    // Forward-backward: R̂ = 1/2 (R̃ + J R̃* J). J reverses indices. Fold in
+    // place into R_out (R̃ -> R̂).
+    for (std::size_t r = 0; r < M_eff; ++r) {
+        for (std::size_t c = 0; c < M_eff; ++c) {
+            const std::size_t pr = M_eff - 1 - r;
+            const std::size_t pc = M_eff - 1 - c;
+            const Cfloat conj_e = std::conj(R_out[pr * M_eff + pc]);
+            const Cfloat fwd = R_out[r * M_eff + c];
+            R_out[r * M_eff + c] = 0.5F * (fwd + conj_e);
+        }
+    }
 }
 
 // ------------------------------------------------- copy-paste of naive DAS
@@ -425,6 +604,30 @@ struct CpuOptBeamTracker::Impl {
     std::size_t coarse_cells_per_axis = 0;
     std::size_t M_eff = 0;
 
+    // --- Phase 1 preallocated scratchpad buffers (zero-allocation hot path) ---
+    // Sized once in the constructor from the configured dimensions; the
+    // `run_into` hot path reuses these slices instead of allocating per
+    // window. All sizes are worst-case capacities (independent of window K,
+    // which is bounded by integration_spectra).
+    std::vector<Cfloat> snapshot_buffer;  // size: K_max * M_eff (one contiguous
+                                           //        block of K decoded snapshots)
+    std::vector<Cfloat> R_block_scratch;  // size: M_eff * M_eff (block / smoothed
+                                           //        covariance out-buffer)
+    std::vector<Cfloat> L_factors;        // size: n_freq * M_eff * M_eff (Capon
+                                           //        Cholesky scratch per frequency)
+    std::vector<Cfloat> steer_scratch;    // size: M_eff (steering vector for a cell)
+    // Capon RHS/solution scratch (M_eff): the Cholesky solve writes R^{-1} a
+    // here. Kept separate from `steer_scratch` (which holds the read-only `a`)
+    // so the a^H w step reads the original steering vector after the solve.
+    std::vector<Cfloat> capon_b_scratch;  // size: M_eff
+    std::vector<float>  power_grid;       // size: G * G (coarse integrated power)
+    // Per-subarray covariance accumulation scratch for spatial smoothing:
+    // capacity L_max * M_eff^2 where L_max = n_ant - M_eff + 1 (max sub-array
+    // count; 1 when smoothing disabled since M_eff == n_ant).
+    std::vector<Cfloat> per_sub_scratch;
+    std::size_t K_max = 0;                // integration_spectra capacity bound
+    std::size_t G_max = 0;               // coarse grid cells-per-axis capacity
+
     // Optional per-window timing, populated only when the translation unit is
     // compiled with -DBEAMFORMER_TRACKER_PERF (the benchmark defines this).
     // Production builds compile with the macro undefined, so this branch is
@@ -536,6 +739,35 @@ CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
             ? config_.spatial_smoothing_subarray_size
             : dims_.n_ant;
     impl_->reset_R(dims_.n_freq, M_eff);
+
+    // --- Phase 1: preallocate the zero-allocation hot-path scratchpads. ---
+    // K_max bounds the number of snapshots integrated per window (the final
+    // window may be shorter, but never longer than integration_spectra). The
+    // snapshot buffer holds K_max decoded length-M_eff vectors back-to-back so
+    // the covariance accumulation can iterate contiguous memory. The remaining
+    // buffers are sized from M_eff / the coarse grid; they are reused (not
+    // grown) on every window. The capacities below are conservative upper
+    // bounds and never change after construction.
+    const std::size_t K_max = config_.integration_spectra;
+    const std::size_t G_cap =
+        std::max<std::size_t>(config_.coarse_grid_resolution, 1);
+    impl_->K_max = K_max;
+    impl_->G_max = G_cap;
+    impl_->snapshot_buffer.assign(K_max * dims_.n_ant,
+                                  Cfloat{0.0F, 0.0F});
+    impl_->R_block_scratch.assign(M_eff * M_eff, Cfloat{0.0F, 0.0F});
+    impl_->L_factors.assign(dims_.n_freq * M_eff * M_eff,
+                            Cfloat{0.0F, 0.0F});
+    impl_->steer_scratch.assign(M_eff, Cfloat{0.0F, 0.0F});
+    impl_->capon_b_scratch.assign(M_eff, Cfloat{0.0F, 0.0F});
+    impl_->power_grid.assign(G_cap * G_cap, 0.0F);
+    // Per-subarray accumulation scratch: cap L_max * M_eff^2. When smoothing
+    // is disabled M_eff == n_ant => L_max == 1; otherwise L_max = n_ant - M_eff + 1.
+    {
+        const std::size_t L_max = dims_.n_ant - M_eff + 1;
+        impl_->per_sub_scratch.assign(L_max * M_eff * M_eff,
+                                      Cfloat{0.0F, 0.0F});
+    }
 
     // Precompute the coarse steering table (O6) if a scan is requested.
     // Van Veen & Buckley 1988 (beam-space preprocessing); Van Trees 2002 §6.8.
@@ -985,24 +1217,37 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // (matches the spec's block-form recursion; with lambda == 1.0 this
         //  reduces to the plain block estimate R_w = R_w_block.)
         for (std::size_t f = 0; f < dims_.n_freq; ++f) {
-            // Decode the K snapshots for this frequency.
-            std::vector<std::vector<Cfloat>> snaps;
-            snaps.reserve(K);
+            // Decode the K snapshots for this frequency straight into the
+            // preallocated contiguous `snapshot_buffer` slice (one length-
+            // n_ant snapshot per time step, back-to-back). No heap allocation
+            // occurs on this hot path — the slice was sized once in the ctor.
+            const std::size_t snap_stride = dims_.n_ant;
+            Cfloat* __restrict snap_flat = impl_->snapshot_buffer.data();
             for (std::size_t t = first_time; t < last_time; ++t) {
-                snaps.push_back(decode_snapshot(packed, dims_, t, f));
+                decode_snapshot_into(packed, dims_, t, f,
+                                     snap_flat + (t - first_time) * snap_stride);
             }
-            // O2: spatial smoothing + forward-backward.
-            //   Shan/Wax/Kailath 1985; Weiss & Friedlander 1997.
-            auto cov = spatial_smoothed_covariance(
-                snaps, dims_.n_ant, config_.spatial_smoothing_subarray_size);
-            // cov.first is M_eff×M_eff; second unused when smoothing off.
-            std::vector<Cfloat> R_block = std::move(cov.first);
+            // O2: spatial smoothing + forward-backward, written directly into
+            // the preallocated M_eff×M_eff `R_block_scratch` (no vector-of-
+            // vectors allocation). Shan/Wax/Kailath 1985; Weiss & Friedlander 1997.
+            spatial_smoothed_covariance_into(
+                snap_flat, K, dims_.n_ant, snap_stride,
+                config_.spatial_smoothing_subarray_size, M_eff,
+                impl_->R_block_scratch.data(), impl_->per_sub_scratch);
+            const Cfloat* __restrict R_block = impl_->R_block_scratch.data();
+            // Capon diagonal load in place (O1 numerical safety).
             if (config_.estimator == TrackerEstimator::Capon) {
-                apply_diagonal_load(R_block, M_eff, config_.diagonal_load);
+                apply_diagonal_load_into(impl_->R_block_scratch.data(),
+                                         M_eff, config_.diagonal_load);
             }
-            // Fold with previous R (O5).
+            // Fold with previous R (O5). Reuse `impl_->R_freq[f]` in place;
+            // when lambda == 1 or first window, R_block is copied in wholesale
+            // (still via the preallocated pool — R_freq[f] was sized in reset_R).
             if (!impl_->R_initialised || lambda >= 1.0F) {
-                impl_->R_freq[f] = R_block;
+                std::vector<Cfloat>& R = impl_->R_freq[f];
+                for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
+                    R[i] = R_block[i];
+                }
             } else {
                 std::vector<Cfloat>& R = impl_->R_freq[f];
                 for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
@@ -1011,7 +1256,16 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
             }
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         dbg_w_R[f] = impl_->R_freq[f];
-        dbg_w_snaps[f] = snaps;
+        // Debug capture still copies the contiguous slice into a vector-of-
+        // vectors shape so the dump writer keeps its existing layout. This
+        // allocates, but only when BEAMFORMER_TRACKER_DEBUG is defined
+        // (diagnostic builds; never the production hot path).
+        dbg_w_snaps[f].assign(K);
+        for (std::size_t k = 0; k < K; ++k) {
+            dbg_w_snaps[f][k].assign(
+                snap_flat + k * snap_stride,
+                snap_flat + k * snap_stride + snap_stride);
+        }
 #endif
         }
         impl_->R_initialised = true;
@@ -1024,32 +1278,45 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // Per-frequency coarse power summed across frequency for the
         // per-window direction decision (spec O1: "integrated across
         // frequency for the final per-window direction decision").
-        std::vector<float> P_coarse(G * G, 0.0F);
+        // Reuse the preallocated `power_grid` slice (G*G); zero it once here.
+        float* __restrict P_coarse = impl_->power_grid.data();
+        for (std::size_t i = 0; i < G * G; ++i) P_coarse[i] = 0.0F;
+        // Reusable steering scratchpad (M_eff, read-only `a`) plus a separate
+        // Capon RHS/solution slot, and a per-frequency M_eff×M_eff Cholesky
+        // work buffer — none allocated per cell.
+        Cfloat* __restrict steer_buf = impl_->steer_scratch.data();
+        Cfloat* __restrict capon_b = impl_->capon_b_scratch.data();
+        const bool capon = (config_.estimator == TrackerEstimator::Capon);
 #if defined(BEAMFORMER_TRACKER_DEBUG)
+        std::vector<float> P_coarse_dbg(G * G, 0.0F);
         impl_->dbg_coarse_centres.push_back(coarse);
-        impl_->dbg_coarse_power.push_back(P_coarse);  // will fill below
+        impl_->dbg_coarse_power.push_back(P_coarse_dbg);  // will fill below
         std::vector<float>& dbg_P_coarse = impl_->dbg_coarse_power.back();
         impl_->dbg_refine_cands.emplace_back();
         impl_->dbg_refine_power.emplace_back();
 #endif
         for (std::size_t f = 0; f < dims_.n_freq; ++f) {
-            const std::vector<Cfloat>& R_f = impl_->R_freq[f];
+            const Cfloat* __restrict R_f = impl_->R_freq[f].data();
             const double wave_number =
                 two_pi * static_cast<double>(frequencies_hz_[f])
                 / speed_of_light_m_per_s;
+            // Per-frequency Capon Cholesky scratch slice (M_eff×M_eff), reused
+            // for every cell of this frequency's coarse scan.
+            Cfloat* __restrict work = impl_->L_factors.data()
+                + f * M_eff * M_eff;
             for (std::size_t cell = 0; cell < G * G; ++cell) {
                 // M_eff steering vector for this (frequency, cell). When
                 // smoothing reduces M_eff, the sub-array steering uses the
                 // first M_eff antenna positions with their phases relative to
                 // the cell direction — a consistent truncation.
-                std::vector<Cfloat> a_vec(M_eff);
                 for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
-                    a_vec[a_idx] = steer_one(positions_m_, wave_number,
-                                             coarse[cell], a_idx);
+                    steer_buf[a_idx] = steer_one(positions_m_, wave_number,
+                                                 coarse[cell], a_idx);
                 }
-                float p = (config_.estimator == TrackerEstimator::Capon)
-                              ? capon_power_correct(R_f, a_vec)
-                              : bartlett_power(R_f, a_vec);
+                float p = capon
+                              ? capon_power_into(R_f, steer_buf, M_eff,
+                                                 work, capon_b)
+                              : bartlett_power_into(R_f, steer_buf, M_eff);
                 if (!std::isfinite(p)) p = 0.0F;
                 P_coarse[cell] += p;
             }
@@ -1057,7 +1324,7 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         // Copy the fully-accumulated coarse power into the debug slot captured
         // above (the slot was pushed as a zero vector; copy the final values).
-        impl_->dbg_coarse_power.back() = P_coarse;
+        for (std::size_t i = 0; i < G * G; ++i) dbg_P_coarse[i] = P_coarse[i];
 #endif
         // Argmax of the integrated coarse spectrum.
         std::size_t best_cell = 0;
@@ -1079,13 +1346,14 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         for (std::size_t level = 1; level <= L_refine; ++level) {
             cell_half_l *= 0.5F;
             cell_half_m *= 0.5F;
-            // 3×3 neighbourhood candidates around `centre`.
-            std::vector<Vec3> cand;
-            std::vector<float> Pcand;
-            cand.reserve(9);
-            Pcand.assign(9, 0.0F);
+            // 3×3 neighbourhood candidates around `centre`. Fixed-size stack
+            // storage (9 cells) — no per-level heap allocation.
+            Vec3 cand[9];
+            float Pcand[9] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
             for (std::int64_t dv = -1; dv <= 1; ++dv) {
                 for (std::int64_t du = -1; du <= 1; ++du) {
+                    const std::size_t idx =
+                        static_cast<std::size_t>((dv + 1) * 3 + (du + 1));
                     float l = centre[0] + static_cast<float>(du) * cell_half_l;
                     float m = centre[1] + static_cast<float>(dv) * cell_half_m;
                     const float r2 = l * l + m * m;
@@ -1094,37 +1362,42 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                         l *= s;
                         m *= s;
                     }
-                    cand.push_back(direction_from_lm(l, m));
+                    cand[idx] = direction_from_lm(l, m);
                 }
             }
 #if defined(BEAMFORMER_TRACKER_DEBUG)
-            impl_->dbg_refine_cands[window].push_back(cand);
-            impl_->dbg_refine_power[window].push_back(Pcand);  // pre-fill; refreshed after
+            // Debug capture copies the stack arrays into the per-window debug
+            // vectors (allocates, but only in diagnostic builds).
+            impl_->dbg_refine_cands[window].emplace_back(cand, cand + 9);
+            impl_->dbg_refine_power[window].emplace_back(Pcand, Pcand + 9);
 #endif
             for (std::size_t f = 0; f < dims_.n_freq; ++f) {
-                const std::vector<Cfloat>& R_f = impl_->R_freq[f];
+                const Cfloat* __restrict R_f = impl_->R_freq[f].data();
                 const double wave_number =
                     two_pi * static_cast<double>(frequencies_hz_[f])
                     / speed_of_light_m_per_s;
-                for (std::size_t i = 0; i < cand.size(); ++i) {
-                    std::vector<Cfloat> a_vec(M_eff);
+                Cfloat* __restrict work = impl_->L_factors.data()
+                    + f * M_eff * M_eff;
+                for (std::size_t i = 0; i < 9; ++i) {
                     for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
-                        a_vec[a_idx] =
+                        steer_buf[a_idx] =
                             steer_one(positions_m_, wave_number, cand[i], a_idx);
                     }
-                    float p = (config_.estimator == TrackerEstimator::Capon)
-                                  ? capon_power_correct(R_f, a_vec)
-                                  : bartlett_power(R_f, a_vec);
+                    float p = capon
+                                  ? capon_power_into(R_f, steer_buf, M_eff,
+                                                     work, capon_b)
+                                  : bartlett_power_into(R_f, steer_buf, M_eff);
                     if (!std::isfinite(p)) p = 0.0F;
                     Pcand[i] += p;
                 }
             }
             std::size_t best = 0;
-            for (std::size_t i = 1; i < Pcand.size(); ++i) {
+            for (std::size_t i = 1; i < 9; ++i) {
                 if (Pcand[i] > Pcand[best]) best = i;
             }
 #if defined(BEAMFORMER_TRACKER_DEBUG)
-            impl_->dbg_refine_power[window].back() = Pcand;
+            for (std::size_t i = 0; i < 9; ++i)
+                impl_->dbg_refine_power[window].back()[i] = Pcand[i];
 #endif
             centre = cand[best];
             // O4: quadratic 3-point interpolation around the level argmax.

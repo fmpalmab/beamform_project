@@ -494,6 +494,7 @@ int main(int argc, char** argv) {
 
         // ----- CSV outputs -----
         if (opt.metrics) {
+            std::filesystem::create_directories(opt.metrics->parent_path());
             append_metrics(*opt.metrics, opt, dims, naive_ms_best, opt_ms_best,
                            ls, doa_err_prior_mean, doa_err_est_mean,
                            target_pass);
