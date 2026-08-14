@@ -17,9 +17,14 @@
 #include "beamformer/weights.hpp"
 #include "beamformer/indexing.hpp"
 #include "beamformer/int4.hpp"
+#include "beamformer/physics.hpp"
 
 namespace beamformer {
 namespace {
+
+// Add these two lines to explicitly define the missing constants:
+constexpr double two_pi = 6.28318530717958647692;
+constexpr double speed_of_light_m_per_s = 299792458.0;
 
 // -------------------------------------------------------------- complex math
 // The project carries its own POD `ComplexFloat` (two adjacent floats, see
