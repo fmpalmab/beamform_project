@@ -135,6 +135,21 @@ public:
     // builds keep the vector empty → zero overhead). Read-only view.
     const std::vector<double>& per_frame_ms() const noexcept;
 
+    // Debug search dump (only when compiled with -DBEAMFORMER_TRACKER_DEBUG).
+    // Writes a self-describing directory under `dir` capturing everything needed
+    // to diagnose a failing DOA-recovery assertion: array geometry, frequency
+    // plan, the search config, the seeded prior / per-window estimates, and the
+    // coarse-to-fine power spectra captured during the last `run_into`. The
+    // dump-machine-readable files are written only when the capture buffers were
+    // populated (i.e. a scan run_into was executed with the macro defined).
+    //
+    // `extra` is a short human label folded into the directory name and a
+    // README so multiple dumps from one test run are distinguishable.
+    //
+    // No-op (returns an empty optional) when BEAMFORMER_TRACKER_DEBUG is
+    // undefined, so production builds pay nothing.
+    void debug_search_dump(const char* dir, const char* extra = "") const;
+
     // Stateful free-function overload seeds the trajectory prior here.
     friend void cpu_opt_beam_tracker_packed_intensity_into(
         const PackedVoltage& packed, const TrackerConfig& trajectory,

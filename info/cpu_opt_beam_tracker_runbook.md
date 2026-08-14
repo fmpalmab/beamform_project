@@ -82,6 +82,79 @@ blocks run on synthetic point sources (deterministic, no fixtures on disk).
     `n_time*n_freq*1`, all intensities ≥ 0, aligned energy > misaligned energy
     (the carried-over `aligned_total > misaligned_total` invariant).
 
+### 3.1. Dumping search state to debug a failing DOA-recovery assertion
+
+If a `err_est < err_prior` assert fires (the tracker's estimated window
+direction is *not* closer to the true source than the open-loop prior —
+the symptom of a broken Bartlett/Capon peak, a steering/sign error, a
+smoothing bug, or a quadratic-interpolation inversion), you can ask the
+tracker to capture the entire coarse-to-fine search and write it to disk.
+
+1. Configure with the capture enabled (adds
+   `-DBEAMFORMER_TRACKER_DEBUG` to the default `beamformer_core` TU and
+   the test target; the perf-only `beamformer_core_perf` used by the
+   benchmark is left untouched, so its per-frame timings stay clean):
+
+   ```bash
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+         -DBEAMFORMER_ENABLE_CUDA=OFF \
+         -DBEAMFORMER_TRACKER_DEBUG=ON
+   cmake --build build -j
+   ```
+
+2. (Re)run the test. Each DOA-recovery block (Bartlett / Capon / smoothing)
+   calls [`CpuOptBeamTracker::debug_search_dump`](../src/cpu_opt_beam_tracker.cpp)
+   *before* its assertion, so you get the dump even if the assert then
+   aborts:
+
+   ```bash
+   ./build/test_cpu_opt_beam_tracker
+   # stdout: [block5 bartlett] true=(...) est=(...) err_prior=... err_est=... est<=NO
+   #         [tracker] debug dump written to ./tracker_dumps (block5_bartlett)
+   # then aborts at the assert, leaving the on-disk dump behind.
+   ```
+
+   Point the dumps elsewhere with the env var:
+
+   ```bash
+   BEAMFORMER_TRACKER_DUMP_DIR=build/debug_dumps ./build/test_cpu_opt_beam_tracker
+   ```
+
+3. Inspect the dump. Each run writes a timestamped subdirectory
+   `<dir>/<label>_<n>/` containing:
+
+   - `README.txt` / `config.txt` — config knobs, `M_eff`, seeded prior, file
+     layout reference.
+   - `positions.csv`, `frequencies.csv` — array geometry / channel plan.
+   - `estimates.csv` — per-window prior centre vs final estimate (l,m,n).
+   - `coarse_<w>.csv` — per-window coarse grid cell directions + integrated
+     Bartlett/Capon power (row-major `G×G`), so the argmax cell and the
+     peak shape relative to the true source are immediately visible.
+   - `refine_<w>_<lvl>.csv` — per-window per refinement level 3×3 candidate
+     dirs + integrated power (the level argmax + O4 input).
+   - `R_<w>_<f>.bin` — per-window per-frequency `M_eff×M_eff` Hermitian
+     covariance (post O2 smoothing + O5 fold + Capon diagonal load), raw
+     `std::complex<float>` row-major.
+   - `snaps_<w>_<f>.bin` — per-window per-frequency `K` decoded length-`n_ant`
+     snapshots (pre-smoothing), so the source phase / amplitude can be
+     re-derived independently.
+   - `shapes_<w>.txt` — `M_eff`, freq count, snapshot counts so the binary
+     files are interpretable.
+   - `DUMP_COMPLETE` — sentinel present when the dump finished.
+
+   Typical diagnosis flow: load `coarse_0.csv` in a spreadsheet/Python and
+   confirm the power peak lands near the true `(l,m)`; if it doesn't, the
+   bug is in the covariance (`R_*.bin`) or the steering convention —
+   reconstruct the expected peak from `snaps_*.bin` + `positions.csv` and
+   compare. If the coarse peak is correct but `estimates.csv` is wrong,
+   the bug is in refinement (`refine_*.csv`) or the O4 quadratic
+   interpolation denominator.
+
+> When `BEAMFORMER_TRACKER_DEBUG` is **off** (the default), the capture
+> members and the dump method are compiled out — `debug_search_dump` is a
+> no-op stub and the test prints a one-line "built WITHOUT debug capture"
+> reminder, so production / benchmark builds carry zero overhead.
+
 ---
 
 ## 4. Run the benchmark (the < 0.5 ms/frame objective)

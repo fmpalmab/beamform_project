@@ -38,6 +38,21 @@ target_include_directories(beamformer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/in
 target_compile_definitions(beamformer_core PUBLIC BEAMFORMER_HAS_CUDA=$<BOOL:${BEAMFORMER_HAS_CUDA}>)
 target_compile_options(beamformer_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>)
 
+# Optional: instrument the optimized tracker TU inside beamformer_core with
+# -DBEAMFORMER_TRACKER_DEBUG so run_into captures the full coarse-to-fine
+# search state (covariance, snapshots, per-window spectra) that
+# CpuOptBeamTracker::debug_search_dump() can write to disk. Default OFF to
+# keep the capture overhead out of normal builds; enable explicitly when
+# debugging a failing DOA-recovery assertion:
+#     cmake -DBEAMFORMER_TRACKER_DEBUG=ON ...
+# This only affects beamformer_core (and the tests that link it); the
+# perf-enabled benchmark core (beamformer_core_perf) is left untouched.
+option(BEAMFORMER_TRACKER_DEBUG
+       "Capture optimized-tracker search state in run_into for debug dumps" OFF)
+if(BEAMFORMER_TRACKER_DEBUG)
+    target_compile_definitions(beamformer_core PRIVATE BEAMFORMER_TRACKER_DEBUG)
+endif()
+
 # Performance build of the whole CPU core: the optimized tracker TU is compiled
 # with BEAMFORMER_TRACKER_PERF defined (which populates the per-window latency
 # vector inside run_into) and -O3, *and* every other CPU TU is compiled at -O3
@@ -148,6 +163,14 @@ if(BUILD_TESTING)
                    tests/test_cpu_opt_beam_tracker.cpp)
     target_link_libraries(test_cpu_opt_beam_tracker PRIVATE beamformer_core)
     target_compile_options(test_cpu_opt_beam_tracker PRIVATE -UNDEBUG)
+    # When the debug-dump core is requested, the test harness emits a
+    # search dump (app/debug/tracker_dumps by default, or
+    # $BEAMFORMER_TRACKER_DUMP_DIR if set) right before the DOA-recovery
+    # assertions so a failure leaves on-disk state for offline diagnosis.
+    if(BEAMFORMER_TRACKER_DEBUG)
+        target_compile_definitions(test_cpu_opt_beam_tracker PRIVATE
+            BEAMFORMER_TRACKER_DEBUG)
+    endif()
     add_test(NAME cpu_opt_beam_tracker COMMAND test_cpu_opt_beam_tracker)
     set_tests_properties(cpu_opt_beam_tracker PROPERTIES
         LABELS "tracker;optimization;validation"

@@ -45,8 +45,11 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -73,6 +76,41 @@ float lm_distance(const beamformer::Vec3& a, const beamformer::Vec3& b) {
     const float dl = a[0] - b[0];
     const float dm = a[1] - b[1];
     return std::sqrt(dl * dl + dm * dm);
+}
+
+// Write a debug search dump for `tracker` so a failing DOA-recovery
+// assertion leaves on-disk state (covariance, snapshots, coarse + refinement
+// spectra, estimates) for offline diagnosis. The dump is emitted only when
+// the tracker TU was compiled with -DBEAMFORMER_TRACKER_DEBUG (the CMake
+// option BEAMFORMER_TRACKER_DEBUG=ON arranges this); otherwise the call is
+// a zero-cost stub inside the library. The destination is:
+//   ${BEAMFORMER_TRACKER_DUMP_DIR}  if that env var is set, else
+//   ./tracker_dumps
+// `label` is folded into the per-run subdirectory name so multiple failures
+// (e.g. block 5 vs block 6) don't clobber one another.
+void dump_search(const beamformer::CpuOptBeamTracker& tracker,
+                 const char* label) {
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+    const char* env_dir = std::getenv("BEAMFORMER_TRACKER_DUMP_DIR");
+    const std::string dir = (env_dir && *env_dir) ? std::string(env_dir)
+                                                  : std::string("./tracker_dumps");
+    try {
+        tracker.debug_search_dump(dir.c_str(), label);
+        std::printf("[tracker] debug dump written to %s (%s)\n",
+                    dir.c_str(), label);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[tracker] WARNING: debug dump failed for %s: %s\n",
+                     label, e.what());
+    }
+#else
+    (void)tracker;
+    (void)label;
+    std::printf("[tracker] debug dump requested for %s but the tracker was "
+                "built WITHOUT -DBEAMFORMER_TRACKER_DEBUG (reconfigure with "
+                "-DBEAMFORMER_TRACKER_DEBUG=ON to enable capture).\n",
+                label);
+#endif
 }
 
 // Helper: build a standard default-geometry / default-frequency tracker input
@@ -300,6 +338,12 @@ int main() {
         const float err_prior = lm_distance(true_dir,
                                             prior.trajectory.direction_start);
         const float err_est = lm_distance(true_dir, est);
+        std::printf("[block5 bartlett] true=(%.6f,%.6f,%.6f) est=(%.6f,%.6f,%.6f)"
+                    " err_prior=%.6f err_est=%.6f est<=%sprior\n",
+                    true_dir[0], true_dir[1], true_dir[2],
+                    est[0], est[1], est[2], err_prior, err_est,
+                    (err_est < err_prior ? "yes" : "NO"));
+        dump_search(tracker, "block5_bartlett");
         assert(err_est < err_prior);
         const float coarse_pitch = (2.0F * scan.search_fov_l)
                                    / static_cast<float>(scan.coarse_grid_resolution);
@@ -334,6 +378,12 @@ int main() {
         const float err_est = lm_distance(true_dir, est);
         const float err_prior = lm_distance(true_dir,
                                             prior.trajectory.direction_start);
+        std::printf("[block6 capon] true=(%.6f,%.6f,%.6f) est=(%.6f,%.6f,%.6f)"
+                    " err_prior=%.6f err_est=%.6f est<=%sprior\n",
+                    true_dir[0], true_dir[1], true_dir[2],
+                    est[0], est[1], est[2], err_prior, err_est,
+                    (err_est < err_prior ? "yes" : "NO"));
+        dump_search(tracker, "block6_capon");
         assert(err_est < err_prior);
         const float coarse_pitch = (2.0F * scan.search_fov_l)
                                    / static_cast<float>(scan.coarse_grid_resolution);
@@ -368,6 +418,12 @@ int main() {
         const float err_est = lm_distance(true_dir, est);
         const float err_prior = lm_distance(true_dir,
                                             prior.trajectory.direction_start);
+        std::printf("[block7 smoothing] true=(%.6f,%.6f,%.6f) est=(%.6f,%.6f,%.6f)"
+                    " err_prior=%.6f err_est=%.6f est<=%sprior\n",
+                    true_dir[0], true_dir[1], true_dir[2],
+                    est[0], est[1], est[2], err_prior, err_est,
+                    (err_est < err_prior ? "yes" : "NO"));
+        dump_search(tracker, "block7_smoothing");
         assert(err_est < err_prior);
     }
 
