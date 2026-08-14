@@ -97,6 +97,17 @@ public:
                       Dimensions dims,
                       CpuOptTrackerConfig config);
 
+    // Destructor and move ops declared out-of-line because the pimpl `Impl` is
+    // an incomplete type in this header (defined only in the .cpp). They are
+    // defaulted in the .cpp where `Impl` is complete; every TU that includes
+    // this header then references the out-of-line special members and never
+    // needs the full `Impl` definition. Copy is disabled (pimpl-owned state).
+    ~CpuOptBeamTracker();
+    CpuOptBeamTracker(CpuOptBeamTracker&&) noexcept;
+    CpuOptBeamTracker& operator=(CpuOptBeamTracker&&) noexcept;
+    CpuOptBeamTracker(const CpuOptBeamTracker&) = delete;
+    CpuOptBeamTracker& operator=(const CpuOptBeamTracker&) = delete;
+
     // Run the optimized pipeline over a packed-int4 shard and write the standard
     // [time][freq][beam=1] float32 intensity cube. Byte-compatible output with
     // the naive beam_tracker_cpu_packed_intensity_into.

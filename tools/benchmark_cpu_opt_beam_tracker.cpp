@@ -261,13 +261,6 @@ LatencyStats summarise(std::vector<double> samples) {
     return s;
 }
 
-double percentile_sorted(const std::vector<double>& sorted, double q) {
-    if (sorted.empty()) return 0.0;
-    const std::size_t idx = static_cast<std::size_t>(
-        std::ceil(q * static_cast<double>(sorted.size())) - 1.0);
-    return sorted[std::min(idx, sorted.size() - 1)];
-}
-
 float lm_distance(const beamformer::Vec3& a, const beamformer::Vec3& b) {
     const float dl = a[0] - b[0];
     const float dm = a[1] - b[1];

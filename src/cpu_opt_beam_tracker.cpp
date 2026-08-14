@@ -446,6 +446,14 @@ struct CpuOptBeamTracker::Impl {
 };
 
 // =====================================================================
+// Special members — defined here (not in the header) so `Impl` is complete.
+// =====================================================================
+CpuOptBeamTracker::~CpuOptBeamTracker() = default;
+CpuOptBeamTracker::CpuOptBeamTracker(CpuOptBeamTracker&&) noexcept = default;
+CpuOptBeamTracker& CpuOptBeamTracker::operator=(CpuOptBeamTracker&&)
+    noexcept = default;
+
+// =====================================================================
 // Construction
 // =====================================================================
 CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
