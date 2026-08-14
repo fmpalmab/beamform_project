@@ -15,7 +15,8 @@
 #include "beamformer/cpu_opt_beam_tracker.hpp"
 #include "beamformer/complex.hpp"
 #include "beamformer/weights.hpp"
-#include "beamformer/constants.hpp" 
+#include "beamformer/indexing.hpp"
+#include "beamformer/int4.hpp"
 
 namespace beamformer {
 namespace {
