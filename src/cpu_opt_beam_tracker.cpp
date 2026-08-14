@@ -321,6 +321,72 @@ inline float capon_power_into(const Cfloat* __restrict R_loaded,
     return 1.0F / denom;
 }
 
+// ------------------------------------------------------- Phase 2: FOSM
+// Factor-Once / Solve-Many Cholesky decoupling. The pre-Phase-2 Capon hot
+// path re-ran the full O(M^3) factorization for every candidate cell (coarse
+// grid + every refinement stage) by way of `capon_power_into`. FOSM instead
+// factorizes the (diagonal-loaded) per-frequency covariance R = L L^H exactly
+// ONCE per frequency per window, then for each candidate cell evaluates the
+// MVDR power as the squared norm of a single O(M^2) forward substitution:
+//   a^H R^{-1} a = || L^{-1} a ||_2^2 = || v ||_2^2,   L v = a,  P = 1/||v||^2.
+// This is mathematically identical to the per-cell Cholesky solve (it is the
+// same factorization used internally by `cholesky_solve_into` — only the back
+// substitution, which produced `w = R^{-1} a` only to take `a^H w`, is elided
+// since `a^H R^{-1} a = ||L^{-1} a||^2` for a Hermitian PD R). The storage
+// convention matches the existing solve: `R` is the full M×M row-major
+// Hermitian covariance, only the lower triangle is read during factorization
+// and only the lower triangle is valid (L) afterwards — the quadratic-form
+// power path reads the lower triangle exclusively.
+
+// In-place Cholesky factorization R = L L^H of a Hermitian M×M covariance
+// stored row-major (only the lower triangle is referenced; the strict upper
+// triangle is left stale and must not be read by callers afterward). On
+// success `R` holds the lower-triangular factor L (real positive diagonal).
+// Returns false if `R` is not numerically positive-definite (the caller
+// falls back to the per-cell solve for that frequency so degenerate windows
+// retain the prior Phase-1 numerics). The tiny `1e-12` positive definiteness
+// sill matches the existing `capon_power_into` denominator guard.
+bool cholesky_factorize(Cfloat* __restrict R, std::size_t M) {
+    for (std::size_t i = 0; i < M; ++i) {
+        for (std::size_t j = 0; j <= i; ++j) {
+            Cfloat sum = R[i * M + j];
+            for (std::size_t k = 0; k < j; ++k) {
+                sum -= R[i * M + k] * std::conj(R[j * M + k]);
+            }
+            if (i == j) {
+                if (sum.real() <= 1.0e-12F) return false;
+                R[i * M + j] = Cfloat{std::sqrt(sum.real()), 0.0F};
+            } else {
+                const float inv = 1.0F / R[j * M + j].real();
+                R[i * M + j] = Cfloat{sum.real() * inv, sum.imag() * inv};
+            }
+        }
+    }
+    return true;
+}
+
+// MVDR / Capon power from a precomputed Cholesky factor L (lower triangular,
+// the output of `cholesky_factorize`). Solves L v = a by forward substitution
+// into the caller-owned `v_scratch` (length M) and returns 1 / ||v||^2. The
+// factor is read-only; `a` is read-only. `v_scratch` is mutated in place and
+// must be distinct from `a`. Falls back to 0 on a degenerate (near-zero)
+// denominator, mirroring the `> 1e-12` guard in `capon_power_into`.
+float capon_power_from_factor(const Cfloat* __restrict L, const Cfloat* __restrict a,
+                              std::size_t M, Cfloat* __restrict v_scratch) {
+    float norm_sq = 0.0F;
+    for (std::size_t i = 0; i < M; ++i) {
+        Cfloat sum = a[i];
+        for (std::size_t k = 0; k < i; ++k) {
+            sum -= L[i * M + k] * v_scratch[k];
+        }
+        const float d_inv = 1.0F / L[i * M + i].real();
+        const Cfloat vi{sum.real() * d_inv, sum.imag() * d_inv};
+        v_scratch[i] = vi;
+        norm_sq += vi.real() * vi.real() + vi.imag() * vi.imag();
+    }
+    return (norm_sq > 1.0e-12F) ? (1.0F / norm_sq) : 0.0F;
+}
+
 // ----------------------------------------------------------- spatial smooth
 // Spatial smoothing + forward-backward averaging (O2).
 //   Shan/Wax/Kailath 1985 (spatial smoothing),
@@ -621,6 +687,13 @@ struct CpuOptBeamTracker::Impl {
     // so the a^H w step reads the original steering vector after the solve.
     std::vector<Cfloat> capon_b_scratch;  // size: M_eff
     std::vector<float>  power_grid;       // size: G * G (coarse integrated power)
+    // Phase 2: per-frequency positive-definite flag for the FOSM Cholesky
+    // factorization. Set once per window (after the O5 fold + diagonal load)
+    // and read by both the coarse scan and every refinement stage to decide
+    // whether to use the amortized `capon_power_from_factor` path or fall
+    // back to the per-cell `capon_power_into` solve for a degenerate freq.
+    // Sized once in the constructor (off the hot path) — no per-window alloc.
+    std::vector<char> capon_factor_ok;    // size: n_freq
     // Per-subarray covariance accumulation scratch for spatial smoothing:
     // capacity L_max * M_eff^2 where L_max = n_ant - M_eff + 1 (max sub-array
     // count; 1 when smoothing disabled since M_eff == n_ant).
@@ -761,6 +834,7 @@ CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
     impl_->steer_scratch.assign(M_eff, Cfloat{0.0F, 0.0F});
     impl_->capon_b_scratch.assign(M_eff, Cfloat{0.0F, 0.0F});
     impl_->power_grid.assign(G_cap * G_cap, 0.0F);
+    impl_->capon_factor_ok.assign(dims_.n_freq, 0);
     // Per-subarray accumulation scratch: cap L_max * M_eff^2. When smoothing
     // is disabled M_eff == n_ant => L_max == 1; otherwise L_max = n_ant - M_eff + 1.
     {
@@ -1270,6 +1344,29 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         }
         impl_->R_initialised = true;
 
+        // ---- Phase 2 (FOSM): factorize each per-frequency Capon covariance
+        // exactly ONCE for this window. The lower-triangular factor L is
+        // stored in the preallocated `L_factors[f]` slot (M_eff×M_eff) and is
+        // reused by every coarse grid cell and every refinement candidate of
+        // this window — replacing the prior per-cell O(M^3) `capon_power_into`
+        // re-factorization with a single O(M^3) factorize + O(M^2) forward
+        // substitutions per cell. When a frequency's R is not numerically PD
+        // (insufficient rank / bad diagonal load) we mark it and the scan
+        // falls back to the per-cell `capon_power_into` solve for that
+        // frequency only, preserving the Phase-1 degenerate-window numerics.
+        // Bartlett never factorizes (it has no inverse to amortize).
+        const bool capon = (config_.estimator == TrackerEstimator::Capon);
+        if (capon) {
+            for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+                const std::vector<Cfloat>& R = impl_->R_freq[f];
+                Cfloat* __restrict Lf = impl_->L_factors.data()
+                    + f * M_eff * M_eff;
+                std::copy(R.data(), R.data() + M_eff * M_eff, Lf);
+                impl_->capon_factor_ok[f] =
+                    cholesky_factorize(Lf, M_eff) ? 1 : 0;
+            }
+        }
+
         // ---- O3 + O6: hierarchical coarse-to-fine search.
         //   Skolnik, Radar Handbook §7.11 (two-stage search);
         //   Haykin & Reilly 1991 (hierarchical ML lattice search).
@@ -1286,7 +1383,6 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // work buffer — none allocated per cell.
         Cfloat* __restrict steer_buf = impl_->steer_scratch.data();
         Cfloat* __restrict capon_b = impl_->capon_b_scratch.data();
-        const bool capon = (config_.estimator == TrackerEstimator::Capon);
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         std::vector<float> P_coarse_dbg(G * G, 0.0F);
         impl_->dbg_coarse_centres.push_back(coarse);
@@ -1300,10 +1396,14 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
             const double wave_number =
                 two_pi * static_cast<double>(frequencies_hz_[f])
                 / speed_of_light_m_per_s;
-            // Per-frequency Capon Cholesky scratch slice (M_eff×M_eff), reused
-            // for every cell of this frequency's coarse scan.
-            Cfloat* __restrict work = impl_->L_factors.data()
+            // Per-frequency Capon Cholesky factor slot (M_eff×M_eff): holds the
+            // lower-triangular L factored ONCE per window by the Phase-2 pass
+            // above. Reused for every coarse cell — no re-factorization here.
+            const Cfloat* __restrict Lf = impl_->L_factors.data()
                 + f * M_eff * M_eff;
+            Cfloat* __restrict work = impl_->L_factors.data()
+                + f * M_eff * M_eff;  // mutable fallback scratch (per-cell solve)
+            const bool factor_ok = impl_->capon_factor_ok[f] != 0;
             for (std::size_t cell = 0; cell < G * G; ++cell) {
                 // M_eff steering vector for this (frequency, cell). When
                 // smoothing reduces M_eff, the sub-array steering uses the
@@ -1313,10 +1413,18 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                     steer_buf[a_idx] = steer_one(positions_m_, wave_number,
                                                  coarse[cell], a_idx);
                 }
-                float p = capon
-                              ? capon_power_into(R_f, steer_buf, M_eff,
-                                                 work, capon_b)
-                              : bartlett_power_into(R_f, steer_buf, M_eff);
+                float p;
+                if (!capon) {
+                    p = bartlett_power_into(R_f, steer_buf, M_eff);
+                } else if (factor_ok) {
+                    // FOSM: O(M^2) forward substitution against the single
+                    // pre-factored L. `capon_b` serves as the v_scratch here.
+                    p = capon_power_from_factor(Lf, steer_buf, M_eff, capon_b);
+                } else {
+                    // Degenerate frequency: fall back to the per-cell solve
+                    // (re-factorizes into `work`), preserving Phase-1 numerics.
+                    p = capon_power_into(R_f, steer_buf, M_eff, work, capon_b);
+                }
                 if (!std::isfinite(p)) p = 0.0F;
                 P_coarse[cell] += p;
             }
@@ -1376,17 +1484,33 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                 const double wave_number =
                     two_pi * static_cast<double>(frequencies_hz_[f])
                     / speed_of_light_m_per_s;
+                // Phase 2: reuse the per-frequency Cholesky factor L factored
+                // ONCE per window above (no re-factorization per refinement
+                // candidate). `work` is the mutable fallback scratch slot for
+                // a degenerate frequency's per-cell solve.
+                const Cfloat* __restrict Lf = impl_->L_factors.data()
+                    + f * M_eff * M_eff;
                 Cfloat* __restrict work = impl_->L_factors.data()
                     + f * M_eff * M_eff;
+                const bool factor_ok = impl_->capon_factor_ok[f] != 0;
                 for (std::size_t i = 0; i < 9; ++i) {
                     for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
                         steer_buf[a_idx] =
                             steer_one(positions_m_, wave_number, cand[i], a_idx);
                     }
-                    float p = capon
-                                  ? capon_power_into(R_f, steer_buf, M_eff,
-                                                     work, capon_b)
-                                  : bartlett_power_into(R_f, steer_buf, M_eff);
+                    float p;
+                    if (!capon) {
+                        p = bartlett_power_into(R_f, steer_buf, M_eff);
+                    } else if (factor_ok) {
+                        // FOSM: O(M^2) forward substitution against the single
+                        // pre-factored L. `capon_b` serves as the v_scratch.
+                        p = capon_power_from_factor(Lf, steer_buf, M_eff,
+                                                    capon_b);
+                    } else {
+                        // Degenerate frequency: per-cell solve fallback.
+                        p = capon_power_into(R_f, steer_buf, M_eff, work,
+                                             capon_b);
+                    }
                     if (!std::isfinite(p)) p = 0.0F;
                     Pcand[i] += p;
                 }
