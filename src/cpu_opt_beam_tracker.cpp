@@ -1,9 +1,21 @@
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+// --- Project Includes ---
+#include "beamformer/cpu_opt_beam_tracker.hpp"
+#include "beamformer/complex.hpp"
+#include "beamformer/weights.hpp"
+#include "beamformer/constants.hpp" 
 
 namespace beamformer {
 namespace {
@@ -601,11 +613,6 @@ const std::vector<double>& CpuOptBeamTracker::per_frame_ms()
 // in debug builds (CMake passes -DBEAMFORMER_TRACKER_DEBUG to the test
 // target); a no-op stub below keeps the symbol resolvable in production.
 // ---------------------------------------------------------------------
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <sstream>
-
 namespace {
 
 void ensure_dir(const std::filesystem::path& p) {
