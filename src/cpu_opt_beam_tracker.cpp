@@ -186,7 +186,7 @@ bool cholesky_solve(std::vector<Cfloat>& R, std::vector<Cfloat>& b) {
 // factorization fails and per the O1 spec the function falls back to the
 // Bartlett power `a^H R a` on the *original* loaded R. J. Capon, Proc. IEEE
 // 1969; diagonal-load safety following Tikhonov-loaded MVDR.
-float capon_power_correct(const std::vector<Cfloat>& R_loaded,
+[[maybe_unused]] float capon_power_correct(const std::vector<Cfloat>& R_loaded,
                            const std::vector<Cfloat>& a_steer) {
     // Add an extra diagonal load if the caller did not — Capon *requires*
     // invertibility. The spec mandates R + λI with λ = diagonal_load *
@@ -212,7 +212,7 @@ float capon_power_correct(const std::vector<Cfloat>& R_loaded,
 
 // Apply diagonal loading `R <- R + ε I` with `ε = diagonal_load * trace(R)/M`
 // (O1 numerical safety for Capon; a no-op when diagonal_load == 0).
-void apply_diagonal_load(std::vector<Cfloat>& R, std::size_t M,
+[[maybe_unused]] void apply_diagonal_load(std::vector<Cfloat>& R, std::size_t M,
                          float diagonal_load) {
     if (diagonal_load <= 0.0F || M == 0) return;
     float trace = 0.0F;
@@ -329,7 +329,7 @@ inline float capon_power_into(const Cfloat* __restrict R_loaded,
 // Output is P×P, row-major. `snapshots` are the K length-M snapshots (each a
 // length-M complex vector). When smoothing is disabled (P == 0 or P >= M),
 // returns the plain full-array covariance scaled by 1/K.
-std::pair<std::vector<Cfloat>, std::vector<Cfloat>>
+[[maybe_unused]] std::pair<std::vector<Cfloat>, std::vector<Cfloat>>
 spatial_smoothed_covariance(
     const std::vector<std::vector<Cfloat>>& snapshots, std::size_t M,
     std::size_t P_sub) {
