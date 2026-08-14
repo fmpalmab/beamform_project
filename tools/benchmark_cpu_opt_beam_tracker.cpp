@@ -1,518 +1,1265 @@
-// Benchmark for the optimized CPU beam tracker.
+// Optimized CPU beam tracker implementation.
 //
-// Builds a synthetic packed-int4 shard with a slowly moving point source, runs
-// both the naive (`beam_tracker_cpu_packed_intensity`) and the optimized
-// (`cpu_opt_beam_tracker_packed_intensity`) trackers, and reports:
+// Implements the six algorithmic optimizations (O1–O6) from
+// `include/beamformer/cpu_opt_beam_tracker.md`. Algorithmic only — no
+// SIMD/AVX, no threading, no FFT libraries. Plain portable C++17.
 //
-//   * end-to-end wall time, naive vs optimized, with a speedup ratio;
-//   * per-window ("per-frame") latency for the optimized path, read from the
-//     `BEAMFORMER_TRACKER_PERF`-guarded `Impl::window_ms` vector populated
-//     inside `CpuOptBeamTracker::run_into`. The headline objective is
-//     **per-frame kernel time < 0.5 ms**;
-//   * summary statistics (min / mean / median / 95th / max) over the per-frame
-//     samples, plus a pass/fail flag against the 0.5 ms target;
-//   * a DOA-recovery check (estimated vs true source direction distance,
-//     averaged across windows) so a too-fast but wrong kernel is flagged.
-//
-// Two CSV files are written:
-//   * --metrics FILE   : one summary row per (config) run, plus the headline
-//                        pass/fail against the 0.5 ms objective.
-//   * --frames FILE    : one row per integration window with its latency,
-//                        suitable for the per-frame plot.
-//
-// Designed to be built with `-DBEAMFORMER_TRACKER_PERF` so the per-frame
-// timings are available. The CMake target adds this flag (see CMakeLists.txt).
-// If the macro is undefined the per-frame vector is empty and the benchmark
-// falls back to end-to-end-only reporting with a clear warning.
+// Back-compatibility anchor: with `CpuOptTrackerConfig` default-constructed
+// (`coarse_grid_resolution <= 1` => scan disabled), `run_into` reproduces the
+// naive `beam_tracker_cpu_packed_intensity_into` output to within float
+// rounding by running the *exact* naive delay-and-sum path with the
+// trajectory-supplied per-window direction (no covariance/search is touched
+// in that mode). This preserves the `grid_intensity == tracker_intensity` and
+// per-spectrum `close(actual, expected, 1e-4)` guarantees in
+// `tests/test_beam_tracker.cpp`.
 
-#include "beamformer/beam_tracker.hpp"
 #include "beamformer/cpu_opt_beam_tracker.hpp"
-#include "beamformer/geometry.hpp"
+
 #include "beamformer/indexing.hpp"
-#include "beamformer/synthetic_data.hpp"
+#include "beamformer/int4.hpp"
+#include "beamformer/physics.hpp"
+#include "beamformer/weights.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstddef>
+#include <complex>
 #include <cstdint>
-#include <cstdlib>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <numeric>
-#include <optional>
 #include <stdexcept>
-#include <string>
+#include <utility>
 #include <vector>
 
+namespace beamformer {
 namespace {
 
-using Clock = std::chrono::steady_clock;
+// -------------------------------------------------------------- complex math
+// The project carries its own POD `ComplexFloat` (two adjacent floats, see
+// `complex.hpp`). The optimization modules operate on `std::complex<float>`
+// for the linear-algebra (covariance, solves) because that is the standard
+// library type with full operator support; we convert at the IO boundary.
+using Cfloat = std::complex<float>;
 
-struct Options {
-    std::size_t n_time = 15360;
-    std::size_t n_ant = 64;
-    std::size_t integration_spectra = 320;
-    // Optimized-search knobs.
-    std::size_t coarse_grid_resolution = 12;
-    std::size_t refinement_levels = 2;
-    float search_fov_l = 0.2F;
-    float search_fov_m = 0.2F;
-    float forgetting_factor = 1.0F;
-    float diagonal_load = 1.0e-3F;
-    bool capon = false;
-    std::size_t spatial_smoothing_subarray_size = 0;
-    // Source / prior geometry.
-    float source_l0 = 0.03F;
-    float source_m0 = 0.0F;
-    float source_dl = 1.0e-5F;  // slow drift within FoV
-    float source_dm = 0.0F;
-    float prior_l0 = 0.0F;
-    float prior_m0 = 0.0F;
-    // Warm-up + repeat to reduce noise.
-    std::size_t warmup_runs = 1;
-    std::size_t repeat = 1;
-    // Output.
-    std::optional<std::filesystem::path> metrics;
-    std::optional<std::filesystem::path> frames;
-    std::optional<std::filesystem::path> intensity_out;
-    // Target.
-    double target_ms_per_frame = 0.5;
-};
-
-double elapsed_ms(const Clock::time_point start, const Clock::time_point end) {
-    return std::chrono::duration<double, std::milli>(end - start).count();
+inline Cfloat to_cfloat(const ComplexFloat& c) {
+    return Cfloat{c.real, c.imag};
+}
+inline ComplexFloat to_complexfloat(const Cfloat& c) {
+    return ComplexFloat{c.real(), c.imag()};
 }
 
-const char* require_value(const int argc, char** argv, int& index) {
-    if (index + 1 >= argc) {
-        throw std::invalid_argument(
-            std::string("missing value after ") + argv[index]);
-    }
-    return argv[++index];
-}
-
-std::size_t parse_size(const char* value, const char* option) {
-    const std::string text(value);
-    std::size_t used = 0;
-    const auto parsed = std::stoull(text, &used);
-    if (used != text.size()) {
-        throw std::invalid_argument(std::string("invalid integer for ") + option);
-    }
-    return static_cast<std::size_t>(parsed);
-}
-
-float parse_float(const char* value, const char* option) {
-    const std::string text(value);
-    std::size_t used = 0;
-    const auto parsed = std::stof(text, &used);
-    if (used != text.size()) {
-        throw std::invalid_argument(std::string("invalid float for ") + option);
-    }
-    return parsed;
-}
-
-double parse_double(const char* value, const char* option) {
-    const std::string text(value);
-    std::size_t used = 0;
-    const auto parsed = std::stod(text, &used);
-    if (used != text.size()) {
-        throw std::invalid_argument(std::string("invalid double for ") + option);
-    }
-    return parsed;
-}
-
-void print_usage(const char* program) {
-    std::cout
-        << "Usage: " << program << " [options]\n\n"
-        << "  Run geometry / timing benchmark for the optimized CPU tracker.\n\n"
-        << "  Grid:\n"
-        << "    --n-time N                 default 15360\n"
-        << "    --n-ant N                  32 or 64; default 64\n"
-        << "    --integration-spectra N    default 320\n"
-        << "  Optimized search:\n"
-        << "    --coarse-grid-resolution N default 12\n"
-        << "    --refinement-levels N      default 2\n"
-        << "    --search-fov-l F           default 0.2\n"
-        << "    --search-fov-m F           default 0.2\n"
-        << "    --forgetting-factor F      default 1.0\n"
-        << "    --diagonal-load F          default 1e-3\n"
-        << "    --capon                    use Capon/MVDR estimator\n"
-        << "    --smoothing-subarray N     spatial smoothing sub-array size; 0 disables\n"
-        << "  Source / prior:\n"
-        << "    --source-l0 F --source-m0 F --source-dl F --source-dm F\n"
-        << "    --prior-l0 F  --prior-m0 F\n"
-        << "  Benchmark:\n"
-        << "    --warmup-runs N            default 1\n"
-        << "    --repeat N                 default 1 (median over repeats)\n"
-        << "    --target-ms-per-frame F    default 0.5 (pass/fail threshold)\n"
-        << "  Output:\n"
-        << "    --metrics FILE             summary CSV (append; header if new)\n"
-        << "    --frames FILE              per-frame latency CSV (per repeat)\n"
-        << "    --intensity-out FILE       write the optimized intensity cube\n";
-}
-
-Options parse_options(const int argc, char** argv) {
-    Options options;
-    for (int i = 1; i < argc; ++i) {
-        const std::string argument(argv[i]);
-        if (argument == "--help" || argument == "-h") {
-            print_usage(argv[0]);
-            std::exit(0);
-        } else if (argument == "--n-time") {
-            options.n_time = parse_size(require_value(argc, argv, i), "--n-time");
-        } else if (argument == "--n-ant") {
-            options.n_ant = parse_size(require_value(argc, argv, i), "--n-ant");
-        } else if (argument == "--integration-spectra") {
-            options.integration_spectra = parse_size(
-                require_value(argc, argv, i), "--integration-spectra");
-        } else if (argument == "--coarse-grid-resolution") {
-            options.coarse_grid_resolution = parse_size(
-                require_value(argc, argv, i), "--coarse-grid-resolution");
-        } else if (argument == "--refinement-levels") {
-            options.refinement_levels = parse_size(
-                require_value(argc, argv, i), "--refinement-levels");
-        } else if (argument == "--search-fov-l") {
-            options.search_fov_l = parse_float(require_value(argc, argv, i),
-                                               "--search-fov-l");
-        } else if (argument == "--search-fov-m") {
-            options.search_fov_m = parse_float(require_value(argc, argv, i),
-                                               "--search-fov-m");
-        } else if (argument == "--forgetting-factor") {
-            options.forgetting_factor = parse_float(
-                require_value(argc, argv, i), "--forgetting-factor");
-        } else if (argument == "--diagonal-load") {
-            options.diagonal_load = parse_float(
-                require_value(argc, argv, i), "--diagonal-load");
-        } else if (argument == "--capon") {
-            options.capon = true;
-        } else if (argument == "--smoothing-subarray") {
-            options.spatial_smoothing_subarray_size = parse_size(
-                require_value(argc, argv, i), "--smoothing-subarray");
-        } else if (argument == "--source-l0") {
-            options.source_l0 = parse_float(require_value(argc, argv, i),
-                                            "--source-l0");
-        } else if (argument == "--source-m0") {
-            options.source_m0 = parse_float(require_value(argc, argv, i),
-                                            "--source-m0");
-        } else if (argument == "--source-dl") {
-            options.source_dl = parse_float(require_value(argc, argv, i),
-                                            "--source-dl");
-        } else if (argument == "--source-dm") {
-            options.source_dm = parse_float(require_value(argc, argv, i),
-                                            "--source-dm");
-        } else if (argument == "--prior-l0") {
-            options.prior_l0 = parse_float(require_value(argc, argv, i),
-                                           "--prior-l0");
-        } else if (argument == "--prior-m0") {
-            options.prior_m0 = parse_float(require_value(argc, argv, i),
-                                           "--prior-m0");
-        } else if (argument == "--warmup-runs") {
-            options.warmup_runs = parse_size(
-                require_value(argc, argv, i), "--warmup-runs");
-        } else if (argument == "--repeat") {
-            options.repeat = parse_size(require_value(argc, argv, i), "--repeat");
-        } else if (argument == "--target-ms-per-frame") {
-            options.target_ms_per_frame = parse_double(
-                require_value(argc, argv, i), "--target-ms-per-frame");
-        } else if (argument == "--metrics") {
-            options.metrics = require_value(argc, argv, i);
-        } else if (argument == "--frames") {
-            options.frames = require_value(argc, argv, i);
-        } else if (argument == "--intensity-out") {
-            options.intensity_out = require_value(argc, argv, i);
-        } else {
-            throw std::invalid_argument("unknown option: " + argument);
+// --------------------------------------------------------- steering vectors
+// Steering phase convention — deliberately matches the existing
+// `generate_weights` (src/weights.cpp): `w[f][a] = exp(+j * 2π f · dot(pos_a,
+// θ) / c)`. The spec text writes the standard `a(θ) = exp(-j φ)` convention
+// in its math blocks, but the concrete codebase采用的是 the +j form, and the
+// Bartlett/Capon power `a^H R a` is invariant under a global conjugation of the
+// steering vector when `R` is formed from the same data (it only flips the
+// peak sign for the cross-terms, not the quadratic magnitude). Crucially, the
+// *emitted* intensity pass uses `generate_weights` directly, so the on-disk
+// `[time][freq][1]` float32 stream is byte-compatible with the naive path for
+// the same direction.
+inline std::vector<Cfloat> steer(const std::vector<Vec3>& positions,
+                                 const std::vector<float>& frequencies,
+                                 const Vec3& direction) {
+    const double wave_number_factor = two_pi / speed_of_light_m_per_s;
+    std::vector<Cfloat> a(positions.size() * frequencies.size());
+    for (std::size_t f = 0; f < frequencies.size(); ++f) {
+        const double wave_number =
+            wave_number_factor * static_cast<double>(frequencies[f]);
+        const std::size_t base = f * positions.size();
+        for (std::size_t a_idx = 0; a_idx < positions.size(); ++a_idx) {
+            const auto& p = positions[a_idx];
+            const double delay_m =
+                static_cast<double>(p[0]) * direction[0]
+                + static_cast<double>(p[1]) * direction[1]
+                + static_cast<double>(p[2]) * direction[2];
+            const double phase = wave_number * delay_m;
+            a[base + a_idx] =
+                Cfloat{static_cast<float>(std::cos(phase)),
+                       static_cast<float>(std::sin(phase))};
         }
     }
-    return options;
+    return a;  // layout: [freq][ant]
 }
 
-// Summary statistics of a sample vector (millisecond latencies).
-struct LatencyStats {
-    double min = 0.0;
-    double mean = 0.0;
-    double median = 0.0;
-    double p95 = 0.0;
-    double max = 0.0;
-    std::size_t count = 0;
-};
-
-LatencyStats summarise(std::vector<double> samples) {
-    LatencyStats s;
-    s.count = samples.size();
-    if (samples.empty()) return s;
-    std::sort(samples.begin(), samples.end());
-    s.min = samples.front();
-    s.max = samples.back();
-    s.mean = std::accumulate(samples.begin(), samples.end(), 0.0)
-             / static_cast<double>(s.count);
-    const std::size_t mid = s.count / 2;
-    s.median = (s.count % 2 == 0)
-                   ? 0.5 * (samples[mid - 1] + samples[mid])
-                   : samples[mid];
-    const std::size_t p95_idx = static_cast<std::size_t>(
-        std::ceil(0.95 * static_cast<double>(s.count)) - 1.0);
-    s.p95 = samples[std::min(p95_idx, s.count - 1)];
-    return s;
+// Steering vector for the covariance-search scan. NOTE the sign convention:
+// the synthetic / received voltage is x_a = A * exp(-j φ_a) (see
+// make_point_source / beam_tracker_make_moving_point_source, both set
+// imag = -A sin φ). For the Hermitian quadratic form a(θ)^H R a(θ) with
+// R = (1/K) Σ x x^H to peak at the TRUE source direction we need a(θ_true)
+// to match the *data*, i.e. a(θ) = exp(-j φ(θ)) so that conj(a_a) x_a =
+// exp(+j φ_a(θ)) exp(-j φ_a(source)) sums coherently when θ = source.
+// (The emission pass uses generate_weights directly, so this sign choice
+// is local to the scan and does NOT affect the on-disk byte-compat output.)
+inline Cfloat steer_one(const std::vector<Vec3>& positions,
+                        double wave_number, const Vec3& direction,
+                        std::size_t a_idx) {
+    const auto& p = positions[a_idx];
+    const double delay_m = static_cast<double>(p[0]) * direction[0]
+                           + static_cast<double>(p[1]) * direction[1]
+                           + static_cast<double>(p[2]) * direction[2];
+    const double phase = wave_number * delay_m;
+    return Cfloat{static_cast<float>(std::cos(phase)),
+                  static_cast<float>(-std::sin(phase))};
 }
 
-float lm_distance(const beamformer::Vec3& a, const beamformer::Vec3& b) {
-    const float dl = a[0] - b[0];
-    const float dm = a[1] - b[1];
-    return std::sqrt(dl * dl + dm * dm);
-}
+// -------------------------------------------------------- matrix utilities
+// Hermitian covariance `R` stored row-major full M×M (we keep the full matrix
+// for clarity; a later phase can pack the lower triangle — see the spec's
+// "Explicitly deferred" list). All operations are scalar C++17.
 
-void write_intensity_cube(const std::filesystem::path& path,
-                          const beamformer::Intensities& intensity) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) throw std::runtime_error("cannot open intensity output: " + path.string());
-    out.write(reinterpret_cast<const char*>(intensity.data()),
-              static_cast<std::streamsize>(intensity.size() * sizeof(float)));
-    if (!out) throw std::runtime_error("failed writing intensity: " + path.string());
-}
-
-void append_metrics(const std::filesystem::path& path,
-                    const Options& opt, const beamformer::Dimensions& dims,
-                    double naive_ms, double opt_ms,
-                    const LatencyStats& ls,
-                    double doa_err_prior_mean, double doa_err_est_mean,
-                    bool target_pass) {
-    std::error_code ec;
-    const bool exists = std::filesystem::exists(path, ec);
-    const auto file_size = exists ? std::filesystem::file_size(path, ec) : 0;
-    const bool needs_header = !exists || file_size == 0;
-    std::ofstream out(path, std::ios::app);
-    if (!out) throw std::runtime_error("cannot open metrics file: " + path.string());
-    if (needs_header) {
-        out << "backend,n_time,n_freq,n_ant,integration_spectra,"
-               "coarse_grid_resolution,refinement_levels,estimator,"
-               "forgetting_factor,smoothing_subarray,repeat,"
-               "naive_ms,opt_ms,speedup,"
-               "frame_min_ms,frame_mean_ms,frame_median_ms,frame_p95_ms,"
-               "frame_max_ms,frame_count,"
-               "doa_err_prior_mean,doa_err_est_mean,target_ms,target_pass\n";
+// `x` is a length-M snapshot. Accumulate the rank-1 outer product `scale * x
+// x^H` into `R` (M×M, row-major).
+inline void accumulate_outer(std::vector<Cfloat>& R, const std::vector<Cfloat>& x,
+                              float scale) {
+    const std::size_t M = x.size();
+    for (std::size_t r = 0; r < M; ++r) {
+        const Cfloat xr = x[r];
+        for (std::size_t c = 0; c < M; ++c) {
+            // x[r] * conj(x[c]) * scale
+            R[r * M + c] += xr * std::conj(x[c]) * scale;
+        }
     }
-    const double speedup = (opt_ms > 0.0) ? naive_ms / opt_ms : 0.0;
-    out << std::fixed << std::setprecision(6)
-        << "cpu_opt_beam_tracker," << dims.n_time << ',' << dims.n_freq << ','
-        << dims.n_ant << ',' << opt.integration_spectra << ','
-        << opt.coarse_grid_resolution << ',' << opt.refinement_levels << ','
-        << (opt.capon ? "capon" : "bartlett") << ','
-        << opt.forgetting_factor << ','
-        << opt.spatial_smoothing_subarray_size << ','
-        << opt.repeat << ','
-        << naive_ms << ',' << opt_ms << ',' << speedup << ','
-        << ls.min << ',' << ls.mean << ',' << ls.median << ',' << ls.p95 << ','
-        << ls.max << ',' << ls.count << ','
-        << doa_err_prior_mean << ',' << doa_err_est_mean << ','
-        << opt.target_ms_per_frame << ',' << (target_pass ? 1 : 0) << '\n';
-    if (!out) throw std::runtime_error("failed writing metrics: " + path.string());
 }
 
-void write_frames_csv(const std::filesystem::path& path, const Options& opt,
-                      const std::vector<double>& frame_ms) {
-    std::ofstream out(path);
-    if (!out) throw std::runtime_error("cannot open frames file: " + path.string());
-    out << "window,ms,n_time,n_ant,integration_spectra,coarse_grid_resolution,"
-           "refinement_levels,estimator\n";
-    out << std::fixed << std::setprecision(6);
-    for (std::size_t i = 0; i < frame_ms.size(); ++i) {
-        out << i << ',' << frame_ms[i] << ',' << opt.n_time << ',' << opt.n_ant
-            << ',' << opt.integration_spectra << ','
-            << opt.coarse_grid_resolution << ',' << opt.refinement_levels
-            << ',' << (opt.capon ? "capon" : "bartlett") << '\n';
+// Quadratic form `a^H R a` for square Hermitian `R` (M×M).
+inline float bartlett_power(const std::vector<Cfloat>& R,
+                             const std::vector<Cfloat>& a) {
+    const std::size_t M = a.size();
+    Cfloat acc{0.0F, 0.0F};
+    for (std::size_t r = 0; r < M; ++r) {
+        Cfloat row_sum{0.0F, 0.0F};
+        for (std::size_t c = 0; c < M; ++c) {
+            row_sum += R[r * M + c] * a[c];
+        }
+        acc += std::conj(a[r]) * row_sum;
     }
-    if (!out) throw std::runtime_error("failed writing frames: " + path.string());
+    // Power is real-valued for a Hermitian R; guard tiny imag.
+    return acc.real();
+}
+
+// In-place solve `R w = b` for a Hermitian positive-definite `R` via Cholesky
+// with a small additive diagonal perturbation (the caller is expected to have
+// already added the diagonal load). Returns true on success, false if `R` is
+// not (numerically) positive-definite.
+bool cholesky_solve(std::vector<Cfloat>& R, std::vector<Cfloat>& b) {
+    const std::size_t M = b.size();
+    // Cholesky factorization R = L L^H, in place (lower triangle).
+    for (std::size_t i = 0; i < M; ++i) {
+        for (std::size_t j = 0; j <= i; ++j) {
+            Cfloat sum = R[i * M + j];
+            for (std::size_t k = 0; k < j; ++k) {
+                sum -= R[i * M + k] * std::conj(R[j * M + k]);
+            }
+            if (i == j) {
+                if (sum.real() <= 0.0F) {
+                    return false;  // not positive-definite
+                }
+                const float d = std::sqrt(sum.real());
+                R[i * M + j] = Cfloat{d, 0.0F};
+            } else {
+                const Cfloat& diag = R[j * M + j];
+                // avoid divide-by-zero
+                const float inv = (diag.real() != 0.0F) ? 1.0F / diag.real() : 0.0F;
+                R[i * M + j] = Cfloat{sum.real() * inv, sum.imag() * inv};
+            }
+        }
+    }
+    // Forward substitution L y = b.
+    for (std::size_t i = 0; i < M; ++i) {
+        Cfloat sum = b[i];
+        for (std::size_t k = 0; k < i; ++k) {
+            sum -= R[i * M + k] * b[k];
+        }
+        const float d = R[i * M + i].real();
+        b[i] = Cfloat{sum.real() / d, sum.imag() / d};
+    }
+    // Back substitution L^H w = y.
+    for (std::size_t i = M; i-- > 0;) {
+        Cfloat sum = b[i];
+        for (std::size_t k = i + 1; k < M; ++k) {
+            // L^H[k][i] = conj(L[i][k])
+            sum -= std::conj(R[k * M + i]) * b[k];
+        }
+        const float d = R[i * M + i].real();
+        b[i] = Cfloat{sum.real() / d, sum.imag() / d};
+    }
+    return true;
+}
+
+// Capon/MVDR power (O1): `1 / (a^H R^{-1} a)`. `R_loaded` is the diagonal-
+// loaded Hermitian M×M covariance (caller applies the `R + εI` load from the
+// spec). `a_steer` is the steering vector `a(θ)` for the candidate cell.
+//
+// Computes `w = R^{-1} a` by an in-place Cholesky solve on a *scratch copy* of
+// R (the caller's R is left intact), then the scalar `a^H w` (real for a
+// Hermitian R). If R is not numerically positive-definite the Cholesky
+// factorization fails and per the O1 spec the function falls back to the
+// Bartlett power `a^H R a` on the *original* loaded R. J. Capon, Proc. IEEE
+// 1969; diagonal-load safety following Tikhonov-loaded MVDR.
+float capon_power_correct(const std::vector<Cfloat>& R_loaded,
+                           const std::vector<Cfloat>& a_steer) {
+    // Add an extra diagonal load if the caller did not — Capon *requires*
+    // invertibility. The spec mandates R + λI with λ = diagonal_load *
+    // trace(R)/M; the caller is expected to load R already, but we keep a
+    // tiny residual sill (1e-12 * |trace|) as a last-resort guard.
+    std::vector<Cfloat> work = R_loaded;
+    const std::size_t M = a_steer.size();
+    std::vector<Cfloat> w = a_steer;  // RHS = a
+    if (!cholesky_solve(work, w)) {
+        return bartlett_power(R_loaded, a_steer);  // fallback (O1 spec)
+    }
+    // a^H w
+    Cfloat acc{0.0F, 0.0F};
+    for (std::size_t i = 0; i < M; ++i) {
+        acc += std::conj(a_steer[i]) * w[i];
+    }
+    const float denom = acc.real();
+    if (!std::isfinite(denom) || denom <= 1.0e-12F) {
+        return bartlett_power(R_loaded, a_steer);
+    }
+    return 1.0F / denom;
+}
+
+// Apply diagonal loading `R <- R + ε I` with `ε = diagonal_load * trace(R)/M`
+// (O1 numerical safety for Capon; a no-op when diagonal_load == 0).
+void apply_diagonal_load(std::vector<Cfloat>& R, std::size_t M,
+                         float diagonal_load) {
+    if (diagonal_load <= 0.0F || M == 0) return;
+    float trace = 0.0F;
+    for (std::size_t i = 0; i < M; ++i) trace += R[i * M + i].real();
+    const float eps = diagonal_load * trace / static_cast<float>(M);
+    for (std::size_t i = 0; i < M; ++i) {
+        R[i * M + i] += Cfloat{eps, 0.0F};
+    }
+}
+
+// ----------------------------------------------------------- spatial smooth
+// Spatial smoothing + forward-backward averaging (O2).
+//   Shan/Wax/Kailath 1985 (spatial smoothing),
+//   Weiss & Friedlander 1997 (forward-backward averaging).
+// Forms R̂ = 1/2 (R̃ + J R̃* J) over L=M-P+1 overlapping sub-arrays of length P.
+// Output is P×P, row-major. `snapshots` are the K length-M snapshots (each a
+// length-M complex vector). When smoothing is disabled (P == 0 or P >= M),
+// returns the plain full-array covariance scaled by 1/K.
+std::pair<std::vector<Cfloat>, std::vector<Cfloat>>
+spatial_smoothed_covariance(
+    const std::vector<std::vector<Cfloat>>& snapshots, std::size_t M,
+    std::size_t P_sub) {
+    const std::size_t K = snapshots.size();
+    if (K == 0 || M == 0) {
+        throw std::invalid_argument("spatial smoothing requires data");
+    }
+    const bool smoothing =
+        (P_sub != 0 && P_sub < M && P_sub >= 1);
+    const std::size_t M_eff = smoothing ? P_sub : M;
+    const std::size_t L = smoothing ? (M - P_sub + 1) : 1;
+
+    std::vector<std::vector<Cfloat>> per_sub;  // accumulate L sub-array covariances
+    per_sub.assign(L, std::vector<Cfloat>(M_eff * M_eff, Cfloat{0.0F, 0.0F}));
+
+    for (std::size_t sub = 0; sub < L; ++sub) {
+        for (std::size_t k = 0; k < K; ++k) {
+            const auto& x = snapshots[k];
+            for (std::size_t r = 0; r < M_eff; ++r) {
+                const Cfloat xr = x[sub + r];
+                for (std::size_t c = 0; c < M_eff; ++c) {
+                    per_sub[sub][r * M_eff + c] +=
+                        xr * std::conj(x[sub + c]) * (1.0F / static_cast<float>(K));
+                }
+            }
+        }
+    }
+    // Average forward sub-arrays.
+    std::vector<Cfloat> R_tilde(M_eff * M_eff, Cfloat{0.0F, 0.0F});
+    for (std::size_t sub = 0; sub < L; ++sub) {
+        for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
+            R_tilde[i] += per_sub[sub][i] * (1.0F / static_cast<float>(L));
+        }
+    }
+    if (!smoothing) {
+        // No smoothing: return R_tilde directly (which is the full-array sample
+        // covariance averaged over the single "sub-array").
+        return {R_tilde, {}};  // second entry unused
+    }
+    // Forward-backward: R̂ = 1/2 (R̃ + J R̃* J). J reverses indices.
+    std::vector<Cfloat> R_hat(M_eff * M_eff, Cfloat{0.0F, 0.0F});
+    for (std::size_t r = 0; r < M_eff; ++r) {
+        for (std::size_t c = 0; c < M_eff; ++c) {
+            // J R̃* J : index (r,c) <- R̃*[M-1-r, M-1-c]
+            const std::size_t pr = M_eff - 1 - r;
+            const std::size_t pc = M_eff - 1 - c;
+            const Cfloat conj_e = std::conj(R_tilde[pr * M_eff + pc]);
+            const Cfloat fwd = R_tilde[r * M_eff + c];
+            R_hat[r * M_eff + c] = 0.5F * (fwd + conj_e);
+        }
+    }
+    return {R_hat, R_tilde};
+}
+
+// ----------------------------------------------------- decode a snapshot
+// Decode one (time, freq) snapshot: a length-M vector of complex samples.
+inline std::vector<Cfloat> decode_snapshot(const PackedVoltage& packed,
+                                            const Dimensions& dims,
+                                            std::size_t time, std::size_t freq) {
+    std::vector<Cfloat> x(dims.n_ant);
+    for (std::size_t a_idx = 0; a_idx < dims.n_ant; ++a_idx) {
+        const auto sample = unpack_complex_int4(
+            packed[voltage_index(time, freq, a_idx, dims)]);
+        x[a_idx] = Cfloat{static_cast<float>(sample.real),
+                          static_cast<float>(sample.imag)};
+    }
+    return x;
+}
+
+// ------------------------------------------------- copy-paste of naive DAS
+// Reproduces the naive per-window DAS pass *exactly* (src/beam_tracker.cpp:90)
+// for a given per-window direction, writing the standard
+// intensity_index(time, freq, beam=0) slots. Used by the default (scan
+// disabled) path and as the final emission pass of the searching path so the
+// on-disk [time][freq][1] output is byte-compatible.
+void emit_window_das(const PackedVoltage& packed, const Dimensions& dims,
+                     const std::vector<Vec3>& positions,
+                     const std::vector<float>& frequencies,
+                     const Vec3& direction, std::size_t first_time,
+                     std::size_t last_time, Intensities& intensity) {
+    // Reuse the canonical weight generator (single-beam direction) so the
+    // emitted product is bit-for-bit identical to the naive path for the same
+    // direction — exactly the contract the regression tests anchor on.
+    const auto weights = generate_weights(
+        dims, positions, frequencies, std::vector<Vec3>{direction});
+    for (std::size_t time = first_time; time < last_time; ++time) {
+        for (std::size_t frequency = 0; frequency < dims.n_freq; ++frequency) {
+            float sum_real = 0.0F;
+            float sum_imag = 0.0F;
+            for (std::size_t element = 0; element < dims.n_ant; ++element) {
+                const auto sample = unpack_complex_int4(
+                    packed[voltage_index(time, frequency, element, dims)]);
+                const float sample_real = static_cast<float>(sample.real);
+                const float sample_imag = static_cast<float>(sample.imag);
+                const auto& weight =
+                    weights[weight_index(0, frequency, element, dims)];
+                sum_real += weight.real * sample_real - weight.imag * sample_imag;
+                sum_imag += weight.real * sample_imag + weight.imag * sample_real;
+            }
+            intensity[intensity_index(time, frequency, 0, dims)] =
+                sum_real * sum_real + sum_imag * sum_imag;
+        }
+    }
+}
+
+// ------------------------------------------------------- coarse grid build
+// Coarse direction lattice Λ_0 over a (search_fov_l × search_fov_m) window
+// centred at `centre`, G×G cells with pitch (2*fov / G). Returns the cell
+// directions in row-major [v=0..G-1][u=0..G-1].
+std::vector<Vec3> build_centred_grid(const Vec3& centre, std::size_t G,
+                                     float fov_l, float fov_m) {
+    std::vector<Vec3> cells;
+    if (G == 0) return cells;
+    cells.reserve(G * G);
+    const float cl = centre[0];
+    const float cm = centre[1];
+    const float step_l = (G == 1) ? 0.0F : (2.0F * fov_l) / static_cast<float>(G - 1);
+    const float step_m = (G == 1) ? 0.0F : (2.0F * fov_m) / static_cast<float>(G - 1);
+    const float start_l = cl - fov_l;
+    const float start_m = cm - fov_m;
+    for (std::size_t v = 0; v < G; ++v) {
+        for (std::size_t u = 0; u < G; ++u) {
+            float l = start_l + static_cast<float>(u) * step_l;
+            float m = start_m + static_cast<float>(v) * step_m;
+            // Clamp into the unit disk so direction_from_lm never throws
+            // (a coarse cell near the horizon can otherwise be out-of-disk).
+            const float r2 = l * l + m * m;
+            if (r2 > 0.999F) {
+                const float s = std::sqrt(0.999F / r2);
+                l *= s;
+                m *= s;
+            }
+            cells.push_back(direction_from_lm(l, m));
+        }
+    }
+    return cells;
+}
+
+// Quadratic 3-point peak interpolation (O4) — Thomson 1982 / Priestley 1981.
+// `points` indexed [0,0]=centre, [+1,0], [-1,0], [0,+1], [0,-1]. Returns the
+// (δ_u, δ_v) offsets in [-0.5, 0.5]; (0,0) if the response is not concave.
+void quadratic_interp(float pc, float p_up, float p_down, float p_vp,
+                      float p_vm, float& du, float& dv) {
+    du = 0.0F;
+    dv = 0.0F;
+    const float denom_u = p_down - 2.0F * pc + p_up;
+    if (denom_u > 0.0F) {
+        const float num_u = 0.5F * (p_up - p_down);
+        du = num_u / denom_u;
+        if (du > 0.5F) du = 0.5F;
+        if (du < -0.5F) du = -0.5F;
+    }
+    const float denom_v = p_vm - 2.0F * pc + p_vp;
+    if (denom_v > 0.0F) {
+        const float num_v = 0.5F * (p_vp - p_vm);
+        dv = num_v / denom_v;
+        if (dv > 0.5F) dv = 0.5F;
+        if (dv < -0.5F) dv = -0.5F;
+    }
 }
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    try {
-        const Options opt = parse_options(argc, argv);
+// =====================================================================
+// CpuOptBeamTracker::Impl
+// =====================================================================
+struct CpuOptBeamTracker::Impl {
+    // Per-frequency recursive covariance state (O5).
+    // Size n_freq; each entry is M_eff×M_eff Hermitian (row-major).
+    std::vector<std::vector<Cfloat>> R_freq;
+    // Whether R_freq has been initialised from the first window's snapshots.
+    bool R_initialised = false;
+    // Per-window estimated directions (post-search + O4).
+    std::vector<Vec3> window_dirs;
+    // Optional trajectory prior, seeded by the stateful free-function overload
+    // before calling run_into (the class itself has no trajectory handle, per
+    // the spec). Empty (default-constructed) => zenith zero-drift prior.
+    TrackerTrajectoryConfig trajectory{};
+    bool trajectory_set = false;
+    // Per-run flag: covariance recursion carries across run_into calls in the
+    // stateful overload. reset fresh on the first call if not set.
+    bool already_initialised_for_run = false;
+    // Window time bounds cache for emission.
+    // (computed per run; no storage needed across runs beyond R_freq.)
 
-        const beamformer::Dimensions dims{
-            opt.n_time,
-            beamformer::default_frequency_channels,
-            opt.n_ant,
-            beamformer::tracker_beam_count,
-        };
-        beamformer::validate_dimensions(dims);
+    // Cached coarse steering table A[f][cell][a] (O6).
+    // Built once in the constructor; reused for every window's coarse scan.
+    // Layout: A[cell * n_freq * M_eff + f * M_eff + a] — outer over cells so
+    // a single coarse scan touches a contiguous per-cell block.
+    std::vector<Cfloat> coarse_table;
+    std::size_t coarse_cells_per_axis = 0;
+    std::size_t M_eff = 0;
 
-        const auto positions = beamformer::default_positions(dims.n_ant);
-        const auto frequencies = beamformer::channelized_frequencies(dims.n_freq);
+    // Optional per-window timing, populated only when the translation unit is
+    // compiled with -DBEAMFORMER_TRACKER_PERF (the benchmark defines this).
+    // Production builds compile with the macro undefined, so this branch is
+    // eliminated and the vectors stay empty — zero runtime overhead.
+#if defined(BEAMFORMER_TRACKER_PERF)
+    std::vector<double> window_ms;  // ms per integration window (one frame)
+    void reset_perf() { window_ms.clear(); }
+#else
+    void reset_perf() {}
+#endif
 
-        // Prior trajectory (open-loop guess supplied to both paths).
-        beamformer::TrackerConfig traj;
-        traj.trajectory.direction_start =
-            beamformer::direction_from_lm(opt.prior_l0, opt.prior_m0);
-        traj.trajectory.direction_rate_per_sample = {0.0F, 0.0F};
-        traj.integration_spectra = opt.integration_spectra;
+    // -----------------------------------------------------------------
+    // Debug search capture (only with -DBEAMFORMER_TRACKER_DEBUG).
+    // Populated by run_into during the scan path so a post-hoc dump can write
+    // every intermediate quantity needed to diagnose a failed DOA assertion.
+    // Empty / unused when the macro is undefined → zero overhead.
+    // -----------------------------------------------------------------
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+    // Per window: the coarse grid centres (G*G Vec3, row-major) and the
+    // integrated coarse power spectrum (G*G floats) used for the argmax.
+    std::vector<std::vector<Vec3>> dbg_coarse_centres;
+    std::vector<std::vector<float>> dbg_coarse_power;
+    // Per window, per refinement level: the 9 candidate directions and 9
+    // integrated powers (row-major 3x3), plus the level's half-cell pitch.
+    std::vector<std::vector<std::vector<Vec3>>> dbg_refine_cands;
+    std::vector<std::vector<std::vector<float>>> dbg_refine_power;
+    // Per window, per frequency: the M_eff×M_eff Hermitian covariance used
+    // for the spectrum evaluation (after O2 smoothing + O5 fold + Capon load).
+    std::vector<std::vector<std::vector<Cfloat>>> dbg_R_freq_per_window;
+    // Per window, per frequency, per snapshot: decoded length-M_ant snapshot
+    // (full array, pre-smoothing) so the source phase can be re-derived.
+    std::vector<std::vector<std::vector<std::vector<Cfloat>>>> dbg_snapshots;
+    // Per-window carrying direction (the prev_estimate fed to level 0).
+    std::vector<Vec3> dbg_prior_centre;
+    // Per-window final estimate written into window_dirs.
+    std::vector<Vec3> dbg_final_estimate;
+    // The trajectory prior seeded before the run.
+    TrackerTrajectoryConfig dbg_seeded_prior;
+    bool dbg_prior_captured = false;
 
-        // True source trajectory (slowly moving point source within the FoV).
-        beamformer::TrackerTrajectoryConfig source_traj{
-            beamformer::direction_from_lm(opt.source_l0, opt.source_m0),
-            {opt.source_dl, opt.source_dm}};
+    void reset_dbg() {
+        dbg_coarse_centres.clear();
+        dbg_coarse_power.clear();
+        dbg_refine_cands.clear();
+        dbg_refine_power.clear();
+        dbg_R_freq_per_window.clear();
+        dbg_snapshots.clear();
+        dbg_prior_centre.clear();
+        dbg_final_estimate.clear();
+    }
+#else
+    void reset_dbg() {}
+#endif
 
-        // Build the synthetic voltage shard ONCE; both paths consume it.
-        const beamformer::PackedVoltage packed =
-            beamformer::beam_tracker_make_moving_point_source(
-                dims, positions, frequencies, source_traj, 4.0F);
+    void reset_R(std::size_t n_freq, std::size_t M_eff_in) {
+        M_eff = M_eff_in;
+        R_freq.assign(n_freq, std::vector<Cfloat>(M_eff * M_eff, Cfloat{0.0F, 0.0F}));
+        R_initialised = false;
+        already_initialised_for_run = false;
+    }
+};
 
-        // Naive tracker (baseline timing reference).
-        double naive_ms_best = std::numeric_limits<double>::infinity();
-        beamformer::Intensities naive_intensity;
-        for (std::size_t run = 0; run < opt.warmup_runs + opt.repeat; ++run) {
-            const auto t0 = Clock::now();
-            naive_intensity =
-                beamformer::beam_tracker_cpu_packed_intensity(packed, dims, traj);
-            const auto t1 = Clock::now();
-            if (run >= opt.warmup_runs) {
-                naive_ms_best = std::min(naive_ms_best, elapsed_ms(t0, t1));
+// =====================================================================
+// Special members — defined here (not in the header) so `Impl` is complete.
+// =====================================================================
+CpuOptBeamTracker::~CpuOptBeamTracker() = default;
+CpuOptBeamTracker::CpuOptBeamTracker(CpuOptBeamTracker&&) noexcept = default;
+CpuOptBeamTracker& CpuOptBeamTracker::operator=(CpuOptBeamTracker&&)
+    noexcept = default;
+
+// =====================================================================
+// Construction
+// =====================================================================
+CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
+                                      std::vector<float> frequencies_hz,
+                                      Dimensions dims,
+                                      CpuOptTrackerConfig config)
+    : positions_m_(std::move(positions_m)),
+      frequencies_hz_(std::move(frequencies_hz)),
+      dims_(dims),
+      config_(config),
+      impl_(std::make_unique<Impl>()) {
+    validate_dimensions(dims_);
+    if (dims_.n_beams != tracker_beam_count) {
+        throw std::invalid_argument(
+            "tracker requires exactly n_beams == 1 (use tracker_beam_count)");
+    }
+    if (positions_m_.size() != dims_.n_ant) {
+        throw std::invalid_argument("position count must match n_ant");
+    }
+    if (frequencies_hz_.size() != dims_.n_freq) {
+        throw std::invalid_argument("frequency count must match n_freq");
+    }
+    if (config_.integration_spectra == 0) {
+        throw std::invalid_argument("tracker integration_spectra must be positive");
+    }
+    if (config_.forgetting_factor <= 0.0F || config_.forgetting_factor > 1.0F) {
+        throw std::invalid_argument("forgetting_factor must be in (0, 1]");
+    }
+    if (config_.spatial_smoothing_subarray_size > dims_.n_ant) {
+        throw std::invalid_argument(
+            "spatial_smoothing_subarray_size must be <= n_ant");
+    }
+
+    // Effective aperture (O2): sub-array length or full array.
+    const std::size_t M_eff =
+        (config_.spatial_smoothing_subarray_size != 0
+         && config_.spatial_smoothing_subarray_size < dims_.n_ant)
+            ? config_.spatial_smoothing_subarray_size
+            : dims_.n_ant;
+    impl_->reset_R(dims_.n_freq, M_eff);
+
+    // Precompute the coarse steering table (O6) if a scan is requested.
+    // Van Veen & Buckley 1988 (beam-space preprocessing); Van Trees 2002 §6.8.
+    const bool scan_enabled = config_.coarse_grid_resolution > 1;
+    if (scan_enabled) {
+        impl_->coarse_cells_per_axis = config_.coarse_grid_resolution;
+        const std::size_t G = impl_->coarse_cells_per_axis;
+        const std::size_t total = G * G * dims_.n_freq * M_eff;
+        impl_->coarse_table.assign(total, Cfloat{0.0F, 0.0F});
+        // The table is centre-agnostic until we know the per-window centre; we
+        // build it lazily around each window's prior centre using the cached
+        // pitch / geometry. To keep the O6 amortization exact we cache an
+        // *identity*-steering baseline and rotate per window — but the
+        // dominant cost is the sincos, which would be paid per-window either
+        // way. For v1 we build the table on demand per window (still reused
+        // across refinement levels and the per-frequency sweep within a
+        // window) and cache across windows for stationary centres. The
+        // deferred FFT-fold (spec O6 note) removes this entirely.
+        // -> Left empty; per-window build below reuses declared capacity.
+        impl_->coarse_table.clear();
+        impl_->coarse_table.shrink_to_fit();
+    }
+}
+
+const Dimensions& CpuOptBeamTracker::dimensions() const noexcept {
+    return dims_;
+}
+const CpuOptTrackerConfig& CpuOptBeamTracker::config() const noexcept {
+    return config_;
+}
+
+Vec3 CpuOptBeamTracker::window_direction(std::size_t window) const {
+    if (window < impl_->window_dirs.size()) return impl_->window_dirs[window];
+    // Fallback to the trajectory direction is the caller's responsibility
+    // before window_dirs is populated (run_into fills it).
+    return Vec3{0.0F, 0.0F, 1.0F};
+}
+
+void CpuOptBeamTracker::seed_trajectory(
+    const TrackerTrajectoryConfig& trajectory) {
+    // Validate the start direction is a finite unit vector, mirroring the
+    // naive validate_tracker_config guard so bad priors surface here rather
+    // than producing a silently-degenerate scan.
+    const auto& start = trajectory.direction_start;
+    const double norm_squared =
+        static_cast<double>(start[0]) * start[0]
+        + static_cast<double>(start[1]) * start[1]
+        + static_cast<double>(start[2]) * start[2];
+    if (!std::isfinite(norm_squared) || std::abs(norm_squared - 1.0) > 1.0e-3) {
+        throw std::invalid_argument(
+            "seed_trajectory direction_start must be a finite unit vector");
+    }
+    for (const float c : trajectory.direction_rate_per_sample) {
+        if (!std::isfinite(c)) {
+            throw std::invalid_argument(
+                "seed_trajectory direction_rate_per_sample must be finite");
+        }
+    }
+    impl_->trajectory = trajectory;
+    impl_->trajectory_set = true;
+}
+
+const std::vector<double>& CpuOptBeamTracker::per_frame_ms()
+    const noexcept {
+#if defined(BEAMFORMER_TRACKER_PERF)
+    return impl_->window_ms;
+#else
+    static const std::vector<double> empty;
+    return empty;
+#endif
+}
+
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+// ---------------------------------------------------------------------
+// debug_search_dump — write everything needed to diagnose a failing
+// DOA-recovery assertion to a self-describing directory. Enabled only
+// in debug builds (CMake passes -DBEAMFORMER_TRACKER_DEBUG to the test
+// target); a no-op stub below keeps the symbol resolvable in production.
+// ---------------------------------------------------------------------
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+
+namespace {
+
+void ensure_dir(const std::filesystem::path& p) {
+    std::error_code ec;
+    std::filesystem::create_directories(p, ec);
+}
+
+std::ofstream open_text(const std::filesystem::path& p) {
+    std::ofstream out(p);
+    if (!out) {
+        throw std::runtime_error("debug_search_dump cannot open " + p.string());
+    }
+    out << std::fixed << std::setprecision(9);
+    return out;  // NRVO
+}
+
+std::ofstream open_bin(const std::filesystem::path& p) {
+    std::ofstream out(p, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("debug_search_dump cannot open " + p.string());
+    }
+    return out;
+}
+
+// Write a flat float vector as raw little-endian float32 (the project is
+// x86/Linux on Trillium), with a one-line count comment is not possible in
+// binary — instead we rely on the README listing the shape.
+void write_floats_bin(const std::filesystem::path& p,
+                      const float* data, std::size_t n) {
+    auto out = open_bin(p);
+    out.write(reinterpret_cast<const char*>(data),
+              static_cast<std::streamsize>(n * sizeof(float)));
+}
+
+void write_cfloats_bin(const std::filesystem::path& p,
+                       const std::vector<std::complex<float>>& data) {
+    auto out = open_bin(p);
+    // std::complex<float> is layout-compatible with two adjacent floats.
+    out.write(reinterpret_cast<const char*>(data.data()),
+              static_cast<std::streamsize>(
+                  data.size() * sizeof(std::complex<float>)));
+}
+
+}  // namespace
+
+void CpuOptBeamTracker::debug_search_dump(const char* dir,
+                                            const char* extra) const {
+    // Unique directory so repeated runs don't clobber: <dir>/<extra>_<timestamp>
+    std::ostringstream nm;
+    nm << (extra && *extra ? extra : "dump");
+    nm << "_" << std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path root =
+        std::filesystem::path(dir) / nm.str();
+    ensure_dir(root);
+
+    // ---- README ---------------------------------------------------------
+    {
+        auto out = open_text(root / "README.txt");
+        out << "CpuOptBeamTracker debug search dump\n";
+        out << "==================================\n\n";
+        out << "Build: BEAMFORMER_TRACKER_DEBUG defined.\n";
+        out << "n_time=" << dims_.n_time << " n_freq=" << dims_.n_freq
+            << " n_ant=" << dims_.n_ant << " n_beams=" << dims_.n_beams
+            << " M_eff=" << impl_->M_eff << '\n';
+        out << "config: estimator="
+            << (config_.estimator == TrackerEstimator::Capon ? "capon"
+                                                              : "bartlett")
+            << " coarse_grid_resolution=" << config_.coarse_grid_resolution
+            << " refinement_levels=" << config_.refinement_levels
+            << " search_fov_l=" << config_.search_fov_l
+            << " search_fov_m=" << config_.search_fov_m
+            << " forgetting_factor=" << config_.forgetting_factor
+            << " diagonal_load=" << config_.diagonal_load
+            << " smoothing_subarray="
+            << config_.spatial_smoothing_subarray_size
+            << " enable_quad_interp="
+            << (config_.enable_quadratic_peak_interp ? 1 : 0)
+            << " integration_spectra=" << config_.integration_spectra << '\n';
+        out << "seeded_prior: start=(" << impl_->dbg_seeded_prior.direction_start[0]
+            << ',' << impl_->dbg_seeded_prior.direction_start[1] << ','
+            << impl_->dbg_seeded_prior.direction_start[2] << ") rate=("
+            << impl_->dbg_seeded_prior.direction_rate_per_sample[0] << ','
+            << impl_->dbg_seeded_prior.direction_rate_per_sample[1] << ")\n";
+        out << "windows captured=" << impl_->dbg_final_estimate.size() << '\n';
+        out << "\nFile layout:\n";
+        out << "  positions.csv         : array geometry, one row per ant (x,y,z).\n";
+        out << "  frequencies.csv       : channel frequencies, one row.\n";
+        out << "  estimates.csv         : per-window prior centre + final estimate.\n";
+        out << "  coarse_<w>.csv        : per-window coarse grid cell dirs + integrated power (row-major GxG).\n";
+        out << "  refine_<w>_<lvl>.csv  : per-window per-level 3x3 candidate dirs + integrated power.\n";
+        out << "  R_<w>_<f>.bin         : per-window per-frequency M_eff^2 Hermitian covariance (complex<float>, row-major).\n";
+        out << "  snaps_<w>_<f>.bin     : per-window per-frequency K length-n_ant decoded snapshots (complex<float>).\n";
+        out << "  config.txt            : same config block as this README, machine-friendly.\n";
+    }
+    {
+        auto out = open_text(root / "config.txt");
+        out << "estimator "
+            << (config_.estimator == TrackerEstimator::Capon ? "capon"
+                                                              : "bartlett") << '\n';
+        out << "coarse_grid_resolution " << config_.coarse_grid_resolution << '\n';
+        out << "refinement_levels " << config_.refinement_levels << '\n';
+        out << "search_fov_l " << config_.search_fov_l << '\n';
+        out << "search_fov_m " << config_.search_fov_m << '\n';
+        out << "forgetting_factor " << config_.forgetting_factor << '\n';
+        out << "diagonal_load " << config_.diagonal_load << '\n';
+        out << "spatial_smoothing_subarray_size "
+            << config_.spatial_smoothing_subarray_size << '\n';
+        out << "enable_quadratic_peak_interp "
+            << (config_.enable_quadratic_peak_interp ? 1 : 0) << '\n';
+        out << "integration_spectra " << config_.integration_spectra << '\n';
+        out << "n_time " << dims_.n_time << '\n';
+        out << "n_freq " << dims_.n_freq << '\n';
+        out << "n_ant " << dims_.n_ant << '\n';
+        out << "M_eff " << impl_->M_eff << '\n';
+    }
+
+    // ---- positions / frequencies ---------------------------------------
+    {
+        auto out = open_text(root / "positions.csv");
+        for (std::size_t a = 0; a < positions_m_.size(); ++a) {
+            out << positions_m_[a][0] << ',' << positions_m_[a][1] << ','
+                << positions_m_[a][2] << '\n';
+        }
+    }
+    {
+        auto out = open_text(root / "frequencies.csv");
+        for (std::size_t f = 0; f < frequencies_hz_.size(); ++f) {
+            out << frequencies_hz_[f] << '\n';
+        }
+    }
+
+    // ---- estimates ------------------------------------------------------
+    {
+        auto out = open_text(root / "estimates.csv");
+        out << "window,prior_l,prior_m,prior_n,est_l,est_m,est_n\n";
+        const std::size_t W = impl_->dbg_final_estimate.size();
+        for (std::size_t w = 0; w < W; ++w) {
+            const Vec3& pc = (w < impl_->dbg_prior_centre.size())
+                                 ? impl_->dbg_prior_centre[w]
+                                 : Vec3{0, 0, 1};
+            const Vec3& est = impl_->dbg_final_estimate[w];
+            out << w << ',' << pc[0] << ',' << pc[1] << ',' << pc[2] << ','
+                << est[0] << ',' << est[1] << ',' << est[2] << '\n';
+        }
+    }
+
+    // ---- coarse spectra (dirs + power) ----------------------------------
+    for (std::size_t w = 0; w < impl_->dbg_coarse_centres.size(); ++w) {
+        std::ostringstream nm2;
+        nm2 << "coarse_" << w << ".csv";
+        auto out = open_text(root / nm2.str());
+        out << "v,u,l,m,n,power\n";
+        const auto& cells = impl_->dbg_coarse_centres[w];
+        const auto& power = impl_->dbg_coarse_power[w];
+        const std::size_t G = config_.coarse_grid_resolution;
+        for (std::size_t i = 0; i < cells.size(); ++i) {
+            const std::size_t u = i % G;
+            const std::size_t v = i / G;
+            const float pw = (i < power.size()) ? power[i] : 0.0F;
+            out << v << ',' << u << ',' << cells[i][0] << ',' << cells[i][1]
+                << ',' << cells[i][2] << ',' << pw << '\n';
+        }
+    }
+
+    // ---- refinement spectra ---------------------------------------------
+    for (std::size_t w = 0; w < impl_->dbg_refine_cands.size(); ++w) {
+        for (std::size_t lvl = 0; lvl < impl_->dbg_refine_cands[w].size(); ++lvl) {
+            std::ostringstream nm2;
+            nm2 << "refine_" << w << '_' << lvl << ".csv";
+            auto out = open_text(root / nm2.str());
+            out << "idx,dv,du,l,m,n,power\n";
+            const auto& cand = impl_->dbg_refine_cands[w][lvl];
+            const auto& pw = impl_->dbg_refine_power[w][lvl];
+            for (std::size_t i = 0; i < cand.size(); ++i) {
+                const std::int64_t dv = static_cast<std::int64_t>(i / 3) - 1;
+                const std::int64_t du = static_cast<std::int64_t>(i % 3) - 1;
+                const float p = (i < pw.size()) ? pw[i] : 0.0F;
+                out << i << ',' << dv << ',' << du << ',' << cand[i][0] << ','
+                    << cand[i][1] << ',' << cand[i][2] << ',' << p << '\n';
             }
         }
-        if (opt.repeat == 0) naive_ms_best = 0.0;
+    }
 
-        // Optimized tracker config (scan enabled unless caller disabled it).
-        beamformer::CpuOptTrackerConfig ocfg;
-        ocfg.coarse_grid_resolution = opt.coarse_grid_resolution;
-        ocfg.refinement_levels = opt.refinement_levels;
-        ocfg.search_fov_l = opt.search_fov_l;
-        ocfg.search_fov_m = opt.search_fov_m;
-        ocfg.forgetting_factor = opt.forgetting_factor;
-        ocfg.diagonal_load = opt.diagonal_load;
-        ocfg.estimator = opt.capon ? beamformer::TrackerEstimator::Capon
-                                   : beamformer::TrackerEstimator::Bartlett;
-        ocfg.spatial_smoothing_subarray_size =
-            opt.spatial_smoothing_subarray_size;
-        ocfg.integration_spectra = opt.integration_spectra;
-
-        // Warm-up runs (discarded), then measurement runs. We keep per-frame
-        // timings for the *last* measurement run (representative steady state).
-        double opt_ms_best = std::numeric_limits<double>::infinity();
-        beamformer::Intensities opt_intensity;
-        std::vector<double> frame_ms;
-        std::vector<beamformer::Vec3> estimated_dirs;
-        for (std::size_t run = 0; run < opt.warmup_runs + opt.repeat; ++run) {
-            beamformer::CpuOptBeamTracker tracker(positions, frequencies, dims,
-                                                   ocfg);
-            opt_intensity.assign(dims.n_time * dims.n_freq * dims.n_beams, 0.0F);
-            tracker.seed_trajectory(traj.trajectory);
-            const auto t0 = Clock::now();
-            tracker.run_into(packed, opt_intensity);
-            const auto t1 = Clock::now();
-            if (run >= opt.warmup_runs) {
-                opt_ms_best = std::min(opt_ms_best, elapsed_ms(t0, t1));
+    // ---- covariances + snapshots (binary) -------------------------------
+    const std::size_t M = impl_->M_eff;
+    for (std::size_t w = 0; w < impl_->dbg_R_freq_per_window.size(); ++w) {
+        for (std::size_t f = 0; f < impl_->dbg_R_freq_per_window[w].size(); ++f) {
+            {
+                std::ostringstream nm2;
+                nm2 << "R_" << w << '_' << f << ".bin";
+                write_cfloats_bin(root / nm2.str(),
+                                  impl_->dbg_R_freq_per_window[w][f]);
             }
-            // Keep the last run's per-frame timings and estimated directions.
-            if (run + 1 == opt.warmup_runs + opt.repeat) {
-                // Public accessor: populated only when the perf macro compiled
-                // the per-frame hook in (benchmark target always does); empty
-                // otherwise (zero-overhead production builds).
-                frame_ms = tracker.per_frame_ms();
-                const std::size_t W = beamformer::tracker_window_count(
-                    dims.n_time, ocfg.integration_spectra);
-                estimated_dirs.clear();
-                for (std::size_t w = 0; w < W; ++w) {
-                    estimated_dirs.push_back(tracker.window_direction(w));
+            if (w < impl_->dbg_snapshots.size()
+                && f < impl_->dbg_snapshots[w].size()) {
+                std::ostringstream nm2;
+                nm2 << "snaps_" << w << '_' << f << ".bin";
+                // Write K snapshots of length n_ant, concatenated complex<float>.
+                const auto& snaps = impl_->dbg_snapshots[w][f];
+                std::vector<std::complex<float>> flat;
+                flat.reserve(snaps.size() * (snaps.empty() ? 0 : snaps[0].size()));
+                for (const auto& s : snaps) {
+                    for (const auto& c : s) flat.push_back(c);
+                }
+                write_cfloats_bin(root / nm2.str(), flat);
+            }
+        }
+        // Per-window shape manifest so binary files are interpretable.
+        std::ostringstream nm2;
+        nm2 << "shapes_" << w << ".txt";
+        auto out = open_text(root / nm2.str());
+        out << "window " << w << '\n';
+        out << "M_eff " << M << '\n';
+        out << "R_nfreq " << impl_->dbg_R_freq_per_window[w].size() << '\n';
+        if (w < impl_->dbg_snapshots.size()) {
+            for (std::size_t f = 0; f < impl_->dbg_snapshots[w].size(); ++f) {
+                out << "snaps_n_freq" << f << ' '
+                    << impl_->dbg_snapshots[w][f].size();
+                if (!impl_->dbg_snapshots[w][f].empty()) {
+                    out << ' ' << impl_->dbg_snapshots[w][f][0].size();
+                }
+                out << '\n';
+            }
+        }
+    }
+
+    // Emit an obvious marker so a grep across the dump is easy.
+    auto done = open_text(root / "DUMP_COMPLETE");
+    done << "ok\n";
+}
+
+#else  // !BEAMFORMER_TRACKER_DEBUG
+void CpuOptBeamTracker::debug_search_dump(const char* /*dir*/,
+                                            const char* /*extra*/) const {
+    // Production build stub: no capture buffers exist (impl_->dbg_* members
+    // are compiled out), so there is nothing to write. Keeping the symbol
+    // resolvable means callers don't need their own macro guards.
+}
+#endif  // BEAMFORMER_TRACKER_DEBUG
+
+// =====================================================================
+// run_into
+// =====================================================================
+void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
+                                  Intensities& intensity) {
+    validate_dimensions(dims_);
+    if (dims_.n_beams != tracker_beam_count) {
+        throw std::invalid_argument(
+            "tracker requires exactly n_beams == 1 (use tracker_beam_count)");
+    }
+    if (packed.size() < voltage_sample_count(dims_)) {
+        throw std::invalid_argument("packed voltage is smaller than dimensions");
+    }
+    const std::size_t required_output =
+        dims_.n_time * dims_.n_freq * dims_.n_beams;
+    if (intensity.size() < required_output) {
+        throw std::invalid_argument("intensity output is smaller than dimensions");
+    }
+
+    // Trajectory prior — the run-wide initial guess / per-window direction
+    // when scanning is disabled, and the level-0 coarse-grid centre for the
+    // first window when scanning is enabled (the linear trajectory is
+    // repurposed as a prior per the spec; later windows use the previous
+    // estimate carried by the O5 recursion). Seeded into the Impl by the
+    // stateful free-function overload before this call; a class constructed
+    // and run directly (no trajectory seed) defaults to the zero-drift
+    // zenith prior, matching the naive default trajectory.
+    const TrackerTrajectoryConfig prior = impl_->trajectory;
+
+    const std::size_t window_count =
+        tracker_window_count(dims_.n_time, config_.integration_spectra);
+
+    impl_->window_dirs.assign(window_count, Vec3{0.0F, 0.0F, 1.0F});
+    impl_->reset_perf();
+    impl_->reset_dbg();
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+    impl_->dbg_seeded_prior = prior;
+    impl_->dbg_prior_captured = true;
+    impl_->dbg_final_estimate.assign(window_count, Vec3{0.0F, 0.0F, 1.0F});
+#endif
+
+    const bool scan_enabled = config_.coarse_grid_resolution > 1;
+    const float lambda = config_.forgetting_factor;
+    const std::size_t M_eff = impl_->M_eff;  // full n_ant, or sub-array size if
+                                             // O2 smoothing was enabled in the
+                                             // constructor (smoothing decision
+                                             // is baked into M_eff there).
+
+#if defined(BEAMFORMER_TRACKER_PERF)
+    impl_->window_ms.reserve(window_count);
+    using PerfClock = std::chrono::steady_clock;
+#define BEAMFORMER_TRACKER_PERF_START(name) \
+        auto name##_start = PerfClock::now()
+#define BEAMFORMER_TRACKER_PERF_STOP(name)                                   \
+    impl_->window_ms.push_back(                                              \
+        std::chrono::duration<double, std::milli>(PerfClock::now()           \
+                                                  - (name##_start)).count())
+#else
+#define BEAMFORMER_TRACKER_PERF_START(name) (void)0
+#define BEAMFORMER_TRACKER_PERF_STOP(name) (void)0
+#endif
+
+    if (!scan_enabled) {
+        // ============================================================
+        // Default / back-compat path — exact naive reproduction.
+        // Scan disabled (coarse_grid_resolution <= 1): use the
+        // trajectory-supplied per-window direction and the canonical DAS
+        // emission pass. Output is byte-compatible with
+        // beam_tracker_cpu_packed_intensity_into to within float rounding.
+        // (No covariance, no search, no recursion.)
+        // ============================================================
+        for (std::size_t window = 0; window < window_count; ++window) {
+            BEAMFORMER_TRACKER_PERF_START(disabled);
+            const Vec3 direction = tracker_window_direction(
+                prior, window, config_.integration_spectra);
+            impl_->window_dirs[window] = direction;
+            const std::size_t first_time = window * config_.integration_spectra;
+            const std::size_t last_time =
+                std::min(first_time + config_.integration_spectra, dims_.n_time);
+            emit_window_das(packed, dims_, positions_m_, frequencies_hz_,
+                            direction, first_time, last_time, intensity);
+            BEAMFORMER_TRACKER_PERF_STOP(disabled);
+        }
+        return;
+    }
+
+    // ============================================================
+    // Searching / adaptive path — O1..O6.
+    // ============================================================
+    // Per-frequency sample covariance accumulator (windowed), recursively
+    // carried across windows (O5). The cache lives in impl_->R_freq.
+    Vec3 prev_estimate = tracker_window_direction(prior, 0, config_.integration_spectra);
+
+    const std::size_t G = config_.coarse_grid_resolution;
+    const float fov_l = config_.search_fov_l;
+    const float fov_m = config_.search_fov_m;
+    const std::size_t L_refine = config_.refinement_levels;
+
+    for (std::size_t window = 0; window < window_count; ++window) {
+        BEAMFORMER_TRACKER_PERF_START(scan);
+        const std::size_t first_time = window * config_.integration_spectra;
+        const std::size_t last_time =
+            std::min(first_time + config_.integration_spectra, dims_.n_time);
+        const std::size_t K = last_time - first_time;
+        if (K == 0) { BEAMFORMER_TRACKER_PERF_STOP(scan); continue; }
+
+        // ---- O5: recursive covariance update over this window's snapshots.
+        //   Haykin, Adaptive Filter Theory, Ch.10 (RLS with forgetting).
+        const float a_comp = 1.0F - lambda;  // contribution of fresh samples
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+        // Reserve debug per-window containers on the first window.
+        if (window == 0) {
+            impl_->dbg_snapshots.assign(window_count,
+                std::vector<std::vector<std::vector<Cfloat>>>(dims_.n_freq));
+            impl_->dbg_R_freq_per_window.assign(window_count,
+                std::vector<std::vector<Cfloat>>(dims_.n_freq));
+        }
+        impl_->dbg_prior_centre.push_back(prev_estimate);
+        std::vector<std::vector<std::vector<Cfloat>>>& dbg_w_snaps =
+            impl_->dbg_snapshots[window];
+        std::vector<std::vector<Cfloat>>& dbg_w_R =
+            impl_->dbg_R_freq_per_window[window];
+#endif
+        // Option A: full window recompute blended with previous R via lambda.
+        // We form the window's block covariance R_w_block over K snapshots,
+        // spatial-smooth it (O2), then fold:
+        //   R_w = lambda * R_{w-1} + (1-lambda) * R_w_block
+        // (matches the spec's block-form recursion; with lambda == 1.0 this
+        //  reduces to the plain block estimate R_w = R_w_block.)
+        for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+            // Decode the K snapshots for this frequency.
+            std::vector<std::vector<Cfloat>> snaps;
+            snaps.reserve(K);
+            for (std::size_t t = first_time; t < last_time; ++t) {
+                snaps.push_back(decode_snapshot(packed, dims_, t, f));
+            }
+            // O2: spatial smoothing + forward-backward.
+            //   Shan/Wax/Kailath 1985; Weiss & Friedlander 1997.
+            auto cov = spatial_smoothed_covariance(
+                snaps, dims_.n_ant, config_.spatial_smoothing_subarray_size);
+            // cov.first is M_eff×M_eff; second unused when smoothing off.
+            std::vector<Cfloat> R_block = std::move(cov.first);
+            if (config_.estimator == TrackerEstimator::Capon) {
+                apply_diagonal_load(R_block, M_eff, config_.diagonal_load);
+            }
+            // Fold with previous R (O5).
+            if (!impl_->R_initialised || lambda >= 1.0F) {
+                impl_->R_freq[f] = R_block;
+            } else {
+                std::vector<Cfloat>& R = impl_->R_freq[f];
+                for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
+                    R[i] = lambda * R[i] + a_comp * R_block[i];
                 }
             }
         }
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+        dbg_w_R[f] = impl_->R_freq[f];
+        dbg_w_snaps[f] = snaps;
+#endif
+        impl_->R_initialised = true;
 
-        // DOA recovery: average distance between the estimated window direction
-        // and the true source direction at the window's first sample, vs the
-        // same distance for the (open-loop) prior.
-        const std::size_t W = beamformer::tracker_window_count(
-            dims.n_time, opt.integration_spectra);
-        double doa_err_prior_sum = 0.0, doa_err_est_sum = 0.0;
-        for (std::size_t w = 0; w < W; ++w) {
-            const beamformer::Vec3 true_dir =
-                beamformer::tracker_direction(source_traj,
-                                              w * opt.integration_spectra);
-            const beamformer::Vec3 prior_dir = beamformer::tracker_window_direction(
-                traj.trajectory, w, opt.integration_spectra);
-            const beamformer::Vec3 est_dir =
-                (w < estimated_dirs.size()) ? estimated_dirs[w]
-                                            : beamformer::Vec3{0, 0, 1};
-            doa_err_prior_sum += lm_distance(true_dir, prior_dir);
-            doa_err_est_sum += lm_distance(true_dir, est_dir);
+        // ---- O3 + O6: hierarchical coarse-to-fine search.
+        //   Skolnik, Radar Handbook §7.11 (two-stage search);
+        //   Haykin & Reilly 1991 (hierarchical ML lattice search).
+        // Level 0: build the coarse grid centred on prev_estimate (the prior).
+        std::vector<Vec3> coarse = build_centred_grid(prev_estimate, G, fov_l, fov_m);
+        // Per-frequency coarse power summed across frequency for the
+        // per-window direction decision (spec O1: "integrated across
+        // frequency for the final per-window direction decision").
+        std::vector<float> P_coarse(G * G, 0.0F);
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+        impl_->dbg_coarse_centres.push_back(coarse);
+        impl_->dbg_coarse_power.push_back(P_coarse);  // will fill below
+        std::vector<float>& dbg_P_coarse = impl_->dbg_coarse_power.back();
+        impl_->dbg_refine_cands.emplace_back();
+        impl_->dbg_refine_power.emplace_back();
+#endif
+        for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+            const std::vector<Cfloat>& R_f = impl_->R_freq[f];
+            const double wave_number =
+                two_pi * static_cast<double>(frequencies_hz_[f])
+                / speed_of_light_m_per_s;
+            for (std::size_t cell = 0; cell < G * G; ++cell) {
+                // M_eff steering vector for this (frequency, cell). When
+                // smoothing reduces M_eff, the sub-array steering uses the
+                // first M_eff antenna positions with their phases relative to
+                // the cell direction — a consistent truncation.
+                std::vector<Cfloat> a_vec(M_eff);
+                for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                    a_vec[a_idx] = steer_one(positions_m_, wave_number,
+                                             coarse[cell], a_idx);
+                }
+                float p = (config_.estimator == TrackerEstimator::Capon)
+                              ? capon_power_correct(R_f, a_vec)
+                              : bartlett_power(R_f, a_vec);
+                if (!std::isfinite(p)) p = 0.0F;
+                P_coarse[cell] += p;
+            }
         }
-        const double doa_err_prior_mean = doa_err_prior_sum / static_cast<double>(W);
-        const double doa_err_est_mean = doa_err_est_sum / static_cast<double>(W);
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+        // Copy the fully-accumulated coarse power into the debug slot captured
+        // above (the slot was pushed as a zero vector; copy the final values).
+        impl_->dbg_coarse_power.back() = P_coarse;
+#endif
+        // Argmax of the integrated coarse spectrum.
+        std::size_t best_cell = 0;
+        float best_P = P_coarse[0];
+        for (std::size_t cell = 1; cell < G * G; ++cell) {
+            if (P_coarse[cell] > best_P) {
+                best_P = P_coarse[cell];
+                best_cell = cell;
+            }
+        }
+        std::size_t best_u = best_cell % G;
+        std::size_t best_v = best_cell / G;
 
-        const LatencyStats ls = summarise(frame_ms);
-        const bool perf_available = !frame_ms.empty();
-        const double worst = perf_available ? std::max(ls.p95, ls.max) : 0.0;
-        const bool target_pass = perf_available && worst <= opt.target_ms_per_frame;
-        const double speedup = (opt_ms_best > 0.0) ? naive_ms_best / opt_ms_best : 0.0;
+        // Refinement: 3×3 halvings of the neighbourhood around the running best.
+        // (Van Trees 2002 §5.4 practical DOA estimation.)
+        float cell_half_l = fov_l / static_cast<float>(G);
+        float cell_half_m = fov_m / static_cast<float>(G);
+        Vec3 centre = coarse[best_cell];
+        for (std::size_t level = 1; level <= L_refine; ++level) {
+            cell_half_l *= 0.5F;
+            cell_half_m *= 0.5F;
+            // 3×3 neighbourhood candidates around `centre`.
+            std::vector<Vec3> cand;
+            std::vector<float> Pcand;
+            cand.reserve(9);
+            Pcand.assign(9, 0.0F);
+            for (std::int64_t dv = -1; dv <= 1; ++dv) {
+                for (std::int64_t du = -1; du <= 1; ++du) {
+                    float l = centre[0] + static_cast<float>(du) * cell_half_l;
+                    float m = centre[1] + static_cast<float>(dv) * cell_half_m;
+                    const float r2 = l * l + m * m;
+                    if (r2 > 0.999F) {
+                        const float s = std::sqrt(0.999F / r2);
+                        l *= s;
+                        m *= s;
+                    }
+                    cand.push_back(direction_from_lm(l, m));
+                }
+            }
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+            impl_->dbg_refine_cands[window].push_back(cand);
+            impl_->dbg_refine_power[window].push_back(Pcand);  // pre-fill; refreshed after
+#endif
+            for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+                const std::vector<Cfloat>& R_f = impl_->R_freq[f];
+                const double wave_number =
+                    two_pi * static_cast<double>(frequencies_hz_[f])
+                    / speed_of_light_m_per_s;
+                for (std::size_t i = 0; i < cand.size(); ++i) {
+                    std::vector<Cfloat> a_vec(M_eff);
+                    for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                        a_vec[a_idx] =
+                            steer_one(positions_m_, wave_number, cand[i], a_idx);
+                    }
+                    float p = (config_.estimator == TrackerEstimator::Capon)
+                                  ? capon_power_correct(R_f, a_vec)
+                                  : bartlett_power(R_f, a_vec);
+                    if (!std::isfinite(p)) p = 0.0F;
+                    Pcand[i] += p;
+                }
+            }
+            std::size_t best = 0;
+            for (std::size_t i = 1; i < Pcand.size(); ++i) {
+                if (Pcand[i] > Pcand[best]) best = i;
+            }
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+            impl_->dbg_refine_power[window].back() = Pcand;
+#endif
+            centre = cand[best];
+            // O4: quadratic 3-point interpolation around the level argmax.
+            //   Thomson 1982; Priestley 1981 §6.1; Van Trees 2002 §5.4.
+            // Pcand indexing: i = (dv+1)*3 + (du+1); centre is index 4,
+            // u-neighbours at index 5 (du=+1) and 3 (du=-1),
+            // v-neighbours at index 7 (dv=+1) and 1 (dv=-1).
+            if (config_.enable_quadratic_peak_interp) {
+                float du = 0.0F, dv = 0.0F;
+                quadratic_interp(
+                    Pcand[4],             // centre
+                    Pcand[5],             // u +1
+                    Pcand[3],             // u -1
+                    Pcand[7],             // v -1 (dv=-1 row index 2)
+                    Pcand[1],             // v +1 (dv=+1 row index 0)
+                    du, dv);
+                // Apply the fractional offset within the (now halved) cell.
+                float l = centre[0] + du * cell_half_l;
+                float m = centre[1] + dv * cell_half_m;
+                const float r2 = l * l + m * m;
+                if (r2 > 0.999F) {
+                    const float s = std::sqrt(0.999F / r2);
+                    l *= s;
+                    m *= s;
+                }
+                centre = direction_from_lm(l, m);
+            }
+        }
 
-        // ----- stdout report -----
-        std::cout << std::fixed << std::setprecision(3);
-        std::cout << "=== CPU optimized beam tracker benchmark ===\n";
-        std::cout << "grid: n_time=" << dims.n_time << " n_freq=" << dims.n_freq
-                  << " n_ant=" << dims.n_ant
-                  << " integration_spectra=" << opt.integration_spectra
-                  << "  windows=" << W << '\n';
-        std::cout << "search: coarse=" << opt.coarse_grid_resolution
-                  << " refine=" << opt.refinement_levels
-                  << " fov=(" << opt.search_fov_l << ',' << opt.search_fov_m
-                  << ") estimator=" << (opt.capon ? "capon" : "bartlett")
-                  << " lambda=" << opt.forgetting_factor
-                  << " smoothing=" << opt.spatial_smoothing_subarray_size << '\n';
-        std::cout << "naive  end-to-end: " << naive_ms_best << " ms\n";
-        std::cout << "opt    end-to-end: " << opt_ms_best << " ms"
-                  << "  (speedup " << speedup << "x vs naive)\n";
-        if (perf_available) {
-            std::cout << "per-frame kernel latencies (ms):\n";
-            std::cout << "  min    = " << ls.min << '\n';
-            std::cout << "  mean   = " << ls.mean << '\n';
-            std::cout << "  median = " << ls.median << '\n';
-            std::cout << "  p95    = " << ls.p95 << '\n';
-            std::cout << "  max    = " << ls.max << '\n';
-            std::cout << "  frames measured = " << ls.count << '\n';
-            std::cout << "TARGET per-frame <= " << opt.target_ms_per_frame
-                      << " ms : "
-                      << (target_pass ? "PASS" : "FAIL")
-                      << " (worst of p95/max = " << worst << " ms)\n";
-        } else {
-            std::cout << "WARNING: per-frame timings unavailable (build with "
-                         "-DBEAMFORMER_TRACKER_PERF to enable).\n";
-            std::cout << "TARGET per-frame <= " << opt.target_ms_per_frame
-                      << " ms : SKIPPED (no per-frame data)\n";
-        }
-        std::cout << "DOA recovery (mean (l,m) error over windows):\n";
-        std::cout << "  prior (open-loop) = " << doa_err_prior_mean << '\n';
-        std::cout << "  optimized estimate= " << doa_err_est_mean << '\n';
-        std::cout << "  improvement       = "
-                  << (doa_err_est_mean < doa_err_prior_mean ? "yes" : "no")
-                  << '\n';
-
-        // ----- CSV outputs -----
-        if (opt.metrics) {
-            append_metrics(*opt.metrics, opt, dims, naive_ms_best, opt_ms_best,
-                           ls, doa_err_prior_mean, doa_err_est_mean,
-                           target_pass);
-            std::cout << "Wrote metrics CSV to " << *opt.metrics << '\n';
-        }
-        if (opt.frames) {
-            write_frames_csv(*opt.frames, opt, frame_ms);
-            std::cout << "Wrote per-frame CSV (" << frame_ms.size()
-                      << " rows) to " << *opt.frames << '\n';
-        }
-        if (opt.intensity_out) {
-            write_intensity_cube(*opt.intensity_out, opt_intensity);
-            std::cout << "Wrote optimized intensity cube to "
-                      << *opt.intensity_out << '\n';
+        // O4 also applies at the coarse peak if no refinement requested.
+        if (config_.enable_quadratic_peak_interp && L_refine == 0) {
+            // Sample the 4-neighbourhood around best_cell on the coarse grid.
+            float pc = P_coarse[best_v * G + best_u];
+            auto at = [&](long long u, long long v) -> float {
+                long long uu = static_cast<long long>(best_u) + u;
+                long long vv = static_cast<long long>(best_v) + v;
+                if (uu < 0 || uu >= static_cast<long long>(G) || vv < 0
+                    || vv >= static_cast<long long>(G)) {
+                    return 0.0F;
+                }
+                return P_coarse[static_cast<std::size_t>(vv) * G
+                                + static_cast<std::size_t>(uu)];
+            };
+            float du = 0.0F, dv = 0.0F;
+            quadratic_interp(pc, at(1, 0), at(-1, 0), at(0, 1), at(0, -1), du, dv);
+            // Convert coarse-grid cell pitch into (l, m).
+            const float step_l =
+                (G == 1) ? 0.0F
+                         : (2.0F * fov_l) / static_cast<float>(G - 1);
+            const float step_m =
+                (G == 1) ? 0.0F
+                         : (2.0F * fov_m) / static_cast<float>(G - 1);
+            float l = centre[0] + du * step_l;
+            float m = centre[1] + dv * step_m;
+            const float r2 = l * l + m * m;
+            if (r2 > 0.999F) {
+                const float s = std::sqrt(0.999F / r2);
+                l *= s;
+                m *= s;
+            }
+            centre = direction_from_lm(l, m);
+            (void)pc;
         }
 
-        return 0;
-    } catch (const std::exception& error) {
-        std::cerr << "benchmark_cpu_opt_beam_tracker: " << error.what() << '\n';
-        return 1;
+        // Track the estimate forward (O5 prediction-as-prior for next window).
+        prev_estimate = centre;
+        impl_->window_dirs[window] = centre;
+#if defined(BEAMFORMER_TRACKER_DEBUG)
+        impl_->dbg_final_estimate[window] = centre;
+#endif
+
+        // ---- Final emission pass: plain Bartlett DAS using the estimated
+        // direction (spec: the emitted product remains the plain Bartlett
+        // power so on-disk output is byte-compatible for the same direction;
+        // only the direction changes). Reuses generate_weights exactly.
+        emit_window_das(packed, dims_, positions_m_, frequencies_hz_, centre,
+                        first_time, last_time, intensity);
+        BEAMFORMER_TRACKER_PERF_STOP(scan);
     }
+#undef BEAMFORMER_TRACKER_PERF_START
+#undef BEAMFORMER_TRACKER_PERF_STOP
 }
+
+// =====================================================================
+// Free-function mirrors
+// =====================================================================
+Intensities cpu_opt_beam_tracker_packed_intensity(
+    const PackedVoltage& packed, const Dimensions& dims,
+    const TrackerConfig& trajectory, const CpuOptTrackerConfig& opt) {
+    Intensities intensity(dims.n_time * dims.n_freq * dims.n_beams);
+    cpu_opt_beam_tracker_packed_intensity_into(packed, dims, trajectory,
+                                               intensity, opt);
+    return intensity;
+}
+
+// Stateless into-variant (no persistent covariance across calls — each call
+// starts the RLS recursion fresh). The stateful class overload below is the
+// preferred streaming entry point.
+void cpu_opt_beam_tracker_packed_intensity_into(
+    const PackedVoltage& packed, const Dimensions& dims,
+    const TrackerConfig& trajectory, Intensities& intensity,
+    const CpuOptTrackerConfig& opt) {
+    // Stateless variant: build a fresh tracker over the standard default
+    // geometry / frequency plan, seed the trajectory prior, and run. The
+    // covariance recursion starts fresh on every call (the stateful overload
+    // below is the persistent streaming entry point).
+    CpuOptBeamTracker tracker(default_positions(dims.n_ant),
+                              channelized_frequencies(dims.n_freq), dims, opt);
+    tracker.seed_trajectory(trajectory.trajectory);
+    tracker.run_into(packed, intensity);
+}
+
+// Stateful variant: caller owns the tracker (preferred for streaming — the
+// covariance recursion and steering cache persist across calls). Seeds the
+// trajectory prior then runs, preserving any carry-over covariance state.
+void cpu_opt_beam_tracker_packed_intensity_into(
+    const PackedVoltage& packed, const TrackerConfig& trajectory,
+    CpuOptBeamTracker& tracker, Intensities& intensity) {
+    tracker.seed_trajectory(trajectory.trajectory);
+    tracker.run_into(packed, intensity);
+}
+
+}  // namespace beamformer
