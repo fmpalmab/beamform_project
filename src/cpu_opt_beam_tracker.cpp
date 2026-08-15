@@ -591,10 +591,12 @@ inline void spatial_smoothed_covariance_into(
         }
         // Mirror the upper triangle into the strict lower triangle via the
         // Hermitian identity R_{c,r} = R_{r,c}*. The diagonal is already
-        // correct (and real). Walking c = r+1.. avoids touching the diagonal.
+        // correct (and real). For row r, column c with c < r: the upper entry
+        // is R[c][r] (column r > row c), and we write it into the lower entry
+        // R[r][c] = conj(R[c][r]).
         for (std::size_t r = 1; r < M_eff; ++r) {
             for (std::size_t c = 0; c < r; ++c) {
-                R_out[c * M_eff + r] = std::conj(R_out[r * M_eff + c]);
+                R_out[r * M_eff + c] = std::conj(R_out[c * M_eff + r]);
             }
         }
         return;
@@ -634,10 +636,12 @@ inline void spatial_smoothed_covariance_into(
             R_out[base + c] = acc;
         }
     }
-    // Mirror the upper triangle into the strict lower (R̃ is Hermitian).
+    // Mirror the populated upper triangle into the strict lower (R̃ is
+    // Hermitian): R[r][c] = conj(R[c][r]) for c < r, where R[c][r] (row c,
+    // column r with r > c) is the populated upper entry.
     for (std::size_t r = 1; r < M_eff; ++r) {
         for (std::size_t c = 0; c < r; ++c) {
-            R_out[c * M_eff + r] = std::conj(R_out[r * M_eff + c]);
+            R_out[r * M_eff + c] = std::conj(R_out[c * M_eff + r]);
         }
     }
     // Forward-backward: R̂ = 1/2 (R̃ + J R̃* J). J reverses indices. Fold in
