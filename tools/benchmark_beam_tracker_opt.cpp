@@ -53,6 +53,11 @@ struct Options {
     std::size_t integration_spectra = 320;
     std::size_t warmup_runs = 1;
     std::size_t repeat = 5;
+    // Explicit thread count for the opt path's OpenMP region. 0 = honour the
+    // process-wide OMP_NUM_THREADS (or the implementation default). A positive
+    // value calls omp_set_num_threads() before the timed runs so a single SLURM
+    // job can sweep thread counts without re-launching.
+    std::size_t threads = 0;
     // Source trajectory: slow drift within the FoV so the per-window direction
     // actually changes (exercising the per-window weight recompute hot path).
     float source_l0 = 0.0F;
@@ -105,6 +110,8 @@ void print_usage(const char* program) {
         << "  --integration-spectra N     default 320\n"
         << "  --warmup-runs N             default 1\n"
         << "  --repeat N                  median over repeats; default 5\n"
+        << "  --threads N                 opt-path OpenMP threads; 0 = honour\n"
+        << "                              OMP_NUM_THREADS / default. default 0\n"
         << "  --source-l0/m0/dl/dm F      default 0/0/1e-5/0\n"
         << "  --prior-l0/m0/dl/dm F       default 0/0/1e-5/0\n"
         << "  --outdir DIR                write summary CSV there\n";
@@ -127,8 +134,10 @@ Options parse_options(const int argc, char** argv) {
         } else if (a == "--warmup-runs") {
             o.warmup_runs =
                 parse_size(require_value(argc, argv, i), "--warmup-runs");
-        } else if (a == "--repeat") {
+       } else if (a == "--repeat") {
             o.repeat = parse_size(require_value(argc, argv, i), "--repeat");
+        } else if (a == "--threads") {
+            o.threads = parse_size(require_value(argc, argv, i), "--threads");
         } else if (a == "--source-l0") {
             o.source_l0 = parse_float(require_value(argc, argv, i), "--source-l0");
         } else if (a == "--source-m0") {
@@ -230,6 +239,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("[guard] naive == opt byte-equal: PASS (%zu cells)\n", naive.size());
+
+    // --- Thread count for the opt path ------------------------------------
+    // The naive tracker is serial; only the opt path uses OpenMP. An explicit
+    // positive --threads value overrides the process default here so a single
+    // SLURM job can sweep thread counts without re-exporting OMP_NUM_THREADS
+    // per launch.
+#ifdef _OPENMP
+    if (opts.threads > 0) {
+        omp_set_num_threads(static_cast<int>(opts.threads));
+    }
+#endif
 
     // --- Timing --------------------------------------------------------------
     // Time the naive path.
