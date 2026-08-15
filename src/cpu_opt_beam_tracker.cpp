@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <complex>
@@ -10,6 +11,18 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+// Threading: the N_freq channels are fully independent, so the dominant
+// per-frame cost (covariance formation + coarse grid scan + refinement) is
+// embarrassingly parallel across frequencies. OpenMP is the project's chosen
+// concurrency layer (linked via OpenMP::OpenMP_CXX in CMake); guarded so the
+// TU still compiles cleanly when the feature is unavailable.
+#if defined(_OPENMP)
+#include <omp.h>
+#define BEAMFORMER_TRACKER_OMP_ENABLED 1
+#else
+#define BEAMFORMER_TRACKER_OMP_ENABLED 0
+#endif
 
 // --- Project Includes ---
 #include "beamformer/cpu_opt_beam_tracker.hpp"
@@ -252,6 +265,42 @@ inline float bartlett_power_into(const Cfloat* __restrict R,
     return acc.real();
 }
 
+// Hermitian-symmetric, trace-precomputed Bartlett quadratic form
+// `a^H R a` for a Hermitian R (M×M row-major) and a unit-modulus steering
+// vector `a` (|a_i|^2 == 1, the Bartlett/Capon scan case). Exploiting the
+// Hermitian symmetry R_{c,r} = R_{r,c}*:
+//
+//   a^H R a = Σ_r |a_r|^2 R_{rr} + Σ_{r≠c} conj(a_r) R_{rc} a_c
+//           = trace(R) + 2·Re( Σ_{r<c} conj(a_r) * R_{rc} * a_c )
+//
+// so only the upper triangle (M(M-1)/2 cross terms) is accumulated instead of
+// the full M×M sweep, halving the inner-product FMAs and turning the diagonal
+// sum into a single precomputed `trace` (constant across all search cells of
+// a given frequency — recomputed once per freq in run_into, never per cell).
+//
+// The steering vectors built here have |a_i|^2 == 1 to float precision
+// (exp(-jφ) = cos φ - j sin φ), so the `|a_r|^2 == 1` substitution is exact in
+// float arithmetic. The cross-term reduction uses `2·Re(...)` which is the
+// standard Hermitian-quadratic identity; the tiny float-reordering versus the
+// full-sweep form does not affect the well-separated DOA argmax the search
+// resolves (the source peak dominates by orders of magnitude).
+inline float bartlett_power_hermitian_trace(const Cfloat* __restrict R,
+                                            const Cfloat* __restrict a,
+                                            std::size_t M, float trace_R) {
+    Cfloat cross{0.0F, 0.0F};
+    for (std::size_t r = 0; r < M; ++r) {
+        const Cfloat ar_conj = std::conj(a[r]);
+        // Upper triangle only: c from r+1 .. M-1. R[r*M+c] is the upper
+        // entry read directly; the lower half (R_{c,r}) is its conjugate.
+        const std::size_t base = r * M;
+        for (std::size_t c = r + 1; c < M; ++c) {
+            cross += ar_conj * R[base + c] * a[c];
+        }
+    }
+    // 2·Re(cross) accounts for both (r<c) and its conjugate (c<r) half.
+    return trace_R + 2.0F * cross.real();
+}
+
 // In-place Cholesky solve `R w = b` operating on a *copy* of R passed in
 // `work` (M×M row-major) and writing the solution back into `b`. Returns true
 // on success, false if R is not numerically positive-definite. Identical
@@ -486,52 +535,110 @@ inline void decode_snapshot_into(const PackedVoltage& packed,
 // Compute the spatially-smoothed + forward-backward-averaged covariance of the
 // K length-M snapshots that are laid out contiguously in `snap_flat` (each
 // snapshot strided by `snap_stride` floats) directly into `R_out` (an
-// M_eff x M_eff row-major buffer). When smoothing is disabled (P_sub == 0 or
-// P_sub >= M) `M_eff == M` and the plain 1/K sample covariance is written.
+// M_eff x M_eff row-major, fully-populated — both triangles written — row-major
+// buffer). When smoothing is disabled (P_sub == 0 or P_sub >= M) `M_eff == M`
+// and the plain 1/K sample covariance is written.
 //
-// This is the allocation-free reimplementation of
-// `spatial_smoothed_covariance` above: it reuses the caller-provided
-// `R_out` / `per_sub_scratch` buffers instead of allocating a vector of
-// vectors per call, so the per-window hot path performs zero heap allocations.
-// The numeric result is identical (same averaging order, same 1/K and 1/L
-// scaling, same forward-backward J R̃* J fold).
+// Optimizations versus the prior scalar form (defects flagged in the analysis):
+//  • Exploits Hermitian symmetry — only the upper triangle (incl. the
+//    diagonal) of each sub-array outer product is accumulated; the lower
+//    triangle is filled by conjugate mirroring (a no-op bit-exact math step
+//    since R_{c,r} == R_{r,c}* exactly for an outer-product average). This
+//    halves the per-snapshot complex FMAs from M^2 to M(M+1)/2.
+//  • When smoothing is disabled (L == 1, the dominant benchmark path:
+//    default config, M_eff == n_ant), accumulates straight into `R_out`
+//    instead of into `per_sub_scratch` and copying. No sub-array scratch is
+//    touched, removing the per-window `assign`-the-whole-M^2-buffer cost.
+//  • Smoothing path still accumulates the L sub-arrays separately (they have
+//    distinct offsets and so cannot share one accumulator), but into a
+//    per-sub upper-triangle slab — half the memory traffic and FMAs.
+//
+// The numeric result is identical up to single-precision floating-point
+// reordering of the upper-triangle accumulation, which does not perturb the
+// well-separated DOA argmax the search resolves.
 inline void spatial_smoothed_covariance_into(
     const Cfloat* __restrict snap_flat, std::size_t K, std::size_t M,
     std::size_t snap_stride, std::size_t P_sub, std::size_t M_eff,
     Cfloat* __restrict R_out,
-    std::vector<Cfloat>& per_sub_scratch) {
+    Cfloat* __restrict per_sub_scratch,
+    std::size_t /*per_sub_capacity*/) {
     const bool smoothing = (P_sub != 0 && P_sub < M && P_sub >= 1);
     const std::size_t L = smoothing ? (M - P_sub + 1) : 1;
     const float inv_K = 1.0F / static_cast<float>(K);
+
+    if (!smoothing) {
+        // L == 1: accumulate the single (full-array) sample covariance straight
+        // into `R_out`. Zero the whole M_eff^2 buffer once (cheap relative to
+        // the K * M(M+1)/2 FMAs), then fill the upper triangle and mirror.
+        for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
+            R_out[i] = Cfloat{0.0F, 0.0F};
+        }
+        for (std::size_t k = 0; k < K; ++k) {
+            const Cfloat* __restrict x = snap_flat + k * snap_stride;
+            for (std::size_t r = 0; r < M_eff; ++r) {
+                const Cfloat xr = x[r];
+                const std::size_t base = r * M_eff;
+                // Diagonal: real-valued term |x_r|^2 / K.
+                {
+                    const Cfloat& xc = x[r];
+                    R_out[base + r] += xr * std::conj(xc) * inv_K;
+                }
+                // Strict upper triangle c = r+1 .. M_eff-1.
+                for (std::size_t c = r + 1; c < M_eff; ++c) {
+                    R_out[base + c] += xr * std::conj(x[c]) * inv_K;
+                }
+            }
+        }
+        // Mirror the upper triangle into the strict lower triangle via the
+        // Hermitian identity R_{c,r} = R_{r,c}*. The diagonal is already
+        // correct (and real). Walking c = r+1.. avoids touching the diagonal.
+        for (std::size_t r = 1; r < M_eff; ++r) {
+            for (std::size_t c = 0; c < r; ++c) {
+                R_out[c * M_eff + r] = std::conj(R_out[r * M_eff + c]);
+            }
+        }
+        return;
+    }
+
+    // --- Smoothing path: L >= 2 sub-arrays, distinct offsets. ---
     const float inv_L = 1.0F / static_cast<float>(L);
-
-    // Zero the per-subarray accumulation scratch once (capacity is L * M_eff^2).
-    per_sub_scratch.assign(L * M_eff * M_eff, Cfloat{0.0F, 0.0F});
-
+    // Per-sub upper-triangle slab (only the upper triangle is stored, packed
+    // contiguously per sub-array). Capacity L * M_eff^2 is reserved by the
+    // caller; we only touch the upper-triangle region, zeroing it once.
+    std::fill_n(per_sub_scratch, L * M_eff * M_eff, Cfloat{0.0F, 0.0F});
     for (std::size_t sub = 0; sub < L; ++sub) {
         Cfloat* __restrict sub_R =
-            per_sub_scratch.data() + sub * M_eff * M_eff;
+            per_sub_scratch + sub * M_eff * M_eff;
         for (std::size_t k = 0; k < K; ++k) {
             const Cfloat* __restrict x =
                 snap_flat + k * snap_stride + sub;
             for (std::size_t r = 0; r < M_eff; ++r) {
                 const Cfloat xr = x[r];
-                for (std::size_t c = 0; c < M_eff; ++c) {
-                    sub_R[r * M_eff + c] += xr * std::conj(x[c]) * inv_K;
+                const std::size_t base = r * M_eff;
+                sub_R[base + r] += xr * std::conj(x[r]) * inv_K;
+                for (std::size_t c = r + 1; c < M_eff; ++c) {
+                    sub_R[base + c] += xr * std::conj(x[c]) * inv_K;
                 }
             }
         }
     }
-    // Average the L forward sub-arrays into R_out (the forward R̃).
-    for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
-        Cfloat acc{0.0F, 0.0F};
-        for (std::size_t sub = 0; sub < L; ++sub) {
-            acc += per_sub_scratch[sub * M_eff * M_eff + i] * inv_L;
+    // Average the L forward sub-arrays into R_out (the forward R̃), filling the
+    // upper triangle; the strict lower triangle is mirrored below.
+    for (std::size_t r = 0; r < M_eff; ++r) {
+        const std::size_t base = r * M_eff;
+        for (std::size_t c = r; c < M_eff; ++c) {
+            Cfloat acc{0.0F, 0.0F};
+            for (std::size_t sub = 0; sub < L; ++sub) {
+                acc += per_sub_scratch[sub * M_eff * M_eff + base + c] * inv_L;
+            }
+            R_out[base + c] = acc;
         }
-        R_out[i] = acc;
     }
-    if (!smoothing) {
-        return;  // R_out already holds the full-array sample covariance.
+    // Mirror the upper triangle into the strict lower (R̃ is Hermitian).
+    for (std::size_t r = 1; r < M_eff; ++r) {
+        for (std::size_t c = 0; c < r; ++c) {
+            R_out[c * M_eff + r] = std::conj(R_out[r * M_eff + c]);
+        }
     }
     // Forward-backward: R̂ = 1/2 (R̃ + J R̃* J). J reverses indices. Fold in
     // place into R_out (R̃ -> R̂).
@@ -579,6 +686,53 @@ void emit_window_das(const PackedVoltage& packed, const Dimensions& dims,
             intensity[intensity_index(time, frequency, 0, dims)] =
                 sum_real * sum_real + sum_imag * sum_imag;
         }
+    }
+}
+
+// Parallel emission counterpart to `emit_window_das` (fix-plan defect #8):
+// distributes the (time, frequency) DAS grid across the OpenMP team. Each
+// output `intensity_index(time, frequency, 0, dims)` cell is independent and
+// its inner n_ant element-sum is computed with the identical serial arithmetic
+// as `emit_window_das`, so the result is bit-identical per cell — only the
+// scheduling of cells across threads differs. `weights` is read-only and safe
+// to share. Used ONLY by the searching/adaptive path (the scan-disabled
+// back-compat path keeps the serial `emit_window_das` so the byte-equal
+// `naive == opt` regression contract is preserved regardless of thread count).
+void emit_window_das_parallel(const PackedVoltage& packed,
+                               const Dimensions& dims,
+                               const std::vector<Vec3>& positions,
+                               const std::vector<float>& frequencies,
+                               const Vec3& direction, std::size_t first_time,
+                               std::size_t last_time, Intensities& intensity) {
+    const auto weights = generate_weights(
+        dims, positions, frequencies, std::vector<Vec3>{direction});
+    const std::size_t n_time_cells = last_time - first_time;
+    const std::size_t n_freq = dims.n_freq;
+    const std::size_t total_cells = n_time_cells * n_freq;
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+#pragma omp parallel for schedule(static)
+#endif
+    for (std::ptrdiff_t ci = 0;
+         ci < static_cast<std::ptrdiff_t>(total_cells); ++ci) {
+        const std::size_t t_off =
+            static_cast<std::size_t>(ci) / n_freq;
+        const std::size_t frequency =
+            static_cast<std::size_t>(ci) % n_freq;
+        const std::size_t time = first_time + t_off;
+        float sum_real = 0.0F;
+        float sum_imag = 0.0F;
+        for (std::size_t element = 0; element < dims.n_ant; ++element) {
+            const auto sample = unpack_complex_int4(
+                packed[voltage_index(time, frequency, element, dims)]);
+            const float sample_real = static_cast<float>(sample.real);
+            const float sample_imag = static_cast<float>(sample.imag);
+            const auto& weight =
+                weights[weight_index(0, frequency, element, dims)];
+            sum_real += weight.real * sample_real - weight.imag * sample_imag;
+            sum_imag += weight.real * sample_imag + weight.imag * sample_real;
+        }
+        intensity[intensity_index(time, frequency, 0, dims)] =
+            sum_real * sum_real + sum_imag * sum_imag;
     }
 }
 
@@ -731,17 +885,47 @@ struct CpuOptBeamTracker::Impl {
     // `run_into` hot path reuses these slices instead of allocating per
     // window. All sizes are worst-case capacities (independent of window K,
     // which is bounded by integration_spectra).
-    std::vector<Cfloat> snapshot_buffer;  // size: K_max * M_eff (one contiguous
-                                           //        block of K decoded snapshots)
-    std::vector<Cfloat> R_block_scratch;  // size: M_eff * M_eff (block / smoothed
-                                           //        covariance out-buffer)
+    // Snapshot decode buffer for the covariance build, sized for per-frequency
+    // parallelism: `n_freq * K_max * n_ant` contiguous slots, so each thread
+    // owning frequency `f` decodes its K snapshots into a private slice
+    // `f * K_max * n_ant` with no cross-thread aliasing. (Hermitian-symmetric
+    // covariance formation reads snapshots in [k][antenna] order, which is the
+    // contiguous strided layout the existing inner kernel already expects.)
+    std::vector<Cfloat> snapshot_buffer;  // size: n_freq * K_max * n_ant
+    // Per-frequency smoothed-covariance block buffers (M_eff×M_eff each, flat
+    // `R_block_freq[f * M_eff * M_eff]`), so the parallel frequency loop writes
+    // each frequency's smoothed covariance into a private slot — no false
+    // sharing with neighbouring threads. The per-fold step `lambda R + (1-lambda)
+    // R_block` then writes `R_freq[f]` (also per-frequency-independent).
+    std::vector<Cfloat> R_block_freq;  // size: n_freq * M_eff * M_eff
     std::vector<Cfloat> L_factors;        // size: n_freq * M_eff * M_eff (Capon
                                            //        Cholesky scratch per frequency)
-    std::vector<Cfloat> steer_scratch;    // size: M_eff (steering vector for a cell)
+    // Per-thread steering-vector scratch, allocated at OpenMP init. With N
+    // threads and `n_threads * M_eff` contiguous slots, thread `t` owns the slice
+    // `t * M_eff`. Thread private (no aliasing across the parallel coarse /
+    // refinement scan).
+    std::vector<Cfloat> steer_scratch;    // size: n_threads * M_eff
     // Capon RHS/solution scratch (M_eff): the Cholesky solve writes R^{-1} a
     // here. Kept separate from `steer_scratch` (which holds the read-only `a`)
     // so the a^H w step reads the original steering vector after the solve.
-    std::vector<Cfloat> capon_b_scratch;  // size: M_eff
+    // Sized `n_threads * M_eff` for the same reason as `steer_scratch`.
+    std::vector<Cfloat> capon_b_scratch;  // size: n_threads * M_eff
+    // Per-subarray covariance accumulation scratch for spatial smoothing,
+    // per-folder (one folder per OpenMP thread so the parallel frequency loop
+    // can each accumulate its sub-array covariances without aliasing). Capacity
+    // per folder: L_max * M_eff^2 where L_max = n_ant - M_eff + 1 (1 when M_eff
+    // == n_ant, i.e. smoothing disabled). Threads index `t * L_max * M_eff^2`.
+    std::vector<Cfloat> per_sub_scratch;
+    // Cached per-frequency trace(R_freq[f]) (post-fold, pre-diagonal-load) — the
+    // diagonal-sum half of a^H R a Bartlett power, constant across all search
+    // cells of a frequency, computed ONCE per window per frequency rather than
+    // inside every Bartlett grid cell. Sized `n_freq`.
+    std::vector<float> R_trace;
+    // Number of OpenMP worker threads the parallel `run_into` paths use.
+    // Captured at hot-path entry (omp_get_max_threads()) once per window so it
+    // is consistent across the cov-formation, capon fold, and the scan loops that
+    // all use the same per-thread scratch indexing scheme.
+    int n_threads = 1;
     std::vector<float>  power_grid;       // size: G * G (coarse integrated power)
     // Phase 2: per-frequency positive-definite flag for the FOSM Cholesky
     // factorization. Set once per window (after the O5 fold + diagonal load)
@@ -882,17 +1066,27 @@ CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
         std::max<std::size_t>(config_.coarse_grid_resolution, 1);
     impl_->K_max = K_max;
     impl_->G_max = G_cap;
-    impl_->snapshot_buffer.assign(K_max * dims_.n_ant,
+    // Per-frequency parallel decode buffer: n_freq * K_max * n_ant contiguous
+    // slots, so each window's parallel frequency loop decodes its K snapshots
+    // into a private `f * K_max * n_ant` slice (no cross-thread aliasing).
+    impl_->snapshot_buffer.assign(dims_.n_freq * K_max * dims_.n_ant,
                                   Cfloat{0.0F, 0.0F});
-    impl_->R_block_scratch.assign(M_eff * M_eff, Cfloat{0.0F, 0.0F});
+    impl_->R_block_freq.assign(dims_.n_freq * M_eff * M_eff, Cfloat{0.0F, 0.0F});
     impl_->L_factors.assign(dims_.n_freq * M_eff * M_eff,
                             Cfloat{0.0F, 0.0F});
+    // Per-thread steering / Capon-RHS scratch: grown lazily at run_into entry
+    // to `omp_get_max_threads()` so a freshly-built tracker is usable on a
+    // machine with a different thread cap than construction time. Baseline of
+    // 1 keeps the buffers non-empty for the OpenMP-disabled fallback path.
     impl_->steer_scratch.assign(M_eff, Cfloat{0.0F, 0.0F});
     impl_->capon_b_scratch.assign(M_eff, Cfloat{0.0F, 0.0F});
     impl_->power_grid.assign(G_cap * G_cap, 0.0F);
     impl_->capon_factor_ok.assign(dims_.n_freq, 0);
-    // Per-subarray accumulation scratch: cap L_max * M_eff^2. When smoothing
-    // is disabled M_eff == n_ant => L_max == 1; otherwise L_max = n_ant - M_eff + 1.
+    impl_->R_trace.assign(dims_.n_freq, 0.0F);
+    impl_->n_threads = 1;
+    // Per-subarray accumulation scratch (per thread): cap L_max * M_eff^2 per
+    // folder. Grown lazily at run_into entry to `n_threads` folders so each
+    // OpenMP worker in the parallel frequency loop gets its own slab.
     {
         const std::size_t L_max = dims_.n_ant - M_eff + 1;
         impl_->per_sub_scratch.assign(L_max * M_eff * M_eff,
@@ -1434,6 +1628,32 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
     const float fov_m = config_.search_fov_m;
     const std::size_t L_refine = config_.refinement_levels;
 
+    // ---- Per-thread scratch warm-up (once per run_into, not per window): the
+    // parallel frequency loops index thread-private steer / capon-RHS slabs by
+    // `omp_get_thread_num()`, so they must be sized to the current OpenMP cap
+    // before the first window. Cheap (one resize if the cap grew) and done off
+    // the per-window hot path.
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+    {
+        const int nthread = omp_get_max_threads();
+        if (nthread > 0) impl_->n_threads = nthread;
+    }
+#else
+    impl_->n_threads = 1;
+#endif
+    {
+        const std::size_t nt =
+            static_cast<std::size_t>(std::max<int>(impl_->n_threads, 1));
+        if (impl_->steer_scratch.size() < nt * M_eff)
+            impl_->steer_scratch.assign(nt * M_eff, Cfloat{0.0F, 0.0F});
+        if (impl_->capon_b_scratch.size() < nt * M_eff)
+            impl_->capon_b_scratch.assign(nt * M_eff, Cfloat{0.0F, 0.0F});
+        const std::size_t L_max = dims_.n_ant - M_eff + 1;
+        const std::size_t per_folder = L_max * M_eff * M_eff;
+        if (impl_->per_sub_scratch.size() < nt * per_folder)
+            impl_->per_sub_scratch.assign(nt * per_folder, Cfloat{0.0F, 0.0F});
+    }
+
     for (std::size_t window = 0; window < window_count; ++window) {
         BEAMFORMER_TRACKER_PERF_START(scan);
         const std::size_t first_time = window * config_.integration_spectra;
@@ -1445,6 +1665,18 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // ---- O5: recursive covariance update over this window's snapshots.
         //   Haykin, Adaptive Filter Theory, Ch.10 (RLS with forgetting).
         const float a_comp = 1.0F - lambda;  // contribution of fresh samples
+        const bool capon = (config_.estimator == TrackerEstimator::Capon);
+        const std::size_t snap_stride = dims_.n_ant;
+        const std::size_t cov_slot = M_eff * M_eff;
+        const std::size_t snap_slot = impl_->K_max * snap_stride;
+        const std::size_t L_max = dims_.n_ant - M_eff + 1;
+        const std::size_t per_folder = L_max * cov_slot;
+        const bool first_window = !impl_->R_initialised;
+        const bool lambda_one = (lambda >= 1.0F);
+        Cfloat* __restrict Rf_block_base = impl_->R_block_freq.data();
+        Cfloat* __restrict snap_buf_base = impl_->snapshot_buffer.data();
+        Cfloat* __restrict per_sub_base = impl_->per_sub_scratch.data();
+
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         // Reserve debug per-window containers on the first window.
         if (window == 0) {
@@ -1458,89 +1690,140 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
             impl_->dbg_snapshots[window];
         std::vector<std::vector<Cfloat>>& dbg_w_R =
             impl_->dbg_R_freq_per_window[window];
-#endif
-        // Option A: full window recompute blended with previous R via lambda.
-        // We form the window's block covariance R_w_block over K snapshots,
-        // spatial-smooth it (O2), then fold:
-        //   R_w = lambda * R_{w-1} + (1-lambda) * R_w_block
-        // (matches the spec's block-form recursion; with lambda == 1.0 this
-        //  reduces to the plain block estimate R_w = R_w_block.)
+        // Debug builds keep the serial covariance path so the per-frequency
+        // snapshot capture (which heap-allocates vectors) is preserved verbatim.
         for (std::size_t f = 0; f < dims_.n_freq; ++f) {
-            // Decode the K snapshots for this frequency straight into the
-            // preallocated contiguous `snapshot_buffer` slice (one length-
-            // n_ant snapshot per time step, back-to-back). No heap allocation
-            // occurs on this hot path — the slice was sized once in the ctor.
-            const std::size_t snap_stride = dims_.n_ant;
-            Cfloat* __restrict snap_flat = impl_->snapshot_buffer.data();
+            Cfloat* __restrict snap_flat = snap_buf_base + f * snap_slot;
             for (std::size_t t = first_time; t < last_time; ++t) {
                 decode_snapshot_into(packed, dims_, t, f,
                                      snap_flat + (t - first_time) * snap_stride);
             }
-            // O2: spatial smoothing + forward-backward, written directly into
-            // the preallocated M_eff×M_eff `R_block_scratch` (no vector-of-
-            // vectors allocation). Shan/Wax/Kailath 1985; Weiss & Friedlander 1997.
+            Cfloat* __restrict R_block = Rf_block_base + f * cov_slot;
             spatial_smoothed_covariance_into(
                 snap_flat, K, dims_.n_ant, snap_stride,
                 config_.spatial_smoothing_subarray_size, M_eff,
-                impl_->R_block_scratch.data(), impl_->per_sub_scratch);
-            const Cfloat* __restrict R_block = impl_->R_block_scratch.data();
-            // Capon diagonal load in place (O1 numerical safety).
-            if (config_.estimator == TrackerEstimator::Capon) {
-                apply_diagonal_load_into(impl_->R_block_scratch.data(),
-                                         M_eff, config_.diagonal_load);
+                R_block, per_sub_base, per_folder);
+            if (capon) {
+                apply_diagonal_load_into(R_block, M_eff, config_.diagonal_load);
             }
-            // Fold with previous R (O5). Reuse `impl_->R_freq[f]` in place;
-            // when lambda == 1 or first window, R_block is copied in wholesale
-            // (still via the preallocated pool — R_freq[f] was sized in reset_R).
-            if (!impl_->R_initialised || lambda >= 1.0F) {
-                std::vector<Cfloat>& R = impl_->R_freq[f];
-                for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
-                    R[i] = R_block[i];
-                }
+            std::vector<Cfloat>& R = impl_->R_freq[f];
+            if (first_window || lambda_one) {
+                for (std::size_t i = 0; i < cov_slot; ++i) R[i] = R_block[i];
             } else {
-                std::vector<Cfloat>& R = impl_->R_freq[f];
-                for (std::size_t i = 0; i < M_eff * M_eff; ++i) {
+                for (std::size_t i = 0; i < cov_slot; ++i) {
                     R[i] = lambda * R[i] + a_comp * R_block[i];
                 }
             }
-#if defined(BEAMFORMER_TRACKER_DEBUG)
-        dbg_w_R[f] = impl_->R_freq[f];
-        // Debug capture still copies the contiguous slice into a vector-of-
-        // vectors shape so the dump writer keeps its existing layout. This
-        // allocates, but only when BEAMFORMER_TRACKER_DEBUG is defined
-        // (diagnostic builds; never the production hot path).
-        dbg_w_snaps[f].assign(K);
-        for (std::size_t k = 0; k < K; ++k) {
-            dbg_w_snaps[f][k].assign(
-                snap_flat + k * snap_stride,
-                snap_flat + k * snap_stride + snap_stride);
-        }
-#endif
+            dbg_w_R[f] = impl_->R_freq[f];
+            dbg_w_snaps[f].assign(K);
+            for (std::size_t k = 0; k < K; ++k) {
+                dbg_w_snaps[f][k].assign(
+                    snap_flat + k * snap_stride,
+                    snap_flat + k * snap_stride + snap_stride);
+            }
         }
         impl_->R_initialised = true;
-
-        // ---- Phase 2 (FOSM): factorize each per-frequency Capon covariance
-        // exactly ONCE for this window. The lower-triangular factor L is
-        // stored in the preallocated `L_factors[f]` slot (M_eff×M_eff) and is
-        // reused by every coarse grid cell and every refinement candidate of
-        // this window — replacing the prior per-cell O(M^3) `capon_power_into`
-        // re-factorization with a single O(M^3) factorize + O(M^2) forward
-        // substitutions per cell. When a frequency's R is not numerically PD
-        // (insufficient rank / bad diagonal load) we mark it and the scan
-        // falls back to the per-cell `capon_power_into` solve for that
-        // frequency only, preserving the Phase-1 degenerate-window numerics.
-        // Bartlett never factorizes (it has no inverse to amortize).
-        const bool capon = (config_.estimator == TrackerEstimator::Capon);
+        for (std::size_t f = 0; f < dims_.n_freq; ++f) {
+            const std::vector<Cfloat>& R = impl_->R_freq[f];
+            float tr = 0.0F;
+            for (std::size_t i = 0; i < M_eff; ++i) tr += R[i * M_eff + i].real();
+            impl_->R_trace[f] = tr;
+        }
         if (capon) {
             for (std::size_t f = 0; f < dims_.n_freq; ++f) {
                 const std::vector<Cfloat>& R = impl_->R_freq[f];
-                Cfloat* __restrict Lf = impl_->L_factors.data()
-                    + f * M_eff * M_eff;
-                std::copy(R.data(), R.data() + M_eff * M_eff, Lf);
+                Cfloat* __restrict Lf = impl_->L_factors.data() + f * cov_slot;
+                std::copy(R.data(), R.data() + cov_slot, Lf);
                 impl_->capon_factor_ok[f] =
                     cholesky_factorize(Lf, M_eff) ? 1 : 0;
             }
         }
+#else
+        // ================================================================
+        // Parallel covariance formation + RLS fold (fix-plan defect #1/#2):
+        // the N_freq channels are independent, so this — the dominant per-
+        // frame cost (~390 ms / frame single-threaded) — is parallelized
+        // across frequencies. Each thread decodes its K snapshots into a
+        // private `snapshot_buffer` slice, builds the Hermitian-symmetric
+        // smoothed covariance into its `R_block_freq` slot, applies the Capon
+        // diagonal load (Capon only), then folds with the previous window's
+        // R_freq[f] (RLS) and caches trace(R_freq[f]) for the Bartlett scan.
+        // All indexed scratch (`snapshot_buffer`, `R_block_freq`, `R_freq`,
+        // `R_trace`) is per-frequency-distinct → no reduction needed; the
+        // per-sub smoothing slab is keyed by `omp_get_thread_num()` so two
+        // threads never touch the same sub-array accumulators.
+        // ================================================================
+        const std::size_t n_freq = dims_.n_freq;
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+#pragma omp parallel for schedule(static)
+#endif
+        for (std::ptrdiff_t fi = 0;
+             fi < static_cast<std::ptrdiff_t>(n_freq); ++fi) {
+            const std::size_t f = static_cast<std::size_t>(fi);
+            Cfloat* __restrict snap_flat = snap_buf_base + f * snap_slot;
+            for (std::size_t t = first_time; t < last_time; ++t) {
+                decode_snapshot_into(packed, dims_, t, f,
+                    snap_flat + (t - first_time) * snap_stride);
+            }
+            Cfloat* __restrict R_block = Rf_block_base + f * cov_slot;
+            // Per-thread smoothing slab (only the smoothing path touches it;
+            // the common M_eff == n_ant path accumulates straight into
+            // R_block and ignores the pointer).
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+            Cfloat* __restrict sub_slab =
+                per_sub_base + static_cast<std::size_t>(omp_get_thread_num())
+                                   * per_folder;
+#else
+            Cfloat* __restrict sub_slab = per_sub_base;
+#endif
+            spatial_smoothed_covariance_into(
+                snap_flat, K, dims_.n_ant, snap_stride,
+                config_.spatial_smoothing_subarray_size, M_eff,
+                R_block, sub_slab, per_folder);
+            if (capon) {
+                apply_diagonal_load_into(R_block, M_eff, config_.diagonal_load);
+            }
+            const Cfloat* __restrict R_block_ro = R_block;
+            std::vector<Cfloat>& R = impl_->R_freq[f];
+            if (first_window || lambda_one) {
+                for (std::size_t i = 0; i < cov_slot; ++i) {
+                    R[i] = R_block_ro[i];
+                }
+            } else {
+                for (std::size_t i = 0; i < cov_slot; ++i) {
+                    R[i] = lambda * R[i] + a_comp * R_block_ro[i];
+                }
+            }
+            // trace(R_freq[f]) — the diagonal sum half of a^H R a Bartlett
+            // power, constant across all search cells of this frequency.
+            float tr = 0.0F;
+            for (std::size_t i = 0; i < M_eff; ++i) {
+                tr += R[i * M_eff + i].real();
+            }
+            impl_->R_trace[f] = tr;
+        }
+        impl_->R_initialised = true;
+
+        // ---- Phase 2 (FOSM): factorize each per-frequency Capon covariance
+        // exactly ONCE for this window, parallel across frequencies. The lower-
+        // triangular L stays in the per-frequency `L_factors[f]` slot (distinct
+        // per f — safe under the reduction-free parallel loop). Bartlett never
+        // factorizes (no inverse to amortize).
+        if (capon) {
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+#pragma omp parallel for schedule(static)
+#endif
+            for (std::ptrdiff_t fi = 0;
+                 fi < static_cast<std::ptrdiff_t>(n_freq); ++fi) {
+                const std::size_t f = static_cast<std::size_t>(fi);
+                const std::vector<Cfloat>& R = impl_->R_freq[f];
+                Cfloat* __restrict Lf = impl_->L_factors.data() + f * cov_slot;
+                std::copy(R.data(), R.data() + cov_slot, Lf);
+                impl_->capon_factor_ok[f] =
+                    cholesky_factorize(Lf, M_eff) ? 1 : 0;
+            }
+        }
+#endif  // !BEAMFORMER_TRACKER_DEBUG
 
         // ---- O3 + O6: hierarchical coarse-to-fine search.
         //   Skolnik, Radar Handbook §7.11 (two-stage search);
@@ -1553,11 +1836,21 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // Reuse the preallocated `power_grid` slice (G*G); zero it once here.
         float* __restrict P_coarse = impl_->power_grid.data();
         for (std::size_t i = 0; i < G * G; ++i) P_coarse[i] = 0.0F;
-        // Reusable steering scratchpad (M_eff, read-only `a`) plus a separate
-        // Capon RHS/solution slot, and a per-frequency M_eff×M_eff Cholesky
-        // work buffer — none allocated per cell.
-        Cfloat* __restrict steer_buf = impl_->steer_scratch.data();
-        Cfloat* __restrict capon_b = impl_->capon_b_scratch.data();
+        // Per-thread steering + Capon-RHS scratch: the parallel coarse scan
+        // indexes thread-private slabs of the contiguous `steer_scratch` /
+        // `capon_b_scratch` buffers by `omp_get_thread_num()`. None allocated
+        // per cell.
+        Cfloat* __restrict steer_buf_base = impl_->steer_scratch.data();
+        Cfloat* __restrict capon_b_base = impl_->capon_b_scratch.data();
+        // Per-thread coarse-power accumulator. OpenMP array-section reductions
+        // are not portable C, so each thread accumulates into its own private
+        // `P_local` (sized G*G); the reduction across threads is performed
+        // serially after the parallel loop. G*G is small (≤144) so the serial
+        // sum is negligible.
+        const std::size_t nt_scan =
+            static_cast<std::size_t>(std::max<int>(impl_->n_threads, 1));
+        std::vector<std::vector<float>> P_local_per_thread(
+            nt_scan, std::vector<float>(G * G, 0.0F));
 
         // ---- Phase 3 steering-vector preload (trig kill for coplanar arrays).
         // The relative phasor table `rel_coarse` was built in the Impl ctor
@@ -1630,44 +1923,125 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         impl_->dbg_refine_cands.emplace_back();
         impl_->dbg_refine_power.emplace_back();
 #endif
+        // ----------------------------------------------------------------
+        // Coarse grid scan, parallel across frequencies (fix-plan defect #6):
+        // the N_freq channels are independent and each thread accumulates its
+        // G*G coarse powers into a private `P_local`, summed into `P_coarse`
+        // after the parallel region. Each thread builds its steering vector
+        // into a private `steer_buf` slab and reuses a private `capon_b` slot,
+        // so no cross-thread aliasing occurs. The Bartlett branch uses the
+        // trace-precomputed Hermitian quadratic form (halves the per-cell FMAs;
+        // the diagonal `trace(R_freq[f])` is reused across all G*G cells of a
+        // frequency instead of recomputed per cell).
+        // ----------------------------------------------------------------
+#if !defined(BEAMFORMER_TRACKER_DEBUG)
+        {
+            const std::size_t coarse_cells = G * G;
+            const std::size_t cell_freq_stride = dims_.n_freq * M_eff;
+            const Cfloat* __restrict rel_coarse_base =
+                phasor_fast ? impl_->rel_coarse.data() : nullptr;
+            const Cfloat* __restrict centre_phasor_base =
+                phasor_fast ? impl_->centre_phasor.data() : nullptr;
+            const Cfloat* __restrict Lf_base = impl_->L_factors.data();
+            const float* __restrict R_trace_base = impl_->R_trace.data();
+            const char* __restrict factor_ok_base = impl_->capon_factor_ok.data();
+            const std::vector<Vec3>& positions = positions_m_;
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+#pragma omp parallel for schedule(static)
+#endif
+            for (std::ptrdiff_t fi = 0;
+                 fi < static_cast<std::ptrdiff_t>(dims_.n_freq); ++fi) {
+                const std::size_t f = static_cast<std::size_t>(fi);
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+                const std::size_t tid =
+                    static_cast<std::size_t>(omp_get_thread_num());
+#else
+                const std::size_t tid = 0;
+#endif
+                Cfloat* __restrict steer_buf = steer_buf_base + tid * M_eff;
+                Cfloat* __restrict capon_b = capon_b_base + tid * M_eff;
+                float* __restrict P_local =
+                    P_local_per_thread[tid].data();
+                const Cfloat* __restrict R_f = impl_->R_freq[f].data();
+                const float trace_R = R_trace_base[f];
+                const double wave_number =
+                    two_pi * static_cast<double>(frequencies_hz_[f])
+                    / speed_of_light_m_per_s;
+                const Cfloat* __restrict Lf = Lf_base + f * M_eff * M_eff;
+                Cfloat* __restrict work = const_cast<Cfloat*>(Lf);
+                const bool factor_ok = factor_ok_base[f] != 0;
+                const Cfloat* __restrict cpf =
+                    phasor_fast ? (centre_phasor_base + f * M_eff) : nullptr;
+                const std::size_t f_M = f * M_eff;
+                for (std::size_t cell = 0; cell < coarse_cells; ++cell) {
+                    if (phasor_fast && !cell_clamped[cell]) {
+                        const Cfloat* __restrict rel =
+                            rel_coarse_base + cell * cell_freq_stride + f_M;
+                        for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                            steer_buf[a_idx] = cpf[a_idx] * rel[a_idx];
+                        }
+                    } else {
+                        for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                            steer_buf[a_idx] = steer_one(positions, wave_number,
+                                                         coarse[cell], a_idx);
+                        }
+                    }
+                    float p;
+                    if (!capon) {
+                        // Hermitian + trace-precomputed Bartlett quadratic form
+                        // (fix-plan defect #3): a^H R a = trace(R) +
+                        // 2·Re(Σ_{r<c} conj(a_r)·R_{rc}·a_c).
+                        p = bartlett_power_hermitian_trace(R_f, steer_buf,
+                                                            M_eff, trace_R);
+                    } else if (factor_ok) {
+                        p = capon_power_from_factor(Lf, steer_buf, M_eff,
+                                                     capon_b);
+                    } else {
+                        p = capon_power_into(R_f, steer_buf, M_eff, work,
+                                             capon_b);
+                    }
+                    if (!std::isfinite(p)) p = 0.0F;
+                    P_local[cell] += p;
+                }
+            }
+            // Serial reduction: sum the per-thread P_local slabs into P_coarse.
+            for (std::size_t t = 0; t < P_local_per_thread.size(); ++t) {
+                const std::vector<float>& P_local = P_local_per_thread[t];
+                for (std::size_t cell = 0; cell < coarse_cells; ++cell) {
+                    P_coarse[cell] += P_local[cell];
+                }
+            }
+        }
+#else  // BEAMFORMER_TRACKER_DEBUG
+        // Serial coarse scan in debug builds (preserves the captured
+        // per-cell spectrum order for the dump writer).
         for (std::size_t f = 0; f < dims_.n_freq; ++f) {
             const Cfloat* __restrict R_f = impl_->R_freq[f].data();
+            const float trace_R = impl_->R_trace[f];
             const double wave_number =
                 two_pi * static_cast<double>(frequencies_hz_[f])
                 / speed_of_light_m_per_s;
-            // Per-frequency Capon Cholesky factor slot (M_eff×M_eff): holds the
-            // lower-triangular L factored ONCE per window by the Phase-2 pass
-            // above. Reused for every coarse cell — no re-factorization here.
             const Cfloat* __restrict Lf = impl_->L_factors.data()
                 + f * M_eff * M_eff;
             Cfloat* __restrict work = impl_->L_factors.data()
-                + f * M_eff * M_eff;  // mutable fallback scratch (per-cell solve)
+                + f * M_eff * M_eff;
             const bool factor_ok = impl_->capon_factor_ok[f] != 0;
-            // Phase 3: on the fast path the centre phasor and the per-cell
-            // relative phasor are precomputed; the steering vector is a single
-            // complex multiply per antenna (no cos/sin per cell). Otherwise the
-            // original `steer_one` trig path is used verbatim.
             const Cfloat* __restrict cpf =
                 phasor_fast ? (impl_->centre_phasor.data() + f * M_eff)
                             : nullptr;
             const Cfloat* __restrict rcf =
                 phasor_fast ? impl_->rel_coarse.data() : nullptr;
             const std::size_t cell_freq_stride = dims_.n_freq * M_eff;
+            Cfloat* __restrict steer_buf = steer_buf_base;
+            Cfloat* __restrict capon_b = capon_b_base;
             for (std::size_t cell = 0; cell < G * G; ++cell) {
-                // M_eff steering vector for this (frequency, cell). When
-                // smoothing reduces M_eff, the sub-array steering uses the
-                // first M_eff antenna positions with their phases relative to
-                // the cell direction — a consistent truncation.
                 if (phasor_fast && !cell_clamped[cell]) {
-                    // Fast path: a = centre_phasor * rel_coarse (one cmul/ant).
                     const Cfloat* __restrict rel =
                         rcf + cell * cell_freq_stride + f * M_eff;
                     for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
                         steer_buf[a_idx] = cpf[a_idx] * rel[a_idx];
                     }
                 } else {
-                    // Non-coplanar aperture or horizon-clamped cell: exact
-                    // direct trig construction (matches the pre-Phase-3 path).
                     for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
                         steer_buf[a_idx] = steer_one(positions_m_, wave_number,
                                                      coarse[cell], a_idx);
@@ -1675,20 +2049,18 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                 }
                 float p;
                 if (!capon) {
-                    p = bartlett_power_into(R_f, steer_buf, M_eff);
+                    p = bartlett_power_hermitian_trace(R_f, steer_buf,
+                                                       M_eff, trace_R);
                 } else if (factor_ok) {
-                    // FOSM: O(M^2) forward substitution against the single
-                    // pre-factored L. `capon_b` serves as the v_scratch here.
                     p = capon_power_from_factor(Lf, steer_buf, M_eff, capon_b);
                 } else {
-                    // Degenerate frequency: fall back to the per-cell solve
-                    // (re-factorizes into `work`), preserving Phase-1 numerics.
                     p = capon_power_into(R_f, steer_buf, M_eff, work, capon_b);
                 }
                 if (!std::isfinite(p)) p = 0.0F;
                 P_coarse[cell] += p;
             }
         }
+#endif  // BEAMFORMER_TRACKER_DEBUG
 #if defined(BEAMFORMER_TRACKER_DEBUG)
         // Copy the fully-accumulated coarse power into the debug slot captured
         // above (the slot was pushed as a zero vector; copy the final values).
@@ -1791,56 +2163,91 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
                     }
                 }
             }
-            for (std::size_t f = 0; f < dims_.n_freq; ++f) {
-                const Cfloat* __restrict R_f = impl_->R_freq[f].data();
-                const double wave_number =
-                    two_pi * static_cast<double>(frequencies_hz_[f])
-                    / speed_of_light_m_per_s;
-                // Phase 2: reuse the per-frequency Cholesky factor L factored
-                // ONCE per window above (no re-factorization per refinement
-                // candidate). `work` is the mutable fallback scratch slot for
-                // a degenerate frequency's per-cell solve.
-                const Cfloat* __restrict Lf = impl_->L_factors.data()
-                    + f * M_eff * M_eff;
-                Cfloat* __restrict work = impl_->L_factors.data()
-                    + f * M_eff * M_eff;
-                const bool factor_ok = impl_->capon_factor_ok[f] != 0;
-                const Cfloat* __restrict ppf =
-                    phasor_fast ? (impl_->centre_phasor.data() + f * M_eff)
-                                : nullptr;
+            // ----------------------------------------------------------------
+            // Refinement candidate power, parallel across frequencies (fix-plan
+            // defect #7): the N_freq channels are independent, each thread
+            // accumulates its 9 candidate powers into a private `Pcand_local`,
+            // then reduced serially into `Pcand`. Thread-private steer/capon-b
+            // slabs; Bartlett uses the trace-precomputed Hermitian form.
+            // ----------------------------------------------------------------
+            {
                 const std::size_t o_freq_stride = dims_.n_freq * M_eff;
-                for (std::size_t i = 0; i < 9; ++i) {
-                    if (phasor_fast && !cand_clamped[i]) {
-                        // Fast path: a = parent_phasor * rel_refine (one cmul/ant).
-                        const Cfloat* __restrict rel =
-                            rel_refine_L + i * o_freq_stride + f * M_eff;
-                        for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
-                            steer_buf[a_idx] = ppf[a_idx] * rel[a_idx];
+                const Cfloat* __restrict Lf_base = impl_->L_factors.data();
+                const Cfloat* __restrict centre_phasor_base =
+                    phasor_fast ? impl_->centre_phasor.data() : nullptr;
+                const float* __restrict R_trace_base = impl_->R_trace.data();
+                const char* __restrict factor_ok_base = impl_->capon_factor_ok.data();
+                const std::vector<Vec3>& positions = positions_m_;
+                const std::size_t nt_ref =
+                    P_local_per_thread.size();
+                std::vector<std::array<float, 9>> Pcand_local_per_thread(
+                    nt_ref, std::array<float, 9>{});
+                for (auto& a : Pcand_local_per_thread) a.fill(0.0F);
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+#pragma omp parallel for schedule(static)
+#endif
+                for (std::ptrdiff_t fi = 0;
+                     fi < static_cast<std::ptrdiff_t>(dims_.n_freq); ++fi) {
+                    const std::size_t f = static_cast<std::size_t>(fi);
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+                    const std::size_t tid =
+                        static_cast<std::size_t>(omp_get_thread_num());
+#else
+                    const std::size_t tid = 0;
+#endif
+                    Cfloat* __restrict steer_buf =
+                        steer_buf_base + tid * M_eff;
+                    Cfloat* __restrict capon_b =
+                        capon_b_base + tid * M_eff;
+                    float* __restrict Pcand_local =
+                        Pcand_local_per_thread[tid].data();
+                    const Cfloat* __restrict R_f = impl_->R_freq[f].data();
+                    const float trace_R = R_trace_base[f];
+                    const double wave_number =
+                        two_pi * static_cast<double>(frequencies_hz_[f])
+                        / speed_of_light_m_per_s;
+                    const Cfloat* __restrict Lf = Lf_base + f * M_eff * M_eff;
+                    Cfloat* __restrict work = const_cast<Cfloat*>(Lf);
+                    const bool factor_ok = factor_ok_base[f] != 0;
+                    const Cfloat* __restrict ppf =
+                        phasor_fast ? (centre_phasor_base + f * M_eff)
+                                    : nullptr;
+                    const std::size_t f_M = f * M_eff;
+                    for (std::size_t i = 0; i < 9; ++i) {
+                        if (phasor_fast && !cand_clamped[i]) {
+                            const Cfloat* __restrict rel =
+                                rel_refine_L + i * o_freq_stride + f_M;
+                            for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                                steer_buf[a_idx] = ppf[a_idx] * rel[a_idx];
+                            }
+                        } else {
+                            for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
+                                steer_buf[a_idx] =
+                                    steer_one(positions, wave_number,
+                                              cand[i], a_idx);
+                            }
                         }
-                    } else {
-                        // Non-coplanar aperture or nested horizon clamp: exact
-                        // direct trig construction (matches pre-Phase-3 path).
-                        for (std::size_t a_idx = 0; a_idx < M_eff; ++a_idx) {
-                            steer_buf[a_idx] =
-                                steer_one(positions_m_, wave_number,
-                                          cand[i], a_idx);
+                        float p;
+                        if (!capon) {
+                            p = bartlett_power_hermitian_trace(R_f, steer_buf,
+                                                               M_eff, trace_R);
+                        } else if (factor_ok) {
+                            p = capon_power_from_factor(Lf, steer_buf, M_eff,
+                                                        capon_b);
+                        } else {
+                            p = capon_power_into(R_f, steer_buf, M_eff, work,
+                                                 capon_b);
                         }
+                        if (!std::isfinite(p)) p = 0.0F;
+                        Pcand_local[i] += p;
                     }
-                    float p;
-                    if (!capon) {
-                        p = bartlett_power_into(R_f, steer_buf, M_eff);
-                    } else if (factor_ok) {
-                        // FOSM: O(M^2) forward substitution against the single
-                        // pre-factored L. `capon_b` serves as the v_scratch.
-                        p = capon_power_from_factor(Lf, steer_buf, M_eff,
-                                                    capon_b);
-                    } else {
-                        // Degenerate frequency: per-cell solve fallback.
-                        p = capon_power_into(R_f, steer_buf, M_eff, work,
-                                             capon_b);
+                }
+                // Reduction into the shared stack Pcand[9].
+                for (std::size_t t = 0; t < Pcand_local_per_thread.size(); ++t) {
+                    const float* Pcand_local = Pcand_local_per_thread[t].data();
+                    for (std::size_t i = 0; i < 9; ++i) {
+                        Pcand[i] += Pcand_local[i];
                     }
-                    if (!std::isfinite(p)) p = 0.0F;
-                    Pcand[i] += p;
                 }
             }
             std::size_t best = 0;
@@ -1924,9 +2331,12 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         // ---- Final emission pass: plain Bartlett DAS using the estimated
         // direction (spec: the emitted product remains the plain Bartlett
         // power so on-disk output is byte-compatible for the same direction;
-        // only the direction changes). Reuses generate_weights exactly.
-        emit_window_das(packed, dims_, positions_m_, frequencies_hz_, centre,
-                        first_time, last_time, intensity);
+        // only the direction changes). The searching path uses the parallel
+        // emission variant (each output cell's inner sum is bit-identical to
+        // `emit_window_das`; only scheduling across the OpenMP team differs)
+        // to keep the per-frame latency inside the sub-millisecond target.
+        emit_window_das_parallel(packed, dims_, positions_m_, frequencies_hz_,
+                                 centre, first_time, last_time, intensity);
         BEAMFORMER_TRACKER_PERF_STOP(scan);
     }
 #undef BEAMFORMER_TRACKER_PERF_START
