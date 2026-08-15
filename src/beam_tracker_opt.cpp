@@ -62,6 +62,27 @@ void validate_opt_inputs(const Dimensions& dims,
     if (intensity.size() < required_output) {
         throw std::invalid_argument("intensity output is smaller than dimensions");
     }
+
+    // Validate the trajectory over EVERY integration window, serially, before
+    // any OpenMP region is entered. The naive path evaluates
+    // tracker_window_direction once per window inside its serial loop, so a
+    // trajectory that leaves the unit disk at some window throws
+    // std::invalid_argument (via direction_from_lm) on the main thread. The
+    // opt path computes directions inside parallel regions; an exception
+    // thrown from a worker thread is not reliably propagated to the caller by
+    // OpenMP (it manifests as std::terminate), which would break parity with
+    // the naive path's exception behavior. This serial pre-scan reproduces the
+    // naive path's "throw on the first bad window, from the main thread"
+    // contract exactly, so the regression-test parity assertions (and any
+    // caller relying on the exception) behave identically across both paths.
+    const std::size_t pre_window_count =
+        tracker_window_count(dims.n_time, tracker.integration_spectra);
+    for (std::size_t w = 0; w < pre_window_count; ++w) {
+        // Discarded: only the side-effect (throw on off-disk cosine) matters.
+        static_cast<void>(
+            tracker_window_direction(tracker.trajectory, w,
+                                     tracker.integration_spectra));
+    }
 }
 
 } // namespace
