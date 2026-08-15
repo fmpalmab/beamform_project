@@ -84,7 +84,6 @@ void validate_opt_inputs(const Dimensions& dims,
 // the packed data, and it contains no covariance / search / grid scan logic.
 void compute_window_weights(const Dimensions& dims,
                             const std::vector<Vec3>& positions,
-                            const std::vector<float>& frequencies,
                             const std::vector<double>& wavenumbers,
                             const Vec3& direction,
                             Weights& weights) {
@@ -169,8 +168,10 @@ void beam_tracker_opt_cpu_packed_intensity_into(const PackedVoltage& packed,
                                      tracker.integration_spectra);
 
         // Recompute the weight set for this window's direction using the exact
-        // phase formula of generate_weights (see compute_window_weights).
-        compute_window_weights(dims, positions, frequencies, wavenumbers,
+        // phase formula of generate_weights (see compute_window_weights). The
+        // per-frequency wavenumbers were precomputed once from `frequencies`
+        // in the loop above, so this helper consumes wavenumbers only.
+        compute_window_weights(dims, positions, wavenumbers,
                                direction, window_weights);
 
         const std::size_t first_time = window * tracker.integration_spectra;

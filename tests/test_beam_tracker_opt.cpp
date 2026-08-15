@@ -28,6 +28,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -239,20 +240,50 @@ int main() {
                 beam_tracker_opt_cpu_packed_intensity(packed, dims, bad));
         }));
 
-        // Non-finite direction_rate rejected by both.
+        // (a) Non-finite direction_rate rejected by BOTH paths identically.
+        //     validate_tracker_config (naive) and validate_opt_inputs (opt) both
+        //     gate on finiteness of every rate component, so a NaN is rejected by
+        //     both before either tracker ever touches the trajectory.
         assert(throws_invalid_argument([&] {
             TrackerConfig bad = stationary;
-            bad.trajectory.direction_rate_per_sample = {1.0e20F, 1.0e20F};
-            // Large finite rate that forces the trajectory off the unit disk.
+            bad.trajectory.direction_rate_per_sample = {
+                std::numeric_limits<float>::quiet_NaN(), 0.0F};
             static_cast<void>(
                 beam_tracker_cpu_packed_intensity(packed, dims, bad));
         }));
         assert(throws_invalid_argument([&] {
             TrackerConfig bad = stationary;
-            bad.trajectory.direction_rate_per_sample = {1.0e20F, 1.0e20F};
+            bad.trajectory.direction_rate_per_sample = {
+                std::numeric_limits<float>::quiet_NaN(), 0.0F};
             static_cast<void>(
                 beam_tracker_opt_cpu_packed_intensity(packed, dims, bad));
         }));
+
+        // (b) Parallel parity: a trajectory whose (l, m) leaves the unit disk
+        //     at an *evaluated* window must be rejected by BOTH paths at the
+        //     same point (the shared tracker_window_direction -> tracker_direction
+        //     -> direction_from_lm chain). Use integration_spectra=1 so window
+        //     1 evaluates tracker_direction(t=1): start {0.5, 0.0} + rate
+        //     {0.5, 0.5} -> l=1.0, m=0.5 -> l^2+m^2 = 1.25 > 1 -> throws. This
+        //     guards that the opt path exercises the exact same per-window
+        //     trajectory evaluation as the naive path (and does NOT silently stop
+        //     early, skip a window, or clamp instead of throw).
+        {
+            Dimensions parity_dims{4, default_frequency_channels, 32,
+                                    tracker_beam_count};
+            TrackerConfig offdisk;
+            offdisk.trajectory.direction_start = direction_from_lm(0.5F, 0.0F);
+            offdisk.trajectory.direction_rate_per_sample = {0.5F, 0.5F};
+            offdisk.integration_spectra = 1;
+            assert(throws_invalid_argument([&] {
+                static_cast<void>(beam_tracker_cpu_packed_intensity(
+                    packed, parity_dims, offdisk));
+            }));
+            assert(throws_invalid_argument([&] {
+                static_cast<void>(beam_tracker_opt_cpu_packed_intensity(
+                    packed, parity_dims, offdisk));
+            }));
+        }
 
         // Wrong packed size rejected by both.
         assert(throws_invalid_argument([&] {

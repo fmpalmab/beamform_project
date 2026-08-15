@@ -30,7 +30,7 @@ add_library(beamformer_core
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
     src/beam_tracker_opt.cpp
-    src/cpu_opt_beam_tracker.cpp
+    # src/cpu_opt_beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
     src/quantization.cpp
