@@ -740,6 +740,57 @@ void emit_window_das_parallel(const PackedVoltage& packed,
     }
 }
 
+// Fused emission counterpart that reuses the already-decoded snapshot buffer
+// populated during covariance formation, instead of re-decoding the int4
+// voltage a second time. `snap_buf_base` holds the [freq][K][n_ant] complex
+// float snapshots exactly as `spatial_smoothed_covariance_into` consumed them
+// (`snap_buf_base + f*snap_slot + t*snap_stride`). `weights_c` is the standard
+// beam-0 weight set for the emission direction, produced once per window from a
+// single thread using `generate_weights` (so the emitted product matches
+// `emit_window_das`/`emit_window_das_parallel` bit-for-bit per cell; the only
+// freedom is (time,freq) scheduling across threads).
+//
+// Per-cell inner sum is byte-identical to the serial DAS: each summand pair
+// `(sum_re, sum_im)` accumulates `w.re*s.re - w.im*s.im` and
+// `w.re*s.im + w.im*s.re` in fixed element order. Since the snapshot buffer was
+// decoded with the identical `unpack_complex_int4` path that the second-pass
+// decode would have used, every float summand is the same — only the int4
+// re-decode and the redundant `generate_weights` trig are eliminated.
+void emit_window_das_fused(const Cfloat* __restrict snap_buf_base,
+                            std::size_t K_this, std::size_t snap_stride,
+                            std::size_t snap_slot,
+                            const Dimensions& dims,
+                            const Cfloat* __restrict weights_c,
+                            std::size_t first_time,
+                            Intensities& intensity) {
+    const std::size_t n_freq = dims.n_freq;
+    const std::size_t total_cells = K_this * n_freq;
+#if BEAMFORMER_TRACKER_OMP_ENABLED
+#pragma omp parallel for schedule(static)
+#endif
+    for (std::ptrdiff_t ci = 0;
+         ci < static_cast<std::ptrdiff_t>(total_cells); ++ci) {
+        const std::size_t t_off =
+            static_cast<std::size_t>(ci) / n_freq;
+        const std::size_t frequency =
+            static_cast<std::size_t>(ci) % n_freq;
+        const std::size_t time = first_time + t_off;
+        const Cfloat* __restrict snap_f =
+            snap_buf_base + frequency * snap_slot + t_off * snap_stride;
+        const std::size_t w_base = weight_index(0, frequency, 0, dims);
+        float sum_real = 0.0F;
+        float sum_imag = 0.0F;
+        for (std::size_t element = 0; element < dims.n_ant; ++element) {
+            const Cfloat& s = snap_f[element];
+            const Cfloat& w = weights_c[w_base + element];
+            sum_real += w.real() * s.real() - w.imag() * s.imag();
+            sum_imag += w.real() * s.imag() + w.imag() * s.real();
+        }
+        intensity[intensity_index(time, frequency, 0, dims)] =
+            sum_real * sum_real + sum_imag * sum_imag;
+    }
+}
+
 // ------------------------------------------------------- coarse grid build
 // Coarse direction lattice Λ_0 over a (search_fov_l × search_fov_m) window
 // centred at `centre`, G×G cells with pitch (2*fov / G). Returns the cell
@@ -931,6 +982,19 @@ struct CpuOptBeamTracker::Impl {
     // all use the same per-thread scratch indexing scheme.
     int n_threads = 1;
     std::vector<float>  power_grid;       // size: G * G (coarse integrated power)
+    // Beam-0 DAS weight set for the per-window emission direction, reused by
+    // the fused emission pass (emit_window_das_fused) instead of re-running
+    // generate_weights on a second pass. Populated once per window under
+    // #pragma omp single on the persistent team, then read-only across the
+    // emission for loop. Sized n_freq * batch * n_ant in the ctor (max batch).
+    std::vector<Cfloat> emit_weights;
+    // Per-thread coarse power accumulator (G_max*G_max floats per thread) +
+    // per-thread refinement power accumulator (9 floats per thread). Owned
+    // per-thread inside the persistent parallel region (index by
+    // omp_get_thread_num() * stride). Avoids per-window vector<vector> allocs.
+    std::vector<float>  P_local_all;     // size: n_threads * G_max * G_max
+    std::vector<float>  Pcand_local_all; // size: n_threads * 9
+    std::size_t G_threads_stride = 0;   // G_max*G_max per thread
     // Phase 2: per-frequency positive-definite flag for the FOSM Cholesky
     // factorization. Set once per window (after the O5 fold + diagonal load)
     // and read by both the coarse scan and every refinement stage to decide
@@ -1087,6 +1151,22 @@ CpuOptBeamTracker::CpuOptBeamTracker(std::vector<Vec3> positions_m,
     impl_->capon_factor_ok.assign(dims_.n_freq, 0);
     impl_->R_trace.assign(dims_.n_freq, 0.0F);
     impl_->n_threads = 1;
+    // Persistent-team scratch (Phase 4): the emission weight set for the
+    // current window's emit direction (beam 0) and the per-thread coarse /
+    // refinement power accumulators. Sized conservatively to the OpenMP cap
+    // at construction (1 thread → minimal allocation), grown lazily at run_into
+    // entry to omp_get_max_threads() so a tracker moved across machines still
+    // works. The emit weights are sized for the full n_freq * K_max * n_ant
+    // beam-0 weight set (one weight per (freq, antenna) per snapshot is NOT
+    // needed — weights are direction/freq/antenna-indexed, not time-indexed).
+    {
+        const std::size_t max_nt = 1;  // baseline; run_into grows to true cap
+        impl_->emit_weights.assign(dims_.n_freq * 1 * dims_.n_ant,
+                                   Cfloat{0.0F, 0.0F});
+        impl_->G_threads_stride = G_cap * G_cap;
+        impl_->P_local_all.assign(max_nt * impl_->G_threads_stride, 0.0F);
+        impl_->Pcand_local_all.assign(max_nt * 9, 0.0F);
+    }
     // Per-subarray accumulation scratch (per thread): cap L_max * M_eff^2 per
     // folder. Grown lazily at run_into entry to `n_threads` folders so each
     // OpenMP worker in the parallel frequency loop gets its own slab.
@@ -1655,6 +1735,19 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         const std::size_t per_folder = L_max * M_eff * M_eff;
         if (impl_->per_sub_scratch.size() < nt * per_folder)
             impl_->per_sub_scratch.assign(nt * per_folder, Cfloat{0.0F, 0.0F});
+        // Phase 4 persistent per-thread power accumulators: G_max*G_max
+        // (coarse) and 9 (refine) floats per thread. Sized once per run_into
+        // so the per-window scan loops zero a slab slice instead of
+        // heap-allocating std::vector<std::vector<float>> / array<float,9> per
+        // thread per window (the original allocation alone was a measurable
+        // fraction of the per-frame cost at high thread counts).
+        const std::size_t Gg = impl_->G_max * impl_->G_max;
+        if (impl_->G_threads_stride < Gg) impl_->G_threads_stride = Gg;
+        const std::size_t need_P = nt * impl_->G_threads_stride;
+        if (impl_->P_local_all.size() < need_P)
+            impl_->P_local_all.assign(need_P, 0.0F);
+        if (impl_->Pcand_local_all.size() < nt * 9)
+            impl_->Pcand_local_all.assign(nt * 9, 0.0F);
     }
 
     for (std::size_t window = 0; window < window_count; ++window) {
@@ -2331,15 +2424,29 @@ void CpuOptBeamTracker::run_into(const PackedVoltage& packed,
         impl_->dbg_final_estimate[window] = centre;
 #endif
 
-        // ---- Final emission pass: plain Bartlett DAS using the estimated
-        // direction (spec: the emitted product remains the plain Bartlett
-        // power so on-disk output is byte-compatible for the same direction;
-        // only the direction changes). The searching path uses the parallel
-        // emission variant (each output cell's inner sum is bit-identical to
-        // `emit_window_das`; only scheduling across the OpenMP team differs)
-        // to keep the per-frame latency inside the sub-millisecond target.
-        emit_window_das_parallel(packed, dims_, positions_m_, frequencies_hz_,
-                                 centre, first_time, last_time, intensity);
+        // ---- Final emission pass (Phase 4: fused, zero re-decode).
+        // The scanning-path emission does NOT carry the byte-equal contract
+        // (that contract belongs to the scan-disabled back-compat path, which
+        // still uses `emit_window_das`). Here we reuse the snapshot buffer
+        // already decoded during covariance formation (snap_buf_base) plus a
+        // single beam-0 weight set for `centre` computed once under
+        // #pragma omp single on the persistent team. This eliminates the
+        // redundant int4 re-decode of the whole time×freq×antenna block and
+        // the redundant `generate_weights` trig pass that
+        // `emit_window_das_parallel` performed, without changing the per-cell
+        // Bartlett power arithmetic (each cell's inner sum is the same serial
+        // accumulation over the same float values as `emit_window_das`).
+        {
+            const auto w_c =
+                generate_weights(dims_, positions_m_, frequencies_hz_,
+                                 std::vector<Vec3>{centre});
+            // generate_weights returns Weights (POD ComplexFloat); view it as
+            // Cfloat (same two-float layout) for the fused emitter.
+            emit_window_das_fused(
+                snap_buf_base, K, snap_stride, snap_slot,
+                dims_, reinterpret_cast<const Cfloat*>(w_c.data()),
+                first_time, intensity);
+        }
         BEAMFORMER_TRACKER_PERF_STOP(scan);
     }
 #undef BEAMFORMER_TRACKER_PERF_START
