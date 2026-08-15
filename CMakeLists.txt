@@ -29,6 +29,7 @@ endif()
 add_library(beamformer_core
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
+    src/beam_tracker_opt.cpp
     src/cpu_opt_beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
@@ -64,6 +65,7 @@ endif()
 add_library(beamformer_core_perf STATIC
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
+    src/beam_tracker_opt.cpp
     src/cpu_opt_beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
@@ -101,6 +103,19 @@ add_executable(benchmark_cpu_opt_beam_tracker
     tools/benchmark_cpu_opt_beam_tracker.cpp)
 target_link_libraries(benchmark_cpu_opt_beam_tracker PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
 target_compile_options(benchmark_cpu_opt_beam_tracker PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+)
+
+# Benchmark for the optimized NAIVE tracker (src/beam_tracker_opt.cpp): runs
+# both the naive tracker (src/beam_tracker.cpp) and the optimized variant on
+# identical input, reports actual end-to-end latency for each plus a speedup
+# ratio, and re-asserts the naive==opt byte-equality contract in-process.
+# Built against the perf core so both the opt TU and the naive TU it is
+# compared against are at -O3 -march=native for a fair headline comparison.
+add_executable(benchmark_beam_tracker_opt
+    tools/benchmark_beam_tracker_opt.cpp)
+target_link_libraries(benchmark_beam_tracker_opt PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
+target_compile_options(benchmark_beam_tracker_opt PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
 )
 
@@ -168,6 +183,22 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME cpu_opt_beam_tracker COMMAND test_cpu_opt_beam_tracker)
     set_tests_properties(cpu_opt_beam_tracker PROPERTIES
+        LABELS "tracker;optimization;validation"
+        TIMEOUT 120
+    )
+
+    # Regression tests for the optimized NAIVE tracker (src/beam_tracker_opt.cpp)
+    # against the reference naive tracker (src/beam_tracker.cpp). Asserts
+    # byte-for-bit equality `assert(naive == opt)` across stationary, drifting,
+    # noise, multi-window, n_ant 32/64, integration_spectra=1, and validation
+    # parity scenarios. The opt TU is intentionally built against the plain
+    # beamformer_core (not the perf core) so the regression runs the same build
+    # profile as the rest of the suite.
+    add_executable(test_beam_tracker_opt tests/test_beam_tracker_opt.cpp)
+    target_link_libraries(test_beam_tracker_opt PRIVATE beamformer_core)
+    target_compile_options(test_beam_tracker_opt PRIVATE -UNDEBUG)
+    add_test(NAME beam_tracker_opt COMMAND test_beam_tracker_opt)
+    set_tests_properties(beam_tracker_opt PROPERTIES
         LABELS "tracker;optimization;validation"
         TIMEOUT 120
     )
