@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Enable OpenMP
+find_package(OpenMP REQUIRED)
+
 option(BEAMFORMER_ENABLE_CUDA "Enable CUDA targets when a CUDA compiler is available" ON)
 
 set(BEAMFORMER_HAS_CUDA OFF)
@@ -37,6 +40,7 @@ add_library(beamformer_core
 target_include_directories(beamformer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(beamformer_core PUBLIC BEAMFORMER_HAS_CUDA=$<BOOL:${BEAMFORMER_HAS_CUDA}>)
 target_compile_options(beamformer_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>)
+target_link_libraries(beamformer_core PUBLIC OpenMP::OpenMP_CXX)
 
 # Optional: instrument the optimized tracker TU inside beamformer_core with
 # -DBEAMFORMER_TRACKER_DEBUG so run_into captures the full coarse-to-fine
@@ -44,7 +48,7 @@ target_compile_options(beamformer_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall;-
 # CpuOptBeamTracker::debug_search_dump() can write to disk. Default OFF to
 # keep the capture overhead out of normal builds; enable explicitly when
 # debugging a failing DOA-recovery assertion:
-#     cmake -DBEAMFORMER_TRACKER_DEBUG=ON ...
+#      cmake -DBEAMFORMER_TRACKER_DEBUG=ON ...
 # This only affects beamformer_core (and the tests that link it); the
 # perf-enabled benchmark core (beamformer_core_perf) is left untouched.
 option(BEAMFORMER_TRACKER_DEBUG
@@ -55,11 +59,8 @@ endif()
 
 # Performance build of the whole CPU core: the optimized tracker TU is compiled
 # with BEAMFORMER_TRACKER_PERF defined (which populates the per-window latency
-# vector inside run_into) and -O3, *and* every other CPU TU is compiled at -O3
-# too so the headline per-frame numbers are measured at release optimisation
-# rather than a Debug default. This is a *separate* static library so it never
-# clashes with the default beamformer_core symbols; the benchmark links *only*
-# against this perf core (it contains both the naive and optimized tracker).
+# vector inside run_into) and -O3 -march=native, *and* every other CPU TU is compiled at -O3
+# too so the headline per-frame numbers are measured at release optimisation.
 add_library(beamformer_core_perf STATIC
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
@@ -79,8 +80,9 @@ target_compile_definitions(beamformer_core_perf PRIVATE
     BEAMFORMER_TRACKER_PERF
 )
 target_compile_options(beamformer_core_perf PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3;-Wall;-Wextra;-Wpedantic>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
 )
+target_link_libraries(beamformer_core_perf PUBLIC OpenMP::OpenMP_CXX)
 
 add_executable(generate_fake_data tools/generate_fake_data.cpp)
 target_link_libraries(generate_fake_data PRIVATE beamformer_core)
@@ -94,15 +96,12 @@ target_link_libraries(beamformer_cpu PRIVATE beamformer_core)
 add_executable(beam_tracker_cpu tools/beam_tracker_cpu.cpp)
 target_link_libraries(beam_tracker_cpu PRIVATE beamformer_core)
 
-# Benchmark for the optimized CPU tracker. Built against the perf-enabled core
-# so per-frame timings (BEAMFORMER_TRACKER_PERF) and -O3 optimisation are in
-# effect; links ONLY against beamformer_core_perf to avoid duplicate symbols
-# with the default beamformer_core.
+# Benchmark for the optimized CPU tracker.
 add_executable(benchmark_cpu_opt_beam_tracker
     tools/benchmark_cpu_opt_beam_tracker.cpp)
-target_link_libraries(benchmark_cpu_opt_beam_tracker PRIVATE beamformer_core_perf)
+target_link_libraries(benchmark_cpu_opt_beam_tracker PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
 target_compile_options(benchmark_cpu_opt_beam_tracker PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3;-Wall;-Wextra;-Wpedantic>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
 )
 
 if(BEAMFORMER_HAS_CUDA)
@@ -163,10 +162,6 @@ if(BUILD_TESTING)
                    tests/test_cpu_opt_beam_tracker.cpp)
     target_link_libraries(test_cpu_opt_beam_tracker PRIVATE beamformer_core)
     target_compile_options(test_cpu_opt_beam_tracker PRIVATE -UNDEBUG)
-    # When the debug-dump core is requested, the test harness emits a
-    # search dump (app/debug/tracker_dumps by default, or
-    # $BEAMFORMER_TRACKER_DUMP_DIR if set) right before the DOA-recovery
-    # assertions so a failure leaves on-disk state for offline diagnosis.
     if(BEAMFORMER_TRACKER_DEBUG)
         target_compile_definitions(test_cpu_opt_beam_tracker PRIVATE
             BEAMFORMER_TRACKER_DEBUG)
