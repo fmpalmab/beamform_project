@@ -937,7 +937,6 @@ struct CpuOptBeamTracker::Impl {
     // Per-subarray covariance accumulation scratch for spatial smoothing:
     // capacity L_max * M_eff^2 where L_max = n_ant - M_eff + 1 (max sub-array
     // count; 1 when smoothing disabled since M_eff == n_ant).
-    std::vector<Cfloat> per_sub_scratch;
     std::size_t K_max = 0;                // integration_spectra capacity bound
     std::size_t G_max = 0;               // coarse grid cells-per-axis capacity
 
