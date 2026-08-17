@@ -4,4 +4,6 @@ __pycache__/
 *.py[cod]
 /build-release/
 /build-*
+/build_*
 results/
+results_*/

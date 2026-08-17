@@ -135,6 +135,11 @@ target_compile_options(benchmark_beam_tracker_opt_v2 PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
 )
 
+add_executable(beam_tracker_naive_cpu_test_suite
+    tools/beam_tracker_naive_cpu_test_suite.cpp)
+target_link_libraries(beam_tracker_naive_cpu_test_suite PRIVATE beamformer_core)
+target_compile_options(beam_tracker_naive_cpu_test_suite PRIVATE -UNDEBUG -O2)
+
 if(BEAMFORMER_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
     add_library(beamformer_cuda_core
