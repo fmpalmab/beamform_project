@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/test_synthetic_data.dir/link.d CMakeFiles/test_synthetic_data.dir/tests/test_synthetic_data.cpp.o -o test_synthetic_data  libbeamformer_core.a /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a
