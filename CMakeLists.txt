@@ -30,6 +30,7 @@ add_library(beamformer_core
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
     src/beam_tracker_opt.cpp
+    src/beam_tracker_opt_v2.cpp
     src/cpu_opt_beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
@@ -66,6 +67,7 @@ add_library(beamformer_core_perf STATIC
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp
     src/beam_tracker_opt.cpp
+    src/beam_tracker_opt_v2.cpp
     src/cpu_opt_beam_tracker.cpp
     src/geometry.cpp
     src/io.cpp
@@ -116,6 +118,20 @@ add_executable(benchmark_beam_tracker_opt
     tools/benchmark_beam_tracker_opt.cpp)
 target_link_libraries(benchmark_beam_tracker_opt PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
 target_compile_options(benchmark_beam_tracker_opt PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+)
+
+# Benchmark for the v2 optimized naive tracker (src/beam_tracker_opt_v2.cpp):
+# runs the naive tracker, v1, and v2 on identical input at the same config and
+# reports end-to-end latency for each, plus v1-vs-naive, v2-vs-naive and
+# v2-vs-v1 speedup ratios. Re-asserts the three-way byte-equality contract
+# (naive==v1==v2) in-process before timing, so a fast-but-wrong kernel is
+# caught here too. Built against the perf core so v1, v2, and the naive TU they
+# are compared against are all at -O3 -march=native for a fair comparison.
+add_executable(benchmark_beam_tracker_opt_v2
+    tools/benchmark_beam_tracker_opt_v2.cpp)
+target_link_libraries(benchmark_beam_tracker_opt_v2 PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
+target_compile_options(benchmark_beam_tracker_opt_v2 PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
 )
 
@@ -199,6 +215,23 @@ if(BUILD_TESTING)
     target_compile_options(test_beam_tracker_opt PRIVATE -UNDEBUG)
     add_test(NAME beam_tracker_opt COMMAND test_beam_tracker_opt)
     set_tests_properties(beam_tracker_opt PROPERTIES
+        LABELS "tracker;optimization;validation"
+        TIMEOUT 120
+    )
+
+    # Regression tests for the v2 optimized NAIVE tracker
+    # (src/beam_tracker_opt_v2.cpp) against BOTH the reference naive tracker
+    # (src/beam_tracker.cpp) and v1 (src/beam_tracker_opt.cpp). Asserts
+    # byte-for-bit equality `assert(naive == v2)` AND `assert(v1 == v2)` across
+    # the same scenario matrix as test_beam_tracker_opt (stationary, drifting,
+    # noise, multi-window, n_ant 32/64, integration_spectra=1, validation
+    # parity across all three paths, output-size contract). Built against the
+    # plain beamformer_core for the same reason as the v1 test.
+    add_executable(test_beam_tracker_opt_v2 tests/test_beam_tracker_opt_v2.cpp)
+    target_link_libraries(test_beam_tracker_opt_v2 PRIVATE beamformer_core)
+    target_compile_options(test_beam_tracker_opt_v2 PRIVATE -UNDEBUG)
+    add_test(NAME beam_tracker_opt_v2 COMMAND test_beam_tracker_opt_v2)
+    set_tests_properties(beam_tracker_opt_v2 PROPERTIES
         LABELS "tracker;optimization;validation"
         TIMEOUT 120
     )
