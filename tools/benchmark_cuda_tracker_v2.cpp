@@ -579,6 +579,7 @@ int main(int argc, char** argv) {
     const double c2p_med = medians[3];
     const double cfus_med = medians[4];
     const double cwrp_med = medians[5];
+    const double cfws_med = medians[6];
 
     std::printf("  CPU Naive:          %9.3f ms\n", n_med);
     std::printf("  CPU Opt v1:         %9.3f ms  (%.2fx vs Naive)\n", v1_med, n_med / v1_med);
@@ -638,7 +639,7 @@ int main(int argc, char** argv) {
     if (prefix) {
         const beamformer::CudaDeviceInfo device_info;
         write_summary_csv(with_suffix(*prefix, "_summary.csv"), dims, opts, max_threads, n_med,
-                          v1_med, v2_med, c2p_med, cfus_med, cwrp_med);
+                          v1_med, v2_med, c2p_med, cfus_med, cwrp_med, cfws_med);
         write_frame_latencies_csv(with_suffix(*prefix, "_frame_latencies.csv"), frame_rows);
         write_window_stats_csv(with_suffix(*prefix, "_window_validation.csv"), window_stats_rows);
         write_metadata_json(with_suffix(*prefix, "_metadata.json"), dims, opts, device_info,
