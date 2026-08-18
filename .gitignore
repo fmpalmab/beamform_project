@@ -17,3 +17,4 @@ DartConfiguration.tcl
 Testing/
 *.cmake
 !CMakeLists.txt
+trillium_bench_results/

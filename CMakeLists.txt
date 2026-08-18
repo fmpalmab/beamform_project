@@ -147,6 +147,7 @@ if(BEAMFORMER_HAS_CUDA)
         src/cuda_offline_runner.cu
         src/cuda_quantize_int8.cu
         src/cuda_beam_tracker_v2.cu
+        src/cuda_beam_tracker_fused_warp_shuffle.cu
     )
     target_include_directories(beamformer_cuda_core
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

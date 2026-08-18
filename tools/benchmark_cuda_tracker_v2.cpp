@@ -71,6 +71,7 @@
                                             // direct-beamformer benchmark (tools/benchmark_cpu_cuda.cpp)
                                             // for the metadata.json's hardware-info block.
 #include "beamformer/cuda_tracker_v2.hpp"
+#include "beamformer/cuda_beam_tracker_fused_warp_shuffle.hpp"
 #include "beamformer/geometry.hpp"
 #include "beamformer/synthetic_data.hpp"
 
@@ -271,8 +272,8 @@ std::vector<Engine> make_engines() {
     using beamformer::beam_tracker_opt_cpu_packed_intensity_into;
     using beamformer::beam_tracker_opt_v2_cpu_packed_intensity_into;
     using beamformer::cuda_tracker_v2_packed_intensity_into;
-    // Index 0 MUST be the naive CPU tracker: it is treated as the ground-
-    // truth reference by every validation/diff computation below.
+    using beamformer::cuda_beam_tracker_fused_warp_shuffle_into;
+
     return {
         {"cpu", "naive",
          [](const PackedVoltage& p, const Dimensions& d, const TrackerConfig& t, Intensities& out) {
@@ -297,6 +298,10 @@ std::vector<Engine> make_engines() {
         {"gpu", "warp_reduction",
          [](const PackedVoltage& p, const Dimensions& d, const TrackerConfig& t, Intensities& out) {
              cuda_tracker_v2_packed_intensity_into(p, d, t, out, CudaTrackerKernelV2::WarpReduction);
+         }},
+        {"gpu", "fused_warp_shuffle",
+         [](const PackedVoltage& p, const Dimensions& d, const TrackerConfig& t, Intensities& out) {
+             cuda_beam_tracker_fused_warp_shuffle_into(p, d, t, out);
          }},
     };
 }
@@ -363,7 +368,7 @@ bool has_content(const std::filesystem::path& path) {
 void write_summary_csv(const std::filesystem::path& path, const Dimensions& dims,
                        const Options& opts, const int threads, const double n_med,
                        const double v1_med, const double v2_med, const double c2p_med,
-                       const double cfus_med, const double cwrp_med) {
+                       const double cfus_med, const double cwrp_med, const double cfws_med) {
     const bool exists = has_content(path);
     std::ofstream out(path, std::ios::app);
     if (!out) {
@@ -371,15 +376,15 @@ void write_summary_csv(const std::filesystem::path& path, const Dimensions& dims
     }
     if (!exists) {
         out << "n_time,n_ant,n_freq,integration_spectra,threads,naive_ms,cpu_v1_ms,cpu_v2_ms,"
-               "cuda_twopass_ms,cuda_fused_ms,cuda_warp_ms,speedup_v2_vs_naive,"
-               "speedup_gpu_warp_vs_cpu_v2\n";
+               "cuda_twopass_ms,cuda_fused_ms,cuda_warp_ms,cuda_fused_warp_shuffle_ms,"
+               "speedup_v2_vs_naive,speedup_gpu_warp_vs_cpu_v2,speedup_gpu_fws_vs_cpu_v2\n";
     }
     out << std::fixed << std::setprecision(6)
         << dims.n_time << ',' << dims.n_ant << ',' << dims.n_freq << ','
         << opts.integration_spectra << ',' << threads << ','
         << n_med << ',' << v1_med << ',' << v2_med << ','
-        << c2p_med << ',' << cfus_med << ',' << cwrp_med << ','
-        << (n_med / v2_med) << ',' << (v2_med / cwrp_med) << '\n';
+        << c2p_med << ',' << cfus_med << ',' << cwrp_med << ',' << cfws_med << ','
+        << (n_med / v2_med) << ',' << (v2_med / cwrp_med) << ',' << (v2_med / cfws_med) << '\n';
 }
 
 struct FrameLatencyRow {
@@ -581,6 +586,7 @@ int main(int argc, char** argv) {
     std::printf("  CUDA TwoPass:       %9.3f ms  (%.2fx vs CPU v2)\n", c2p_med, v2_med / c2p_med);
     std::printf("  CUDA Fused:         %9.3f ms  (%.2fx vs CPU v2)\n", cfus_med, v2_med / cfus_med);
     std::printf("  CUDA WarpReduction: %9.3f ms  (%.2fx vs CPU v2)\n", cwrp_med, v2_med / cwrp_med);
+    std::printf("  CUDA FusedWarpShuffle: %9.3f ms  (%.2fx vs CPU v2)\n", cfws_med, v2_med / cfws_med);
     std::printf("===============================================================\n");
 
     // Per-window pass: fresh isolated calls for latency (see file header),
