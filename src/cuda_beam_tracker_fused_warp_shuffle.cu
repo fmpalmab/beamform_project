@@ -946,5 +946,3 @@ void BatchedTrackerStream::process_batch_kernel_only(const std::size_t first_win
 }
 
 } // namespace beamformer
-
-} // namespace beamformer
