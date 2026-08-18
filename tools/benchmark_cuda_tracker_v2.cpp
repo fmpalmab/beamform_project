@@ -318,6 +318,21 @@ std::vector<Engine> make_engines() {
              }
              cached_stream->process_batch(0, p.data(), out.data());
          }},
+        {"gpu", "batched_kernel",
+         [](const PackedVoltage& p, const Dimensions& d, const TrackerConfig& t, Intensities& out) {
+             static thread_local std::unique_ptr<beamformer::BatchedTrackerStream> cached_stream;
+             static thread_local std::size_t cached_n_time = 0;
+             static thread_local std::size_t cached_n_ant = 0;
+             const std::size_t batch_size = beamformer::tracker_window_count(d.n_time, t.integration_spectra);
+             if (!cached_stream || cached_n_time != d.n_time || cached_n_ant != d.n_ant) {
+                 Dimensions win_dims{t.integration_spectra, d.n_freq, d.n_ant, d.n_beams};
+                 cached_stream = std::make_unique<beamformer::BatchedTrackerStream>(win_dims, t, batch_size);
+                 cached_n_time = d.n_time;
+                 cached_n_ant = d.n_ant;
+                 cached_stream->process_batch(0, p.data(), out.data());
+             }
+             cached_stream->process_batch_kernel_only(0);
+         }},
     };
 }
 
@@ -384,7 +399,7 @@ void write_summary_csv(const std::filesystem::path& path, const Dimensions& dims
                        const Options& opts, const int threads, const double n_med,
                        const double v1_med, const double v2_med, const double c2p_med,
                        const double cfus_med, const double cwrp_med, const double cfws_med,
-                       const double cbat_med) {
+                       const double cbat_med, const double cbat_ker_med) {
     const bool exists = has_content(path);
     std::ofstream out(path, std::ios::app);
     if (!out) {
@@ -392,15 +407,19 @@ void write_summary_csv(const std::filesystem::path& path, const Dimensions& dims
     }
     if (!exists) {
         out << "n_time,n_ant,n_freq,integration_spectra,threads,naive_ms,cpu_v1_ms,cpu_v2_ms,"
-               "cuda_twopass_ms,cuda_fused_ms,cuda_warp_ms,cuda_fused_warp_shuffle_ms,cuda_batched_stream_ms,"
-               "speedup_v2_vs_naive,speedup_gpu_warp_vs_cpu_v2,speedup_gpu_fws_vs_cpu_v2,speedup_gpu_batched_vs_cpu_v2\n";
+               "cuda_twopass_ms,cuda_fused_ms,cuda_warp_ms,cuda_fused_warp_shuffle_ms,"
+               "cuda_batched_stream_ms,cuda_batched_kernel_ms,"
+               "speedup_v2_vs_naive,speedup_gpu_warp_vs_cpu_v2,speedup_gpu_fws_vs_cpu_v2,"
+               "speedup_gpu_batched_vs_cpu_v2,speedup_gpu_kernel_vs_cpu_v2\n";
     }
     out << std::fixed << std::setprecision(6)
         << dims.n_time << ',' << dims.n_ant << ',' << dims.n_freq << ','
         << opts.integration_spectra << ',' << threads << ','
         << n_med << ',' << v1_med << ',' << v2_med << ','
-        << c2p_med << ',' << cfus_med << ',' << cwrp_med << ',' << cfws_med << ',' << cbat_med << ','
-        << (n_med / v2_med) << ',' << (v2_med / cwrp_med) << ',' << (v2_med / cfws_med) << ',' << (v2_med / cbat_med) << '\n';
+        << c2p_med << ',' << cfus_med << ',' << cwrp_med << ',' << cfws_med << ','
+        << cbat_med << ',' << cbat_ker_med << ','
+        << (n_med / v2_med) << ',' << (v2_med / cwrp_med) << ',' << (v2_med / cfws_med) << ','
+        << (v2_med / cbat_med) << ',' << (v2_med / cbat_ker_med) << '\n';
 }
 
 struct FrameLatencyRow {
@@ -597,6 +616,7 @@ int main(int argc, char** argv) {
     const double cwrp_med = medians[5];
     const double cfws_med = medians[6];
     const double cbat_med = medians[7];
+    const double cbat_ker_med = medians[8];
 
     std::printf("  CPU Naive:          %9.3f ms\n", n_med);
     std::printf("  CPU Opt v1:         %9.3f ms  (%.2fx vs Naive)\n", v1_med, n_med / v1_med);
@@ -606,6 +626,7 @@ int main(int argc, char** argv) {
     std::printf("  CUDA WarpReduction: %9.3f ms  (%.2fx vs CPU v2)\n", cwrp_med, v2_med / cwrp_med);
     std::printf("  CUDA FusedWarpShuffle: %9.3f ms  (%.2fx vs CPU v2)\n", cfws_med, v2_med / cfws_med);
     std::printf("  CUDA BatchedStream: %9.3f ms  (%.2fx vs CPU v2)\n", cbat_med, v2_med / cbat_med);
+    std::printf("  CUDA BatchedKernel: %9.3f ms  (%.2fx vs CPU v2)\n", cbat_ker_med, v2_med / cbat_ker_med);
     std::printf("===============================================================\n");
 
     // Per-window pass: fresh isolated calls for latency (see file header),
@@ -657,7 +678,7 @@ int main(int argc, char** argv) {
     if (prefix) {
         const beamformer::CudaDeviceInfo device_info;
         write_summary_csv(with_suffix(*prefix, "_summary.csv"), dims, opts, max_threads, n_med,
-                          v1_med, v2_med, c2p_med, cfus_med, cwrp_med, cfws_med, cbat_med);
+                          v1_med, v2_med, c2p_med, cfus_med, cwrp_med, cfws_med, cbat_med, cbat_ker_med);
         write_frame_latencies_csv(with_suffix(*prefix, "_frame_latencies.csv"), frame_rows);
         write_window_stats_csv(with_suffix(*prefix, "_window_validation.csv"), window_stats_rows);
         write_metadata_json(with_suffix(*prefix, "_metadata.json"), dims, opts, device_info,

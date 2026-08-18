@@ -758,21 +758,28 @@ struct BatchedTrackerStream::Impl {
     float* d_window_directions = nullptr;
     double* d_wavenumbers = nullptr;
     cudaStream_t stream = nullptr;
+    cudaEvent_t start_event = nullptr;
+    cudaEvent_t stop_event = nullptr;
 
     std::size_t window_bytes = 0;
     std::size_t batch_voltage_bytes = 0;
     std::size_t batch_output_floats = 0;
+    float last_kernel_time_ms = 0.0F;
 
     void free_all() {
         if (d_intensity) cudaFree(d_intensity);
         if (d_packed) cudaFree(d_packed);
         if (d_window_directions) cudaFree(d_window_directions);
         if (d_wavenumbers) cudaFree(d_wavenumbers);
+        if (start_event) cudaEventDestroy(start_event);
+        if (stop_event) cudaEventDestroy(stop_event);
         if (stream) cudaStreamDestroy(stream);
         d_intensity = nullptr;
         d_packed = nullptr;
         d_window_directions = nullptr;
         d_wavenumbers = nullptr;
+        start_event = nullptr;
+        stop_event = nullptr;
         stream = nullptr;
     }
     ~Impl() { free_all(); }
@@ -823,6 +830,8 @@ BatchedTrackerStream::BatchedTrackerStream(const Dimensions& dims,
                           dims.n_freq * sizeof(double)),
                "cudaMalloc d_wavenumbers (batched)");
     check_cuda(cudaStreamCreate(&impl_->stream), "cudaStreamCreate (batched)");
+    check_cuda(cudaEventCreate(&impl_->start_event), "cudaEventCreate start (batched)");
+    check_cuda(cudaEventCreate(&impl_->stop_event), "cudaEventCreate stop (batched)");
 
     // Per-freq wavenumbers are uniform across the whole run; compute once.
     const auto frequencies = channelized_frequencies(dims.n_freq);
@@ -846,6 +855,9 @@ std::size_t BatchedTrackerStream::batch_voltage_bytes() const {
 std::size_t BatchedTrackerStream::batch_output_floats() const {
     return impl_->batch_output_floats;
 }
+float BatchedTrackerStream::last_kernel_time_ms() const {
+    return impl_->last_kernel_time_ms;
+}
 
 void BatchedTrackerStream::process_batch(const std::size_t first_window_index,
                                          const std::uint8_t* host_packed,
@@ -854,8 +866,6 @@ void BatchedTrackerStream::process_batch(const std::size_t first_window_index,
     const TrackerConfig& tracker = impl_->tracker;
     const std::size_t batch_size = impl_->batch_size;
 
-    // Derive the steering direction for each window in the batch from the
-    // continuous trajectory, evaluated at the window's absolute index.
     std::vector<float> window_directions_flat(batch_size * 3);
     for (std::size_t w = 0; w < batch_size; ++w) {
         const Vec3 direction = tracker_window_direction(
@@ -865,7 +875,6 @@ void BatchedTrackerStream::process_batch(const std::size_t first_window_index,
         window_directions_flat[w * 3 + 2] = direction[2];
     }
 
-    // Single H2D copy for the whole batch, then the metadata, then ONE kernel.
     check_cuda(cudaMemcpyAsync(impl_->d_packed, host_packed,
                                impl_->batch_voltage_bytes, cudaMemcpyHostToDevice,
                                impl_->stream),
@@ -876,25 +885,66 @@ void BatchedTrackerStream::process_batch(const std::size_t first_window_index,
                                cudaMemcpyHostToDevice, impl_->stream),
                "cudaMemcpyAsync directions H2D (batched)");
 
-    // Present the batch as a single n_time == batch_size * integration_spectra
-    // cube. The kernel's per-warp window index then ranges 0..batch_size-1 and
-    // each warp's time loop spans exactly its own integration window.
     Dimensions batch_dims{batch_size * tracker.integration_spectra, dims.n_freq,
                           dims.n_ant, dims.n_beams};
-    TrackerConfig batch_tracker = tracker;  // integration_spectra unchanged
+    TrackerConfig batch_tracker = tracker;
 
+    check_cuda(cudaEventRecord(impl_->start_event, impl_->stream), "start_event record");
     launch_fused_warp_shuffle(impl_->d_intensity, impl_->d_window_directions,
                               impl_->d_wavenumbers, impl_->d_packed, batch_dims,
                               batch_tracker, default_spacing_m, impl_->load_strategy,
                               impl_->stream);
+    check_cuda(cudaEventRecord(impl_->stop_event, impl_->stream), "stop_event record");
 
-    // Single D2H copy of the batch intensity output.
     check_cuda(cudaMemcpyAsync(host_intensity, impl_->d_intensity,
                                impl_->batch_output_floats * sizeof(float),
                                cudaMemcpyDeviceToHost, impl_->stream),
                "cudaMemcpyAsync batch D2H (batched)");
     check_cuda(cudaStreamSynchronize(impl_->stream),
                "cudaStreamSynchronize (batched)");
+
+    check_cuda(cudaEventElapsedTime(&impl_->last_kernel_time_ms,
+                                    impl_->start_event, impl_->stop_event),
+               "cudaEventElapsedTime");
 }
+
+void BatchedTrackerStream::process_batch_kernel_only(const std::size_t first_window_index) {
+    const Dimensions& dims = impl_->dims;
+    const TrackerConfig& tracker = impl_->tracker;
+    const std::size_t batch_size = impl_->batch_size;
+
+    std::vector<float> window_directions_flat(batch_size * 3);
+    for (std::size_t w = 0; w < batch_size; ++w) {
+        const Vec3 direction = tracker_window_direction(
+            tracker.trajectory, first_window_index + w, tracker.integration_spectra);
+        window_directions_flat[w * 3 + 0] = direction[0];
+        window_directions_flat[w * 3 + 1] = direction[1];
+        window_directions_flat[w * 3 + 2] = direction[2];
+    }
+
+    check_cuda(cudaMemcpyAsync(impl_->d_window_directions,
+                               window_directions_flat.data(),
+                               batch_size * 3 * sizeof(float),
+                               cudaMemcpyHostToDevice, impl_->stream),
+               "cudaMemcpyAsync directions H2D (batched kernel-only)");
+
+    Dimensions batch_dims{batch_size * tracker.integration_spectra, dims.n_freq,
+                          dims.n_ant, dims.n_beams};
+    TrackerConfig batch_tracker = tracker;
+
+    check_cuda(cudaEventRecord(impl_->start_event, impl_->stream), "start_event record");
+    launch_fused_warp_shuffle(impl_->d_intensity, impl_->d_window_directions,
+                              impl_->d_wavenumbers, impl_->d_packed, batch_dims,
+                              batch_tracker, default_spacing_m, impl_->load_strategy,
+                              impl_->stream);
+    check_cuda(cudaEventRecord(impl_->stop_event, impl_->stream), "stop_event record");
+    check_cuda(cudaStreamSynchronize(impl_->stream), "cudaStreamSynchronize (batched kernel-only)");
+
+    check_cuda(cudaEventElapsedTime(&impl_->last_kernel_time_ms,
+                                    impl_->start_event, impl_->stop_event),
+               "cudaEventElapsedTime");
+}
+
+} // namespace beamformer
 
 } // namespace beamformer

@@ -126,6 +126,14 @@ public:
     void process_batch(std::size_t first_window_index,
                        const std::uint8_t* host_packed, float* host_intensity);
 
+    // Executes ONLY the GPU kernel computation for the batch on persistent device
+    // buffers without Host->Device or Device->Host PCIe data transfers.
+    void process_batch_kernel_only(std::size_t first_window_index);
+
+    // Returns the GPU device kernel execution time in milliseconds from the most
+    // recent process_batch or process_batch_kernel_only call (measured via CUDA events).
+    float last_kernel_time_ms() const;
+
     std::size_t batch_size() const;
     std::size_t window_bytes() const;          // bytes per integration window
     std::size_t batch_voltage_bytes() const;   // bytes for the whole batch

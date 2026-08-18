@@ -50,6 +50,7 @@ ENGINES: list[tuple[str, str, str, str]] = [
     ("gpu", "warp_reduction", "CUDA WarpReduction", "#9467bd"),
     ("gpu", "fused_warp_shuffle", "CUDA Fused WarpShuffle", "#2ca02c"),
     ("gpu", "batched_stream", "CUDA Batched Stream", "#e377c2"),
+    ("gpu", "batched_kernel", "CUDA Batched Kernel", "#bcbd22"),
 ]
 
 
