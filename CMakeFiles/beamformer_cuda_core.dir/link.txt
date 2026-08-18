@@ -1,2 +1,0 @@
-/usr/bin/ar qc libbeamformer_cuda_core.a CMakeFiles/beamformer_cuda_core.dir/src/cuda_beamformer.cu.o CMakeFiles/beamformer_cuda_core.dir/src/cuda_offline_runner.cu.o CMakeFiles/beamformer_cuda_core.dir/src/cuda_quantize_int8.cu.o CMakeFiles/beamformer_cuda_core.dir/src/cuda_beam_tracker_v2.cu.o
-/usr/bin/ranlib libbeamformer_cuda_core.a

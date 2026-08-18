@@ -1,2 +1,0 @@
-set(CMAKE_CUDA_COMPILER "/usr/bin/nvcc")
-set(CMAKE_CUDA_HOST_COMPILER "")

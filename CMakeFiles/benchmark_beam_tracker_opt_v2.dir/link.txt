@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/benchmark_beam_tracker_opt_v2.dir/link.d CMakeFiles/benchmark_beam_tracker_opt_v2.dir/tools/benchmark_beam_tracker_opt_v2.cpp.o -o benchmark_beam_tracker_opt_v2  libbeamformer_core_perf.a /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a

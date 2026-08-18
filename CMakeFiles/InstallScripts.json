@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/fernando/charts/beamform_project/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
