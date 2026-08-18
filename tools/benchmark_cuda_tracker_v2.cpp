@@ -301,7 +301,8 @@ std::vector<Engine> make_engines() {
          }},
         {"gpu", "fused_warp_shuffle",
          [](const PackedVoltage& p, const Dimensions& d, const TrackerConfig& t, Intensities& out) {
-             cuda_beam_tracker_fused_warp_shuffle_into(p, d, t, out);
+             // Changed from _into to _stream with 3 streams
+             cuda_beam_tracker_fused_warp_shuffle_stream(p, d, t, out, 3);
          }},
     };
 }
