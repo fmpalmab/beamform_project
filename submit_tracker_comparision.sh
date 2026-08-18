@@ -14,11 +14,11 @@
 # path, left untouched).
 #
 # This version switches to tools/benchmark_cuda_tracker_v2 (see
-# benchmark_cuda_tracker_v2.cpp), which times ALL SIX engines together in a
-# single invocation -- CPU Naive, CPU Opt v1, CPU Opt v2, and the three CUDA
-# v2 kernels (TwoPass, Fused, WarpReduction) -- and re-verifies tolerance
-# equality of every non-naive engine against the CPU naive reference before
-# timing. Each invocation appends one row per engine-pair to
+# benchmark_cuda_tracker_v2.cpp), which times ALL EIGHT engines together in a
+# single invocation -- CPU Naive, CPU Opt v1, CPU Opt v2, CUDA TwoPass,
+# CUDA Fused, CUDA WarpReduction, CUDA FusedWarpShuffle, and CUDA BatchedStream
+# -- and re-verifies tolerance equality of every non-naive engine against the
+# CPU naive reference before timing. Each invocation appends one row per engine-pair to
 # *_summary.csv, so the (n_ant x threads) sweep below accumulates into a
 # single comparison table across CPU thread counts AND GPU kernels.
 #

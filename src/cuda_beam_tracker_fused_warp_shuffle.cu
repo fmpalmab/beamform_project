@@ -736,4 +736,165 @@ void cuda_beam_tracker_fused_warp_shuffle_stream(
     cudaFree(d_wavenumbers);
 }
 
+// ---------------------------------------------------------------------------
+// Batched streaming variant (continuous soak test).
+//
+// Holds persistent device buffers + one CUDA stream so a batch of
+// `batch_size` integration windows is dispatched with a single H2D copy and a
+// single kernel launch (grid == batch_size * n_freq / 4 blocks), saturating the
+// SMs that a per-window launch (84 blocks) leaves idle. The batch is presented
+// to the existing fused warp-shuffle kernel as one `n_time == batch_size *
+// integration_spectra` cube, so each warp still owns exactly one (window, freq)
+// channel and the per-window numerical contract is unchanged.
+// ---------------------------------------------------------------------------
+struct BatchedTrackerStream::Impl {
+    Dimensions dims;          // one integration window
+    TrackerConfig tracker;    // continuous trajectory + integration_spectra
+    std::size_t batch_size = 0;
+    FwsLoadStrategy load_strategy = FwsLoadStrategy::Direct;
+
+    float* d_intensity = nullptr;
+    std::uint8_t* d_packed = nullptr;
+    float* d_window_directions = nullptr;
+    double* d_wavenumbers = nullptr;
+    cudaStream_t stream = nullptr;
+
+    std::size_t window_bytes = 0;
+    std::size_t batch_voltage_bytes = 0;
+    std::size_t batch_output_floats = 0;
+
+    void free_all() {
+        if (d_intensity) cudaFree(d_intensity);
+        if (d_packed) cudaFree(d_packed);
+        if (d_window_directions) cudaFree(d_window_directions);
+        if (d_wavenumbers) cudaFree(d_wavenumbers);
+        if (stream) cudaStreamDestroy(stream);
+        d_intensity = nullptr;
+        d_packed = nullptr;
+        d_window_directions = nullptr;
+        d_wavenumbers = nullptr;
+        stream = nullptr;
+    }
+    ~Impl() { free_all(); }
+};
+
+BatchedTrackerStream::BatchedTrackerStream(const Dimensions& dims,
+                                           const TrackerConfig& tracker,
+                                           std::size_t batch_size,
+                                           const FwsLoadStrategy load_strategy)
+    : impl_(std::make_unique<Impl>()) {
+    if (batch_size == 0) {
+        throw std::invalid_argument("BatchedTrackerStream batch_size must be positive");
+    }
+    if (dims.n_time != tracker.integration_spectra) {
+        throw std::invalid_argument(
+            "BatchedTrackerStream dims must describe exactly one integration window "
+            "(n_time == integration_spectra)");
+    }
+    validate_dimensions(dims);
+    if (dims.n_beams != tracker_beam_count) {
+        throw std::invalid_argument(
+            "BatchedTrackerStream requires exactly n_beams == 1 (tracker_beam_count)");
+    }
+
+    impl_->dims = dims;
+    impl_->tracker = tracker;
+    impl_->batch_size = batch_size;
+    impl_->load_strategy = load_strategy;
+
+    const std::size_t window_bytes =
+        tracker.integration_spectra * dims.n_freq * dims.n_ant;
+    impl_->window_bytes = window_bytes;
+    impl_->batch_voltage_bytes = window_bytes * batch_size;
+    impl_->batch_output_floats =
+        batch_size * tracker.integration_spectra * dims.n_freq * dims.n_beams;
+
+    // Persistent device buffers (allocated once; no per-batch cudaMalloc).
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&impl_->d_packed),
+                          impl_->batch_voltage_bytes),
+               "cudaMalloc d_packed (batched)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&impl_->d_intensity),
+                          impl_->batch_output_floats * sizeof(float)),
+               "cudaMalloc d_intensity (batched)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&impl_->d_window_directions),
+                          batch_size * 3 * sizeof(float)),
+               "cudaMalloc d_window_directions (batched)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&impl_->d_wavenumbers),
+                          dims.n_freq * sizeof(double)),
+               "cudaMalloc d_wavenumbers (batched)");
+    check_cuda(cudaStreamCreate(&impl_->stream), "cudaStreamCreate (batched)");
+
+    // Per-freq wavenumbers are uniform across the whole run; compute once.
+    const auto frequencies = channelized_frequencies(dims.n_freq);
+    std::vector<double> wavenumbers(dims.n_freq);
+    for (std::size_t f = 0; f < dims.n_freq; ++f) {
+        wavenumbers[f] = two_pi * static_cast<double>(frequencies[f])
+                         / speed_of_light_m_per_s;
+    }
+    check_cuda(cudaMemcpy(impl_->d_wavenumbers, wavenumbers.data(),
+                          dims.n_freq * sizeof(double), cudaMemcpyHostToDevice),
+               "cudaMemcpy wavenumbers H2D (batched)");
+}
+
+BatchedTrackerStream::~BatchedTrackerStream() = default;
+
+std::size_t BatchedTrackerStream::batch_size() const { return impl_->batch_size; }
+std::size_t BatchedTrackerStream::window_bytes() const { return impl_->window_bytes; }
+std::size_t BatchedTrackerStream::batch_voltage_bytes() const {
+    return impl_->batch_voltage_bytes;
+}
+std::size_t BatchedTrackerStream::batch_output_floats() const {
+    return impl_->batch_output_floats;
+}
+
+void BatchedTrackerStream::process_batch(const std::size_t first_window_index,
+                                         const std::uint8_t* host_packed,
+                                         float* host_intensity) {
+    const Dimensions& dims = impl_->dims;
+    const TrackerConfig& tracker = impl_->tracker;
+    const std::size_t batch_size = impl_->batch_size;
+
+    // Derive the steering direction for each window in the batch from the
+    // continuous trajectory, evaluated at the window's absolute index.
+    std::vector<float> window_directions_flat(batch_size * 3);
+    for (std::size_t w = 0; w < batch_size; ++w) {
+        const Vec3 direction = tracker_window_direction(
+            tracker.trajectory, first_window_index + w, tracker.integration_spectra);
+        window_directions_flat[w * 3 + 0] = direction[0];
+        window_directions_flat[w * 3 + 1] = direction[1];
+        window_directions_flat[w * 3 + 2] = direction[2];
+    }
+
+    // Single H2D copy for the whole batch, then the metadata, then ONE kernel.
+    check_cuda(cudaMemcpyAsync(impl_->d_packed, host_packed,
+                               impl_->batch_voltage_bytes, cudaMemcpyHostToDevice,
+                               impl_->stream),
+               "cudaMemcpyAsync batch H2D (batched)");
+    check_cuda(cudaMemcpyAsync(impl_->d_window_directions,
+                               window_directions_flat.data(),
+                               batch_size * 3 * sizeof(float),
+                               cudaMemcpyHostToDevice, impl_->stream),
+               "cudaMemcpyAsync directions H2D (batched)");
+
+    // Present the batch as a single n_time == batch_size * integration_spectra
+    // cube. The kernel's per-warp window index then ranges 0..batch_size-1 and
+    // each warp's time loop spans exactly its own integration window.
+    Dimensions batch_dims{batch_size * tracker.integration_spectra, dims.n_freq,
+                          dims.n_ant, dims.n_beams};
+    TrackerConfig batch_tracker = tracker;  // integration_spectra unchanged
+
+    launch_fused_warp_shuffle(impl_->d_intensity, impl_->d_window_directions,
+                              impl_->d_wavenumbers, impl_->d_packed, batch_dims,
+                              batch_tracker, default_spacing_m, impl_->load_strategy,
+                              impl_->stream);
+
+    // Single D2H copy of the batch intensity output.
+    check_cuda(cudaMemcpyAsync(host_intensity, impl_->d_intensity,
+                               impl_->batch_output_floats * sizeof(float),
+                               cudaMemcpyDeviceToHost, impl_->stream),
+               "cudaMemcpyAsync batch D2H (batched)");
+    check_cuda(cudaStreamSynchronize(impl_->stream),
+               "cudaStreamSynchronize (batched)");
+}
+
 } // namespace beamformer

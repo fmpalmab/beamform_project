@@ -37,6 +37,7 @@
 #include "beamformer/formats.hpp"        // PackedVoltage, Intensities
 
 #include <cstddef>
+#include <memory>
 #include <vector>
 
 namespace beamformer {
@@ -80,5 +81,59 @@ void cuda_beam_tracker_fused_warp_shuffle_stream(
     const TrackerConfig& tracker, Intensities& intensity,
     std::size_t n_streams = 3,
     FwsLoadStrategy load_strategy = FwsLoadStrategy::Direct);
+
+// ---------------------------------------------------------------------------
+// Batched streaming variant for the continuous 24/7 soak test.
+//
+// The single-window streaming path launches one kernel per integration window,
+// which yields only `n_freq / 4` == 84 blocks on a 336-channel shard -- far too
+// few to saturate the SMs of an H100 / RTX 5090. This class instead accumulates
+// a configurable batch of `batch_size` integration windows and dispatches them
+// with a SINGLE H2D copy + SINGLE kernel launch whose grid is
+// `batch_size * n_freq / 4` blocks, so the GPU stays busy while the producer
+// keeps feeding windows at the 1.05 ms cadence.
+//
+// The class owns persistent device buffers (batch voltage, per-window steering
+// metadata, output) and one CUDA stream, so per-batch dispatch has no
+// cudaMalloc / cudaFree / stream-create overhead. The caller owns the host
+// batch buffer (e.g. a pinned ring-buffer span) and the host output buffer.
+//
+// The kernel is the SAME fused warp-shuffle kernel as the other variants; the
+// batch is presented as a single `n_time == batch_size * integration_spectra`
+// cube, so each warp still owns exactly one (window, freq) channel and the
+// per-window numerical contract is unchanged.
+// ---------------------------------------------------------------------------
+class BatchedTrackerStream {
+public:
+    // `dims` describes ONE integration window (n_time == integration_spectra).
+    // `tracker` carries the continuous trajectory + integration_spectra.
+    // `batch_size` is the number of windows dispatched per kernel launch.
+    BatchedTrackerStream(const Dimensions& dims, const TrackerConfig& tracker,
+                         std::size_t batch_size,
+                         FwsLoadStrategy load_strategy = FwsLoadStrategy::Direct);
+    ~BatchedTrackerStream();
+
+    BatchedTrackerStream(const BatchedTrackerStream&) = delete;
+    BatchedTrackerStream& operator=(const BatchedTrackerStream&) = delete;
+
+    // Dispatch one batch. `first_window_index` is the ABSOLUTE index of the
+    // first window in the batch along the continuous trajectory (used to derive
+    // each window's steering direction). `host_packed` points at `batch_size`
+    // contiguous integration windows of packed int4 voltage (window-major);
+    // `host_intensity` receives `batch_size * integration_spectra * n_freq`
+    // float32 intensities ([time][freq][beam==1] within the batch). Both are
+    // caller-owned. Synchronous: returns after the D2H copy completes.
+    void process_batch(std::size_t first_window_index,
+                       const std::uint8_t* host_packed, float* host_intensity);
+
+    std::size_t batch_size() const;
+    std::size_t window_bytes() const;          // bytes per integration window
+    std::size_t batch_voltage_bytes() const;   // bytes for the whole batch
+    std::size_t batch_output_floats() const;   // floats for the whole batch
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace beamformer
