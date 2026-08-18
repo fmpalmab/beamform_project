@@ -402,7 +402,12 @@ struct DeviceBuffers {
         if (d_intensity) cudaFree(d_intensity);
         if (d_window_directions) cudaFree(d_window_directions);
         if (d_wavenumbers) cudaFree(d_wavenumbers);
-        d_packed = d_intensity = d_window_directions = d_wavenumbers = nullptr;
+        
+        // Fix: Assign nullptr individually instead of chaining
+        d_packed = nullptr;
+        d_intensity = nullptr;
+        d_window_directions = nullptr;
+        d_wavenumbers = nullptr;
     }
     ~DeviceBuffers() { free_all(); }
 };
