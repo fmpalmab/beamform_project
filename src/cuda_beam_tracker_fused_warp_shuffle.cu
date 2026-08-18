@@ -691,7 +691,7 @@ void cuda_beam_tracker_fused_warp_shuffle_stream(
                 + first_time * dims.n_freq * dims.n_beams;
 
             launch_fused_warp_shuffle(d_window_intensity,
-                                     d_window_directions, d_wavenumbers,
+                                     d_window_directions + w * 3, d_wavenumbers,
                                      d_packed + chunk_offset, win_dims,
                                      win_tracker, spacing_m, load_strategy,
                                      streams[s]);
