@@ -51,7 +51,11 @@ void print_usage(const char* prog) {
 } // namespace
 
 int main(int argc, char** argv) {
+#if BEAMFORMER_HAS_CUDA
+    std::string engine = "cuda_fws";
+#else
     std::string engine = "cpu_v2";
+#endif
     std::size_t n_time = 15360;
     std::size_t n_freq = beamformer::default_frequency_channels;
     std::size_t n_ant = 64;

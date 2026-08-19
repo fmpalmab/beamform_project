@@ -119,8 +119,8 @@ def render_astronomical_dashboard(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--engine", type=str, default="cpu_v2",
-                        help="Tracker engine to test (cpu_naive, cpu_v1, cpu_v2, cuda_fws)")
+    parser.add_argument("--engine", type=str, default="cuda_fws",
+                        help="Tracker engine to test (cuda_fws, cpu_v2, cpu_v1, cpu_naive)")
     parser.add_argument("--burst", type=str, default="FRB20180916B_canonical",
                         help="FRB benchmark name or 'all'")
     parser.add_argument("--outdir", type=Path, default=Path("results/astronomical_validation"),

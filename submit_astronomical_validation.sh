@@ -37,21 +37,15 @@ cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --target run_tracker_stream -j 8
 echo ""
 
-# 2. Run Astronomical Validation Suite for CPU Opt v2
-echo "--- Running Astronomical Validation: CPU Opt v2 ---"
-python tools/run_astronomical_validation.py \
-    --engine cpu_v2 \
-    --burst all \
-    --outdir results/astronomical_validation_cpu
-
-# 3. Run Astronomical Validation Suite for CUDA Fused WarpShuffle (if GPU available)
-echo "--- Running Astronomical Validation: CUDA FusedWarpShuffle ---"
+# 2. Run Astronomical Validation Suite for CUDA Fused WarpShuffle (Best GPU Kernel)
+echo "--- Running Astronomical Validation: CUDA FusedWarpShuffle (cuda_fws) ---"
 python tools/run_astronomical_validation.py \
     --engine cuda_fws \
     --burst all \
-    --outdir results/astronomical_validation_gpu
+    --outdir results/astronomical_validation
 
 echo "=== Astronomical Validation Job completed successfully at $(date) ==="
-echo "Report JSONs written to:"
-echo "  results/astronomical_validation_cpu/astronomical_validation_report.json"
-echo "  results/astronomical_validation_gpu/astronomical_validation_report.json"
+echo "Report JSON written to:"
+echo "  results/astronomical_validation/astronomical_validation_report.json"
+echo "Dashboard Plot written to:"
+echo "  results/astronomical_validation/astronomical_validation_dashboard.png"

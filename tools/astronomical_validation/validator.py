@@ -27,7 +27,7 @@ from .runner import run_beam_tracker
 
 def test_dispersion_sweep_recovery(
     params: FRBParameters,
-    engine: str = "cpu_v2",
+    engine: str = "cuda_fws",
     n_time: int = 15360,
     n_ant: int = 64,
     n_freq: int = 336,
@@ -59,7 +59,7 @@ def test_dispersion_sweep_recovery(
 
 def test_spectro_temporal_refit(
     params: FRBParameters,
-    engine: str = "cpu_v2",
+    engine: str = "cuda_fws",
     n_time: int = 15360,
     n_ant: int = 64,
     n_freq: int = 336,
@@ -78,7 +78,7 @@ def test_spectro_temporal_refit(
 
 def test_off_boresight_beam_response(
     params: FRBParameters,
-    engine: str = "cpu_v2",
+    engine: str = "cuda_fws",
     n_time: int = 15360,
     n_ant: int = 64,
     n_freq: int = 336,
@@ -124,7 +124,7 @@ def test_off_boresight_beam_response(
 
 def test_radiometer_array_scaling(
     params: FRBParameters,
-    engine: str = "cpu_v2",
+    engine: str = "cuda_fws",
     n_time: int = 15360,
     n_freq: int = 336,
 ) -> Dict[str, float | bool | str | List[int] | List[float]]:
