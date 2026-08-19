@@ -22,6 +22,8 @@ if [ -d ".venv" ]; then
 fi
 
 export PYTHONPATH="${SLURM_SUBMIT_DIR}/tools:${PYTHONPATH}"
+export OMP_NUM_THREADS=24
+export OMP_PROC_BIND=true
 
 mkdir -p results/astronomical_validation
 

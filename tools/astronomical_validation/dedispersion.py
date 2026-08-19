@@ -2,6 +2,7 @@
 
 Implements DM trial shifting, frequency integration, time profile construction,
 SNR computation, and DM butterfly curve generation for beam tracker dynamic spectra.
+Vectorized for ultra-fast C-speed execution.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ def dedisperse_waterfall(
     """Dedisperse 2D intensity waterfall (n_time, n_freq) at trial DM.
 
     Returns (dedispersed_waterfall, time_profile_1d).
+    Vectorized take_along_axis implementation.
     """
     n_time, n_freq = waterfall.shape
     if freqs_hz is None:
@@ -33,12 +35,11 @@ def dedisperse_waterfall(
 
     # Delays per frequency channel in seconds
     delays_s = K_DM * dm_trial * ((freqs_mhz ** -2.0) - (f_ref_mhz ** -2.0))
-    shift_samples = np.round(delays_s / dt).astype(int)
+    shift_samples = np.round(delays_s / dt).astype(np.int64)
 
-    dedispersed = np.zeros_like(waterfall)
-    for f_idx in range(n_freq):
-        shift = shift_samples[f_idx]
-        dedispersed[:, f_idx] = np.roll(waterfall[:, f_idx], -shift)
+    # Vectorized 2D shift along time axis
+    time_idx = (np.arange(n_time)[:, None] + shift_samples[None, :]) % n_time
+    dedispersed = np.take_along_axis(waterfall, time_idx, axis=0)
 
     profile = np.sum(dedispersed, axis=1)
     return dedispersed, profile

@@ -18,3 +18,5 @@ Testing/
 *.cmake
 !CMakeLists.txt
 trillium_bench_results/
+
+.gemini/
