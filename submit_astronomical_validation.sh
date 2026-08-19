@@ -17,6 +17,12 @@ module load gcc/12.3
 module load cuda/12.6
 module load python/3.11
 
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+fi
+
+export PYTHONPATH="${SLURM_SUBMIT_DIR}/tools:${PYTHONPATH}"
+
 mkdir -p results/astronomical_validation
 
 echo "=== Astronomical Validation Job started on $(hostname) at $(date) ==="

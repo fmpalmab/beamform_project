@@ -13,6 +13,9 @@ import json
 import sys
 from pathlib import Path
 
+# Ensure tools directory is in sys.path for internal module imports
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import numpy as np
 
 from astronomical_validation.chime_catalog import CHIME_CATALOG2_BENCHMARKS, get_frb_benchmark
