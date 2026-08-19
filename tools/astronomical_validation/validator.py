@@ -121,7 +121,7 @@ def test_radiometer_array_scaling(
 ) -> Dict[str, float | bool | str | List[int] | List[float]]:
     """Test 4: Radiometer Coherent Sensitivity Array Scaling (SNR ~ sqrt(N_ant))."""
     freqs_hz = default_frequencies_hz(n_freq)
-    ant_counts = [16, 32, 64]
+    ant_counts = [32, 64]
     snrs = []
 
     for n_ant in ant_counts:

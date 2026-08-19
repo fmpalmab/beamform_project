@@ -76,7 +76,7 @@ def refit_spectro_temporal_parameters(
     channel_powers = np.maximum(channel_powers, 1e-6)
 
     freqs_mhz = freqs_hz / 1e6
-    f_ref_mhz = 600.0
+    f_ref_mhz = 800.0
     log_f = np.log(freqs_mhz / f_ref_mhz)
     log_p = np.log(channel_powers)
 

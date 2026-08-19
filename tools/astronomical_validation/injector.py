@@ -59,7 +59,7 @@ def synthesize_frb_intensity_waterfall(
     n_time: int,
     freqs_hz: np.ndarray,
     sample_rate_hz: float = 952.381,  # ~1.05 ms sample cadence
-    f_ref_hz: float = 600e6,
+    f_ref_hz: float = 800e6,
 ) -> np.ndarray:
     """Synthesize 2D spectro-temporal intensity waterfall I(t, f) for an FRB burst.
 
