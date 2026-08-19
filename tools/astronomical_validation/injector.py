@@ -111,8 +111,8 @@ def pack_complex_int4(real: np.ndarray, imag: np.ndarray) -> np.ndarray:
     real_clamped = np.clip(np.round(real), -7, 7).astype(np.int8)
     imag_clamped = np.clip(np.round(imag), -7, 7).astype(np.int8)
 
-    real_uint4 = (real_clamped & 0x0F).astype(np.uint8)
-    imag_uint4 = ((imag_clamped & 0x0F) << 4).astype(np.uint8)
+    real_uint4 = (real_clamped & 0x0F).view(np.uint8)
+    imag_uint4 = ((imag_clamped & 0x0F) << 4).view(np.uint8)
 
     packed = real_uint4 | imag_uint4
     return packed
@@ -126,6 +126,8 @@ def generate_frb_packed_voltage_stream(
     source_dir_lm: Tuple[float, float] = (0.0, 0.0),
     steer_dir_lm: Tuple[float, float] = (0.0, 0.0),
     seed: int = 42,
+    ref_n_ant: int = 64,
+    waterfall: np.ndarray | None = None,
 ) -> Tuple[bytes, np.ndarray]:
     """Generate per-antenna complex int4 packed voltage binary stream.
 
@@ -149,30 +151,37 @@ def generate_frb_packed_voltage_stream(
     phases = (2.0 * np.pi / SPEED_OF_LIGHT) * np.outer(freqs_hz, pos_dot_s)
 
     # Dynamic spectrum pulse intensity (n_time, n_freq)
-    waterfall = synthesize_frb_intensity_waterfall(params, n_time, freqs_hz)
+    if waterfall is None:
+        waterfall = synthesize_frb_intensity_waterfall(params, n_time, freqs_hz)
 
-    # Scale signal amplitude so beamformed coherent sum achieves target SNR
-    # Coherent gain = n_ant, Noise RMS after sum = sqrt(n_ant) * sigma_noise
-    # => Target SNR = sqrt(n_ant) * (Amp_signal / sigma_noise)
+    # Scale signal amplitude so beamformed coherent sum achieves target SNR for reference array
     sigma_noise = 1.5
     peak_intensity = np.max(waterfall) if np.max(waterfall) > 0 else 1.0
-    amp_scale = (params.target_snr * sigma_noise) / (math.sqrt(n_ant) * math.sqrt(peak_intensity))
+    amp_scale = np.float32((params.target_snr * sigma_noise) / (math.sqrt(ref_n_ant) * math.sqrt(peak_intensity)))
 
     # Baseband complex signal per (time, freq, ant)
     # Signal voltage = amp_scale * sqrt(I(t, f)) * exp(i * phase)
-    signal_volts = np.sqrt(waterfall[:, :, np.newaxis]) * amp_scale  # (n_time, n_freq, 1)
-    complex_phases = np.exp(1j * phases)[np.newaxis, :, :]            # (1, n_freq, n_ant)
+    signal_volts = (np.sqrt(waterfall[:, :, np.newaxis]) * amp_scale).astype(np.float32)
+    complex_phases = np.exp(1j * phases, dtype=np.complex64)[np.newaxis, :, :]
 
     signal_complex = signal_volts * complex_phases                     # (n_time, n_freq, n_ant)
 
-    # Additive background Gaussian noise per antenna
-    noise_r = rng.normal(0.0, sigma_noise, size=(n_time, n_freq, n_ant))
-    noise_i = rng.normal(0.0, sigma_noise, size=(n_time, n_freq, n_ant))
-    noise_complex = noise_r + 1j * noise_i
+    # Additive background Gaussian noise per antenna in float32
+    noise_r = rng.standard_normal(size=(n_time, n_freq, n_ant), dtype=np.float32)
+    noise_r *= sigma_noise
+    noise_r += signal_complex.real
+    real_clamped = np.clip(np.round(noise_r), -7, 7).astype(np.int8)
+    del noise_r
 
-    total_complex = signal_complex + noise_complex
+    noise_i = rng.standard_normal(size=(n_time, n_freq, n_ant), dtype=np.float32)
+    noise_i *= sigma_noise
+    noise_i += signal_complex.imag
+    imag_clamped = np.clip(np.round(noise_i), -7, 7).astype(np.int8)
+    del noise_i
 
-    # Quantize to int4 packed bytes
-    packed_array = pack_complex_int4(total_complex.real, total_complex.imag)
+    # Quantize to int4 packed bytes directly
+    real_uint4 = (real_clamped & 0x0F).view(np.uint8)
+    imag_uint4 = ((imag_clamped & 0x0F) << 4).view(np.uint8)
+    packed_array = real_uint4 | imag_uint4
 
     return packed_array.tobytes(), waterfall

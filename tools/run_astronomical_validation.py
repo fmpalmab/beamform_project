@@ -34,6 +34,10 @@ def render_astronomical_dashboard(
     params,
     engine: str,
     output_png: Path,
+    profile: np.ndarray | None = None,
+    sweep: dict | None = None,
+    off_res: dict | None = None,
+    scale_res: dict | None = None,
 ) -> None:
     """Render 4-panel astronomical validation dashboard PNG."""
     import matplotlib
@@ -45,19 +49,20 @@ def render_astronomical_dashboard(
     n_freq = 336
     freqs_hz = default_frequencies_hz(n_freq)
 
-    # 1. Generate & run baseline pulse
-    packed, _ = generate_frb_packed_voltage_stream(params, n_time=n_time, n_ant=n_ant, n_freq=n_freq)
-    waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
-
-    # 2. Dedisperse & DM sweep
-    dedispersed, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
-    sweep = run_dispersion_sweep(waterfall, params.dm, freqs_hz=freqs_hz)
+    # 1. Profile & Sweep (compute only if not provided)
+    if profile is None or sweep is None:
+        packed, _ = generate_frb_packed_voltage_stream(params, n_time=n_time, n_ant=n_ant, n_freq=n_freq)
+        waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
+        dedispersed, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
+        sweep = run_dispersion_sweep(waterfall, params.dm, freqs_hz=freqs_hz)
 
     # 3. Off-boresight data
-    off_res = test_off_boresight_beam_response(params, engine=engine, n_time=n_time, n_ant=n_ant, n_freq=n_freq)
+    if off_res is None:
+        off_res = test_off_boresight_beam_response(params, engine=engine, n_time=n_time, n_ant=n_ant, n_freq=n_freq)
 
     # 4. Scaling data
-    scale_res = test_radiometer_array_scaling(params, engine=engine, n_time=n_time, n_freq=n_freq)
+    if scale_res is None:
+        scale_res = test_radiometer_array_scaling(params, engine=engine, n_time=n_time, n_freq=n_freq)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
 
@@ -136,13 +141,14 @@ def main() -> int:
 
     burst_names = list(CHIME_CATALOG2_BENCHMARKS.keys()) if args.burst == "all" else [args.burst]
     results_summary = []
+    primary_data = {}
 
     print("\n" + "=" * 70)
     print(f"  CHIME-Style Astronomical Validation Engine: {args.engine}")
     print("=" * 70)
 
     all_passed = True
-    for name in burst_names:
+    for idx, name in enumerate(burst_names):
         params = get_frb_benchmark(name)
         print(f"\n--- Testing Burst Benchmark: {name} (DM={params.dm}) ---")
 
@@ -168,12 +174,26 @@ def main() -> int:
         burst_passed = t1['passed'] and t2['passed'] and t3['passed'] and t4['passed']
         all_passed = all_passed and burst_passed
 
+        if idx == 0:
+            primary_data = {
+                "profile": t1.get("_profile"),
+                "sweep": t1.get("_sweep"),
+                "off_res": t3,
+                "scale_res": t4,
+            }
+
+        # Filter internal underscore keys for report serialization
+        clean_t1 = {k: v for k, v in t1.items() if not k.startswith("_")}
+        clean_t2 = {k: v for k, v in t2.items() if not k.startswith("_")}
+        clean_t3 = {k: v for k, v in t3.items() if not k.startswith("_")}
+        clean_t4 = {k: v for k, v in t4.items() if not k.startswith("_")}
+
         results_summary.append({
             "burst": name,
-            "test_1_dispersion_sweep": t1,
-            "test_2_spectro_temporal": t2,
-            "test_3_off_boresight": t3,
-            "test_4_array_scaling": t4,
+            "test_1_dispersion_sweep": clean_t1,
+            "test_2_spectro_temporal": clean_t2,
+            "test_3_off_boresight": clean_t3,
+            "test_4_array_scaling": clean_t4,
             "burst_passed": burst_passed,
         })
 
@@ -190,7 +210,15 @@ def main() -> int:
     # Render dashboard for primary benchmark
     primary_params = get_frb_benchmark(burst_names[0])
     dashboard_file = args.outdir / "astronomical_validation_dashboard.png"
-    render_astronomical_dashboard(primary_params, args.engine, dashboard_file)
+    render_astronomical_dashboard(
+        primary_params,
+        args.engine,
+        dashboard_file,
+        profile=primary_data.get("profile"),
+        sweep=primary_data.get("sweep"),
+        off_res=primary_data.get("off_res"),
+        scale_res=primary_data.get("scale_res"),
+    )
 
     print("=" * 70)
     if all_passed:

@@ -17,7 +17,11 @@ import numpy as np
 from .chime_catalog import CHIME_CATALOG2_BENCHMARKS, FRBParameters
 from .dedispersion import compute_profile_snr, dedisperse_waterfall, run_dispersion_sweep
 from .fitter import refit_spectro_temporal_parameters
-from .injector import default_frequencies_hz, generate_frb_packed_voltage_stream
+from .injector import (
+    default_frequencies_hz,
+    generate_frb_packed_voltage_stream,
+    synthesize_frb_intensity_waterfall,
+)
 from .runner import run_beam_tracker
 
 
@@ -33,6 +37,7 @@ def test_dispersion_sweep_recovery(
     waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
 
     freqs_hz = default_frequencies_hz(n_freq)
+    dedispersed, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
     sweep_results = run_dispersion_sweep(waterfall, params.dm, freqs_hz=freqs_hz)
 
     dm_err = float(sweep_results["dm_error"])
@@ -47,6 +52,8 @@ def test_dispersion_sweep_recovery(
         "dm_error": dm_err,
         "recovered_snr": float(sweep_results["recovered_snr"]),
         "passed": passed,
+        "_profile": profile,
+        "_sweep": sweep_results,
     }
 
 
@@ -78,6 +85,7 @@ def test_off_boresight_beam_response(
 ) -> Dict[str, float | bool | str | List[float]]:
     """Test 3: Off-Boresight Pointing & Synthesized Beam Pattern Response."""
     freqs_hz = default_frequencies_hz(n_freq)
+    ref_waterfall = synthesize_frb_intensity_waterfall(params, n_time, freqs_hz)
     # Off-axis angles in l-coordinate (sine of angle off boresight)
     off_axis_l = [0.0, 0.005, 0.010, 0.015, 0.020, 0.025]
     peak_powers = []
@@ -85,7 +93,8 @@ def test_off_boresight_beam_response(
     for l_val in off_axis_l:
         packed, _ = generate_frb_packed_voltage_stream(
             params, n_time=n_time, n_ant=n_ant, n_freq=n_freq,
-            source_dir_lm=(l_val, 0.0), steer_dir_lm=(0.0, 0.0)
+            source_dir_lm=(l_val, 0.0), steer_dir_lm=(0.0, 0.0),
+            waterfall=ref_waterfall,
         )
         waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
         _, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
@@ -129,7 +138,9 @@ def test_radiometer_array_scaling(
         waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
         _, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
         snr, _, _, _ = compute_profile_snr(profile)
-        snrs.append(snr)
+        # Convert detected power profile SNR to coherent voltage sensitivity SNR: S/N_voltage = sqrt(S/N_profile)
+        v_snr = math.sqrt(max(0.0, snr))
+        snrs.append(v_snr)
 
     # Fit log(SNR) vs log(N_ant) -> slope should be close to 0.50
     log_nant = np.log(ant_counts)
