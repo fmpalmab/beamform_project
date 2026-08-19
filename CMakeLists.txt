@@ -140,6 +140,13 @@ add_executable(beam_tracker_naive_cpu_test_suite
 target_link_libraries(beam_tracker_naive_cpu_test_suite PRIVATE beamformer_core)
 target_compile_options(beam_tracker_naive_cpu_test_suite PRIVATE -UNDEBUG -O2)
 
+add_executable(run_tracker_stream tools/run_tracker_stream.cpp)
+if(BEAMFORMER_HAS_CUDA)
+    target_link_libraries(run_tracker_stream PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
+else()
+    target_link_libraries(run_tracker_stream PRIVATE beamformer_core OpenMP::OpenMP_CXX)
+endif()
+
 if(BEAMFORMER_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
     add_library(beamformer_cuda_core
