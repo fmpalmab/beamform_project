@@ -80,14 +80,15 @@ fi
 echo "========================================================================"
 echo ""
 
-# 4. Load HPC Environment Modules & Python Virtual Environment
+# 4. Load HPC Environment Modules & Python Environment
 echo "--- [1/7] Environment Setup & Hardware Diagnostics ---"
 if command -v module &> /dev/null; then
-    echo "Loading HPC modules (StdEnv/2023, gcc/12.3, cuda/12.6, python/3.11)..."
+    echo "Loading HPC modules (StdEnv/2023, gcc/12.3, cuda/12.6, python/3.11, scipy-stack)..."
     module load StdEnv/2023 2>/dev/null || true
     module load gcc/12.3 2>/dev/null || true
     module load cuda/12.6 2>/dev/null || true
     module load python/3.11 2>/dev/null || true
+    module load scipy-stack 2>/dev/null || true
 fi
 
 if [[ -d ".venv" ]]; then
@@ -98,7 +99,7 @@ elif [[ -d "venv" ]]; then
     source venv/bin/activate
 fi
 
-export PYTHONPATH="${PROJECT_ROOT}/tools:${PYTHONPATH:-}"
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/tools:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-24}
 export OMP_PROC_BIND=true
 
@@ -142,18 +143,19 @@ echo ""
 echo "--- [2/7] Compiling Project Targets (Release with CUDA) ---"
 BUILD_LOG="${RESULTS_DIR}/build.log"
 
-if [[ "${REBUILD}" -eq 1 && -d "build" ]]; then
-    echo "Cleaning previous build directory..."
+if [[ "${REBUILD}" -eq 1 || ! -f "build/CMakeCache.txt" || ! -f "build/benchmark_cuda_tracker_v3" || ! -f "build/run_tracker_stream" ]]; then
+    echo "Configuring clean build with CUDA support..."
     rm -rf build
 fi
 
 cmake -B build -S . \
     -DCMAKE_BUILD_TYPE=Release \
     -DBEAMFORMER_ENABLE_CUDA=ON \
-    >"${BUILD_LOG}" 2>&1
+    -DBUILD_TESTING=ON \
+    2>&1 | tee "${BUILD_LOG}"
 
-NPROC=$(nproc 2>/dev/null || echo 8)
-cmake --build build --config Release -j "${NPROC}" >>"${BUILD_LOG}" 2>&1
+NPROC=$(nproc 2>/dev/null || echo 24)
+cmake --build build --config Release -j "${NPROC}" 2>&1 | tee -a "${BUILD_LOG}"
 
 echo "Build complete. (Log: ${BUILD_LOG})"
 echo ""
@@ -164,22 +166,19 @@ if [[ "${SKIP_TESTS}" -eq 0 ]]; then
 
     # CTest Suite
     echo ">>> Running CTest Suite (All C++ and CUDA unit tests)..."
-    ctest --test-dir build --output-on-failure >"${RESULTS_DIR}/tests/ctest.log" 2>&1 || {
+    ctest --test-dir build --output-on-failure 2>&1 | tee "${RESULTS_DIR}/tests/ctest.log" || {
         echo "(Warning: Some CTest tests reported failures; see ${RESULTS_DIR}/tests/ctest.log)"
     }
-    grep -E "tests passed|Test project" "${RESULTS_DIR}/tests/ctest.log" || true
 
     # Naive CPU Test Suite
     if [[ -x "./build/beam_tracker_naive_cpu_test_suite" ]]; then
         echo ">>> Running Naive CPU Test Suite..."
-        ./build/beam_tracker_naive_cpu_test_suite --skip-benchmark >"${RESULTS_DIR}/tests/naive_cpu_suite.log" 2>&1 || true
-        grep -E "tests ran|tests passed|tests failed" "${RESULTS_DIR}/tests/naive_cpu_suite.log" || true
+        ./build/beam_tracker_naive_cpu_test_suite --skip-benchmark 2>&1 | tee "${RESULTS_DIR}/tests/naive_cpu_suite.log" || true
     fi
 
     # Python Unit Tests
     echo ">>> Running Python unit tests..."
-    python3 -m unittest discover -s tests/python -p "test_*.py" -v >"${RESULTS_DIR}/tests/python_tests.log" 2>&1 || true
-    tail -n 2 "${RESULTS_DIR}/tests/python_tests.log" || true
+    python3 -m unittest discover -s tests/python -p "test_*.py" -v 2>&1 | tee "${RESULTS_DIR}/tests/python_tests.log" || true
 
     echo "Unit test suite completed."
     echo ""
