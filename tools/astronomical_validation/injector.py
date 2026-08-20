@@ -20,22 +20,26 @@ SPEED_OF_LIGHT = 2.99792458e8  # m/s
 
 
 def default_antenna_positions(n_ant: int, spacing_m: float = 0.6) -> np.ndarray:
-    """Generate (n_ant, 3) antenna coordinates in meters for a regular planar grid."""
-    if n_ant not in (32, 64):
+    """Generate (n_ant, 3) antenna coordinates in meters matching C++ geometry."""
+    if n_ant == 32:
+        nx, ny = 8, 4
+    elif n_ant == 64:
+        nx, ny = 8, 8
+    elif n_ant == 128:
+        nx, ny = 16, 8
+    elif n_ant == 256:
+        nx, ny = 16, 16
+    else:
         grid_size = int(math.sqrt(n_ant))
         nx = grid_size
-        ny = n_ant // grid_size
-    elif n_ant == 32:
-        nx, ny = 8, 4
-    else:  # 64
-        nx, ny = 8, 8
+        ny = (n_ant + grid_size - 1) // grid_size
 
     positions = []
     for y in range(ny):
         for x in range(nx):
             if len(positions) < n_ant:
-                positions.append([(x - (nx - 1) / 2.0) * spacing_m,
-                                  (y - (ny - 1) / 2.0) * spacing_m,
+                positions.append([float(x) * spacing_m,
+                                  float(y) * spacing_m,
                                   0.0])
     return np.array(positions, dtype=np.float32)
 
