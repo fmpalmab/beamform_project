@@ -5,9 +5,9 @@
 v2 applies four changes, none of which alter per-cell floating-point computation
 or the element-axis accumulation order, so v2's output is bit-for-bit identical
 to both the naive tracker and v1. That is asserted in
-`tests/test_beam_tracker_opt_v2.cpp` as exact `std::vector<float>` equality
+`tests/cpu/test_beam_tracker_opt_v2.cpp` as exact `std::vector<float>` equality
 (*both* `naive == v2` *and* `v1 == v2`), and re-asserted in-process before every
-timed run by `tools/benchmark_beam_tracker_opt_v2.cpp` (guard line
+timed run by `benchmarks/benchmark_beam_tracker_opt_v2.cpp` (guard line
 `naive == v1 == v2 byte-equal: PASS (5160960 cells)`).
 
 ## Pre-flight: was Fix 1 even worth attempting?
@@ -153,9 +153,9 @@ second-order win that survives independently of NUMA placement.**
 |------|------|
 | `include/beamformer/beam_tracker_opt_v2.hpp` | v2 public API |
 | `src/beam_tracker_opt_v2.cpp` | v2 implementation (Fixes 1–4) |
-| `tests/test_beam_tracker_opt_v2.cpp` | naive==v2 AND v1==v2, full scenario matrix |
-| `tools/benchmark_beam_tracker_opt_v2.cpp` | three-way (naive/v1/v2) benchmark |
-| `submit_benchmark_v2.sh` | SLURM sweep + numactl diagnostic pair |
+| `tests/cpu/test_beam_tracker_opt_v2.cpp` | naive==v2 AND v1==v2, full scenario matrix |
+| `benchmarks/benchmark_beam_tracker_opt_v2.cpp` | three-way (naive/v1/v2) benchmark |
+| `scripts/slurm/submit_benchmark_v2.sh` | SLURM sweep + numactl diagnostic pair |
 | `CMakeLists.txt` | registers v2 in both cores, the test, and the benchmark |
 
 v1, naive, and `cpu_opt_beam_tracker` files remain bit-for-bit untouched

@@ -7,7 +7,7 @@
 #   1. Builds the benchmark binary via:
 #         cmake --build build --target benchmark_cuda_tracker_v2
 #   2. Sweeps OpenMP thread counts (1, 4, 8, 16, 32, 64) and antenna sizes
-#      (n_ant = 32, 64), invoking tools/benchmark_cuda_tracker_v2 for every
+#      (n_ant = 32, 64), invoking benchmarks/benchmark_cuda_tracker_v2 for every
 #      (threads, n_ant) pair. Each run writes the *_summary.csv,
 #      *_frame_latencies.csv, *_validation.csv, *_window_validation.csv, and
 #      *_metadata.json files under a per-sweep output directory.

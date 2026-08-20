@@ -14,8 +14,8 @@
 
 | Artifact | Purpose |
 |---|---|
-| [`tests/test_cpu_opt_beam_tracker.cpp`](../tests/test_cpu_opt_beam_tracker.cpp) | Extensive unit tests (13 blocks): construction/validation, back-compat equivalence to the naive tracker, free-function + stateful mirrors, Bartlett DOA recovery, Capon estimator, spatial smoothing, forgetting factor, quadratic interpolation, multi-window adaptive tracking, n_ant ∈ {32, 64}, coarse-grid argmax sanity, byte-layout + aligned-vs-misaligned energy. |
-| [`tools/benchmark_cpu_opt_beam_tracker.cpp`](../tools/benchmark_cpu_opt_beam_tracker.cpp) | Benchmark: naive vs optimized end-to-end wall time, **per-frame kernel latencies** (min/mean/median/p95/max) read from the `BEAMFORMER_TRACKER_PERF`-guarded accumulator, DOA-recovery check, PASS/FAIL against the 0.5 ms/frame target. Emits a summary CSV (`--metrics`) and a per-frame CSV (`--frames`). |
+| [`tests/cpu/test_cpu_opt_beam_tracker.cpp`](../tests/cpu/test_cpu_opt_beam_tracker.cpp) | Extensive unit tests (13 blocks): construction/validation, back-compat equivalence to the naive tracker, free-function + stateful mirrors, Bartlett DOA recovery, Capon estimator, spatial smoothing, forgetting factor, quadratic interpolation, multi-window adaptive tracking, n_ant ∈ {32, 64}, coarse-grid argmax sanity, byte-layout + aligned-vs-misaligned energy. |
+| [`benchmarks/benchmark_cpu_opt_beam_tracker.cpp`](../benchmarks/benchmark_cpu_opt_beam_tracker.cpp) | Benchmark: naive vs optimized end-to-end wall time, **per-frame kernel latencies** (min/mean/median/p95/max) read from the `BEAMFORMER_TRACKER_PERF`-guarded accumulator, DOA-recovery check, PASS/FAIL against the 0.5 ms/frame target. Emits a summary CSV (`--metrics`) and a per-frame CSV (`--frames`). |
 | [`tools/plot_cpu_opt_beam_tracker.py`](../tools/plot_cpu_opt_beam_tracker.py) | Dashboard PNG: per-frame latency vs the 0.5 ms target, multi-config summary bars (PASS/FAIL), DOA tracking sky panel (true source / open-loop prior / optimized estimate), direction-error curve, optional optimized intensity heatmap. |
 | [`src/cpu_opt_beam_tracker.cpp`](../src/cpu_opt_beam_tracker.cpp) (edited) | Removed the dead/placeholder `capon_power` (which returned `bartlett_power(R, w)` with the wrong vector); kept the correct `capon_power_correct`. Added a zero-overhead per-frame timing hook behind `BEAMFORMER_TRACKER_PERF`. |
 | [`CMakeLists.txt`](../CMakeLists.txt) (edited) | Added `src/cpu_opt_beam_tracker.cpp` to `beamformer_core`; registered the test and a separate `beamformer_core_perf` static lib (perf macro + `-O3`) used only by the benchmark so production builds keep zero timing overhead. |
@@ -49,7 +49,7 @@ ctest --test-dir build -R cpu_opt_beam_tracker --output-on-failure
 ```
 
 The test binary is assertion-based (no external framework), mirroring
-[`tests/test_beam_tracker.cpp`](../tests/test_beam_tracker.cpp). It exits `0`
+[`tests/cpu/test_beam_tracker.cpp`](../tests/cpu/test_beam_tracker.cpp). It exits `0`
 on success and aborts on the first failing assert with a core file. The 13
 blocks run on synthetic point sources (deterministic, no fixtures on disk).
 

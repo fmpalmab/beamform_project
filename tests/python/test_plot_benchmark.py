@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 
-SCRIPT = Path(__file__).parents[1] / "tools" / "plot_benchmark.py"
+SCRIPT = Path(__file__).parents[2] / "tools" / "plot_benchmark.py"
 SPEC = importlib.util.spec_from_file_location("plot_benchmark", SCRIPT)
 plot_benchmark = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

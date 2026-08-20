@@ -20,7 +20,7 @@
 // None of these four changes alter per-cell floating-point computation or the
 // element-axis accumulation order. The output is therefore bit-for-bit
 // identical to BOTH the naive tracker and v1 — asserted in
-// tests/test_beam_tracker_opt_v2.cpp as exact `std::vector<float>` equality
+// tests/cpu/test_beam_tracker_opt_v2.cpp as exact `std::vector<float>` equality
 // (no epsilon), mirroring the v1 regression contract.
 //
 // Scope guardrails

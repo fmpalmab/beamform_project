@@ -37,9 +37,9 @@
 // ----------------------------
 // The output of beam_tracker_opt_cpu_packed_intensity is **bit-for-bit
 // identical** to beam_tracker_cpu_packed_intensity for the same inputs,
-// asserted in tests/test_beam_tracker_opt.cpp as `assert(naive == opt)`. This
+// asserted in tests/cpu/test_beam_tracker_opt.cpp as `assert(naive == opt)`. This
 // follows the established "naive == opt byte-equality" precedent already used
-// in this codebase (tests/test_cpu_opt_beam_tracker.cpp, block 2). Bit-equality
+// in this codebase (tests/cpu/test_cpu_opt_beam_tracker.cpp, block 2). Bit-equality
 // holds because:
 //   1. The per-window direction is the same call to tracker_window_direction,
 //      so the same trajectory input produces the same direction vector.

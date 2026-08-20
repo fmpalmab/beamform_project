@@ -1,4 +1,4 @@
-// tests/test_cuda_beam_tracker_fused_warp_shuffle.cpp
+// tests/cuda/test_cuda_beam_tracker_fused_warp_shuffle.cpp
 //
 // Correctness unit tests for Phase 4 Fused Warp-Shuffle Tracker.
 // Validates Direct Registers, Shared Memory staging, and Double-Buffered

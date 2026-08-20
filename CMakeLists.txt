@@ -102,7 +102,7 @@ target_link_libraries(beam_tracker_cpu PRIVATE beamformer_core)
 
 # Benchmark for the optimized CPU tracker.
 add_executable(benchmark_cpu_opt_beam_tracker
-    tools/benchmark_cpu_opt_beam_tracker.cpp)
+    benchmarks/benchmark_cpu_opt_beam_tracker.cpp)
 target_link_libraries(benchmark_cpu_opt_beam_tracker PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
 target_compile_options(benchmark_cpu_opt_beam_tracker PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
@@ -115,7 +115,7 @@ target_compile_options(benchmark_cpu_opt_beam_tracker PRIVATE
 # Built against the perf core so both the opt TU and the naive TU it is
 # compared against are at -O3 -march=native for a fair headline comparison.
 add_executable(benchmark_beam_tracker_opt
-    tools/benchmark_beam_tracker_opt.cpp)
+    benchmarks/benchmark_beam_tracker_opt.cpp)
 target_link_libraries(benchmark_beam_tracker_opt PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
 target_compile_options(benchmark_beam_tracker_opt PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
@@ -129,14 +129,14 @@ target_compile_options(benchmark_beam_tracker_opt PRIVATE
 # caught here too. Built against the perf core so v1, v2, and the naive TU they
 # are compared against are all at -O3 -march=native for a fair comparison.
 add_executable(benchmark_beam_tracker_opt_v2
-    tools/benchmark_beam_tracker_opt_v2.cpp)
+    benchmarks/benchmark_beam_tracker_opt_v2.cpp)
 target_link_libraries(benchmark_beam_tracker_opt_v2 PRIVATE beamformer_core_perf OpenMP::OpenMP_CXX)
 target_compile_options(benchmark_beam_tracker_opt_v2 PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
 )
 
 add_executable(beam_tracker_naive_cpu_test_suite
-    tools/beam_tracker_naive_cpu_test_suite.cpp)
+    tests/cpu/beam_tracker_naive_cpu_test_suite.cpp)
 target_link_libraries(beam_tracker_naive_cpu_test_suite PRIVATE beamformer_core)
 target_compile_options(beam_tracker_naive_cpu_test_suite PRIVATE -UNDEBUG -O2)
 
@@ -169,14 +169,14 @@ if(BEAMFORMER_HAS_CUDA)
     add_executable(beamformer_cuda tools/beamformer_cuda.cpp)
     target_link_libraries(beamformer_cuda PRIVATE beamformer_cuda_core)
 
-    add_executable(benchmark_cpu_cuda tools/benchmark_cpu_cuda.cpp)
+    add_executable(benchmark_cpu_cuda benchmarks/benchmark_cpu_cuda.cpp)
     target_link_libraries(benchmark_cpu_cuda PRIVATE beamformer_cuda_core)
 
-    add_executable(benchmark_cuda_quantized tools/benchmark_cuda_quantized.cpp)
+    add_executable(benchmark_cuda_quantized benchmarks/benchmark_cuda_quantized.cpp)
     target_link_libraries(benchmark_cuda_quantized PRIVATE beamformer_cuda_core)
 
     # Benchmark for CUDA Tracker V2 vs CPU optimized trackers
-    add_executable(benchmark_cuda_tracker_v2 tools/benchmark_cuda_tracker_v2.cpp)
+    add_executable(benchmark_cuda_tracker_v2 benchmarks/benchmark_cuda_tracker_v2.cpp)
     target_link_libraries(benchmark_cuda_tracker_v2 
         PRIVATE 
         beamformer_cuda_core 
@@ -187,7 +187,7 @@ if(BEAMFORMER_HAS_CUDA)
     )
 
     # Benchmark for CUDA Tracker V3 (ILP, PTX bfe, Tiled, Streaming, Graph)
-    add_executable(benchmark_cuda_tracker_v3 tools/benchmark_cuda_tracker_v3.cpp)
+    add_executable(benchmark_cuda_tracker_v3 benchmarks/benchmark_cuda_tracker_v3.cpp)
     target_link_libraries(benchmark_cuda_tracker_v3 
         PRIVATE 
         beamformer_cuda_core 
@@ -200,34 +200,34 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(test_contract tests/test_contract.cpp)
+    add_executable(test_contract tests/cpu/test_contract.cpp)
     target_link_libraries(test_contract PRIVATE beamformer_core)
     target_compile_options(test_contract PRIVATE -UNDEBUG)
     add_test(NAME contract COMMAND test_contract)
 
-    add_executable(test_geometry tests/test_geometry.cpp)
+    add_executable(test_geometry tests/cpu/test_geometry.cpp)
     target_link_libraries(test_geometry PRIVATE beamformer_core)
     target_compile_options(test_geometry PRIVATE -UNDEBUG)
     add_test(NAME geometry COMMAND test_geometry)
 
-    add_executable(test_synthetic_data tests/test_synthetic_data.cpp)
+    add_executable(test_synthetic_data tests/cpu/test_synthetic_data.cpp)
     target_link_libraries(test_synthetic_data PRIVATE beamformer_core)
     target_compile_options(test_synthetic_data PRIVATE -UNDEBUG)
     add_test(NAME synthetic_data COMMAND test_synthetic_data)
 
-    add_executable(test_cpu_beamformer tests/test_cpu_beamformer.cpp)
+    add_executable(test_cpu_beamformer tests/cpu/test_cpu_beamformer.cpp)
     target_link_libraries(test_cpu_beamformer PRIVATE beamformer_core)
     target_compile_options(test_cpu_beamformer PRIVATE -UNDEBUG)
     add_test(NAME cpu_beamformer COMMAND test_cpu_beamformer)
 
-    add_executable(test_beam_tracker tests/test_beam_tracker.cpp)
+    add_executable(test_beam_tracker tests/cpu/test_beam_tracker.cpp)
     target_link_libraries(test_beam_tracker PRIVATE beamformer_core)
     target_compile_options(test_beam_tracker PRIVATE -UNDEBUG)
     add_test(NAME beam_tracker COMMAND test_beam_tracker)
 
     # Extensive tests for the optimized CPU tracker (O1–O6 + back-compat).
     add_executable(test_cpu_opt_beam_tracker
-                   tests/test_cpu_opt_beam_tracker.cpp)
+                   tests/cpu/test_cpu_opt_beam_tracker.cpp)
     target_link_libraries(test_cpu_opt_beam_tracker PRIVATE beamformer_core)
     target_compile_options(test_cpu_opt_beam_tracker PRIVATE -UNDEBUG)
     if(BEAMFORMER_TRACKER_DEBUG)
@@ -247,7 +247,7 @@ if(BUILD_TESTING)
     # parity scenarios. The opt TU is intentionally built against the plain
     # beamformer_core (not the perf core) so the regression runs the same build
     # profile as the rest of the suite.
-    add_executable(test_beam_tracker_opt tests/test_beam_tracker_opt.cpp)
+    add_executable(test_beam_tracker_opt tests/cpu/test_beam_tracker_opt.cpp)
     target_link_libraries(test_beam_tracker_opt PRIVATE beamformer_core)
     target_compile_options(test_beam_tracker_opt PRIVATE -UNDEBUG)
     add_test(NAME beam_tracker_opt COMMAND test_beam_tracker_opt)
@@ -264,7 +264,7 @@ if(BUILD_TESTING)
     # noise, multi-window, n_ant 32/64, integration_spectra=1, validation
     # parity across all three paths, output-size contract). Built against the
     # plain beamformer_core for the same reason as the v1 test.
-    add_executable(test_beam_tracker_opt_v2 tests/test_beam_tracker_opt_v2.cpp)
+    add_executable(test_beam_tracker_opt_v2 tests/cpu/test_beam_tracker_opt_v2.cpp)
     target_link_libraries(test_beam_tracker_opt_v2 PRIVATE beamformer_core)
     target_compile_options(test_beam_tracker_opt_v2 PRIVATE -UNDEBUG)
     add_test(NAME beam_tracker_opt_v2 COMMAND test_beam_tracker_opt_v2)
@@ -273,24 +273,24 @@ if(BUILD_TESTING)
         TIMEOUT 120
     )
 
-    add_executable(test_temporal_integration tests/test_temporal_integration.cpp)
+    add_executable(test_temporal_integration tests/cpu/test_temporal_integration.cpp)
     target_link_libraries(test_temporal_integration PRIVATE beamformer_core)
     target_compile_options(test_temporal_integration PRIVATE -UNDEBUG)
     add_test(NAME temporal_integration COMMAND test_temporal_integration)
 
-    add_executable(test_quantization tests/test_quantization.cpp)
+    add_executable(test_quantization tests/cpu/test_quantization.cpp)
     target_link_libraries(test_quantization PRIVATE beamformer_core)
     target_compile_options(test_quantization PRIVATE -UNDEBUG)
     add_test(NAME quantization COMMAND test_quantization)
 
-    add_executable(test_cuda_frame_contract tests/test_cuda_frame_contract.cpp)
+    add_executable(test_cuda_frame_contract tests/cpu/test_cuda_frame_contract.cpp)
     target_link_libraries(test_cuda_frame_contract PRIVATE beamformer_core)
     target_compile_options(test_cuda_frame_contract PRIVATE -UNDEBUG)
     add_test(NAME cuda_frame_contract COMMAND test_cuda_frame_contract)
     set_tests_properties(cuda_frame_contract PROPERTIES LABELS "contract")
 
     if(BEAMFORMER_HAS_CUDA)
-        add_executable(test_cuda_point_source tests/test_cuda_point_source.cpp)
+        add_executable(test_cuda_point_source tests/cuda/test_cuda_point_source.cpp)
         target_link_libraries(test_cuda_point_source PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_point_source PRIVATE -UNDEBUG)
         add_test(NAME cuda_point_source COMMAND test_cuda_point_source)
@@ -299,7 +299,7 @@ if(BUILD_TESTING)
             TIMEOUT 60
         )
 
-        add_executable(test_cuda_packed tests/test_cuda_packed.cu)
+        add_executable(test_cuda_packed tests/cuda/test_cuda_packed.cu)
         target_link_libraries(test_cuda_packed PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_packed PRIVATE -UNDEBUG)
         add_test(NAME cuda_packed COMMAND test_cuda_packed)
@@ -309,7 +309,7 @@ if(BUILD_TESTING)
         )
 
         add_executable(test_cuda_temporal_integration
-                       tests/test_cuda_temporal_integration.cpp)
+                       tests/cuda/test_cuda_temporal_integration.cpp)
         target_link_libraries(test_cuda_temporal_integration PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_temporal_integration PRIVATE -UNDEBUG)
         add_test(NAME cuda_temporal_integration COMMAND test_cuda_temporal_integration)
@@ -318,7 +318,7 @@ if(BUILD_TESTING)
             TIMEOUT 60
         )
 
-        add_executable(test_cuda_quantization tests/test_cuda_quantization.cpp)
+        add_executable(test_cuda_quantization tests/cuda/test_cuda_quantization.cpp)
         target_link_libraries(test_cuda_quantization PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_quantization PRIVATE -UNDEBUG)
         add_test(NAME cuda_quantization COMMAND test_cuda_quantization)
@@ -328,9 +328,9 @@ if(BUILD_TESTING)
         )
 
         add_executable(test_cuda_frame_pipeline
-                       tests/test_cuda_frame_pipeline.cpp)
+                       tests/cuda/test_cuda_frame_pipeline.cpp)
         set_source_files_properties(
-            tests/test_cuda_frame_pipeline.cpp PROPERTIES LANGUAGE CUDA)
+            tests/cuda/test_cuda_frame_pipeline.cpp PROPERTIES LANGUAGE CUDA)
         target_link_libraries(test_cuda_frame_pipeline PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_frame_pipeline PRIVATE -UNDEBUG)
         add_test(NAME cuda_frame_pipeline COMMAND test_cuda_frame_pipeline)
@@ -340,7 +340,7 @@ if(BUILD_TESTING)
         )
 
         add_executable(test_cuda_offline_runner
-                       tests/test_cuda_offline_runner.cpp)
+                       tests/cuda/test_cuda_offline_runner.cpp)
         target_link_libraries(test_cuda_offline_runner PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_offline_runner PRIVATE -UNDEBUG)
         add_test(NAME cuda_offline_runner COMMAND test_cuda_offline_runner)
@@ -349,7 +349,7 @@ if(BUILD_TESTING)
             TIMEOUT 60
         )
         add_executable(test_cuda_tracker_v2
-                       tests/test_cuda_tracker_v2.cpp)
+                       tests/cuda/test_cuda_tracker_v2.cpp)
         target_link_libraries(test_cuda_tracker_v2 PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_tracker_v2 PRIVATE -UNDEBUG)
         add_test(NAME cuda_tracker_v2 COMMAND test_cuda_tracker_v2)
@@ -359,7 +359,7 @@ if(BUILD_TESTING)
         )
 
         add_executable(test_cuda_beam_tracker_fused_warp_shuffle
-                       tests/test_cuda_beam_tracker_fused_warp_shuffle.cpp)
+                       tests/cuda/test_cuda_beam_tracker_fused_warp_shuffle.cpp)
         target_link_libraries(test_cuda_beam_tracker_fused_warp_shuffle PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_beam_tracker_fused_warp_shuffle PRIVATE -UNDEBUG)
         add_test(NAME cuda_beam_tracker_fused_warp_shuffle COMMAND test_cuda_beam_tracker_fused_warp_shuffle)
@@ -369,7 +369,7 @@ if(BUILD_TESTING)
         )
 
         add_executable(test_cuda_beam_tracker_v3
-                       tests/test_cuda_beam_tracker_v3.cpp)
+                       tests/cuda/test_cuda_beam_tracker_v3.cpp)
         target_link_libraries(test_cuda_beam_tracker_v3 PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_beam_tracker_v3 PRIVATE -UNDEBUG)
         add_test(NAME cuda_beam_tracker_v3 COMMAND test_cuda_beam_tracker_v3)

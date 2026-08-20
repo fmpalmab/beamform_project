@@ -1,4 +1,4 @@
-// tests/test_cuda_beam_tracker_v3.cpp
+// tests/cuda/test_cuda_beam_tracker_v3.cpp
 //
 // Unit tests and numerical validation for CUDA Beam Tracker V3.
 // Validates ILP unrolling (T_UNROLL = 2, 4), Time-Chunk Tiling, Multi-Stream

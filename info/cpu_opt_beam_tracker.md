@@ -82,7 +82,7 @@ S_naive = Θ( n_freq * n_ant )               per-window weight storage
    direction — is absent. `dir(t)` is an open-loop parametric guess. If the
    trajectory model is wrong, the coherent gain collapses silently (the
    "misaligned dims" exactly as the `aligned_total > misaligned_total` test in
-   [`tests/test_beam_tracker.cpp:248`](tests/test_beam_tracker.cpp) shows). No
+    [`tests/cpu/test_beam_tracker.cpp:248`](tests/cpu/test_beam_tracker.cpp) shows). No
    spectrum of the data is ever formed over direction, so there is nothing to
    *track* adaptively.
 2. **No spatial covariance is ever built.** Each `(t,f)` sample is consumed
@@ -440,7 +440,7 @@ contracts ([`PackedVoltage`](include/beamformer/formats.hpp:13),
 [`Vec3`](include/beamformer/geometry.hpp:12)) and the existing
 [`read_packed_voltage`](src/io.cpp)/[`write_intensities`](src/io.cpp) IO,
 so the CLI in [`tools/beam_tracker_cpu.cpp`](tools/beam_tracker_cpu.cpp), the
-test fixtures in [`tests/test_beam_tracker.cpp`](tests/test_beam_tracker.cpp),
+test fixtures in [`tests/cpu/test_beam_tracker.cpp`](tests/cpu/test_beam_tracker.cpp),
 and the CSV metrics format all carry over unchanged. The namespace and the
 free-function mirror of the naive API are preserved; a stateful class is added
 to hold the cached steering tables and the recursive covariance state.
@@ -470,7 +470,7 @@ enum class TrackerEstimator {
 // defaults so a default-constructed struct reproduces the naive open-loop
 // output exactly (zero search grid → direction supplied by the trajectory,
 // same as the existing behavior; this is the back-compat / equivalence test
-// anchor in tests/test_beam_tracker.cpp).
+// anchor in tests/cpu/test_beam_tracker.cpp).
 struct CpuOptTrackerConfig {
     // Steering / estimation.
     TrackerEstimator estimator = TrackerEstimator::Bartlett;
@@ -583,12 +583,12 @@ void cpu_opt_beam_tracker_packed_intensity_into(
   must equal the naive [`beam_tracker_cpu_packed_intensity`](src/beam_tracker.cpp:78)
   to within float-rounding — this is the **exact** port of the
   `grid_intensity == tracker_intensity` assertion in
-  [`tests/test_beam_tracker.cpp:139`](tests/test_beam_tracker.cpp) and the
+  [`tests/cpu/test_beam_tracker.cpp:139`](tests/cpu/test_beam_tracker.cpp) and the
   per-spectrum `close(actual, expected, 1e-4)` check at
-  [`tests/test_beam_tracker.cpp:163`](tests/test_beam_tracker.cpp). This is the
+  [`tests/cpu/test_beam_tracker.cpp:163`](tests/cpu/test_beam_tracker.cpp). This is the
   primary regression test the code-mode task must preserve.
 - **Feature parity with the naive test fixtures.** The moving-source recovery
-  test ([`tests/test_beam_tracker.cpp:248`](tests/test_beam_tracker.cpp)) must
+  test ([`tests/cpu/test_beam_tracker.cpp:248`](tests/cpu/test_beam_tracker.cpp)) must
   still pass (`aligned_total > misaligned_total`), and additionally, with the
   search enabled, the *estimated* `window_direction(w)` must lie closer to the
   true source direction than the open-loop trajectory guess (a new assertion the

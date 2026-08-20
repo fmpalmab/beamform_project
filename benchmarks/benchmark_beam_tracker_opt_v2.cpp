@@ -2,7 +2,7 @@
 // (src/beam_tracker_opt.cpp) vs. the reference naive tracker
 // (src/beam_tracker.cpp).
 //
-// This mirrors tools/benchmark_beam_tracker_opt.cpp (the v1 bench) and extends
+// This mirrors benchmarks/benchmark_beam_tracker_opt.cpp (the v1 bench) and extends
 // it to ALSO time v2 at the same configuration, so a single SLURM job produces
 // the v1-vs-v2 apples-to-apples thread sweep the project asked for. The naive
 // path is serial (thread-count independent) and is timed once per run as the

@@ -369,8 +369,8 @@ whether B or C is needed based on measured launch/transfer overhead.
 | [`tools/beam_tracker_cpu.cpp`](tools/beam_tracker_cpu.cpp:1) | CLI: reads a packed shard, runs `beam_tracker_cpu_packed_intensity`, writes float32 `[T][F][B=1]`, optional metrics CSV. Accepts `--track-l0/m0`, `--dl/dm-per-sample`, `--integration-spectra`. |
 | [`tools/plot_tracker_results.py`](tools/plot_tracker_results.py:1) | Tracker dashboard (sky-map trajectory + per-window steering + moving-source overlay, freq-integrated power vs time with optional overlay, single-beam spectrum, `[time,freq]` dB heatmap). Reuses geometry/response helpers from `plot_results.py`. |
 | [`tools/generate_fake_data.cpp`](tools/generate_fake_data.cpp:1) | Extended with a single-shard `moving-point-source` synthetic type and tracker trajectory parsing; the two-shard path rejects it (tracker is per shard). |
-| [`tests/test_beam_tracker.cpp`](tests/test_beam_tracker.cpp:1) | C++ unit tests: trajectory projection, window cadence, stationary==fixed-grid equivalence, per-window decode match, moving-source recovery, validation rejections. |
-| [`tests/test_plot_tracker_results.py`](tests/test_plot_tracker_results.py:1) | Python unit tests: trajectory math, resolution/buffer validation, intensity load round-trip, dashboard PNG render. |
+| [`tests/cpu/test_beam_tracker.cpp`](tests/cpu/test_beam_tracker.cpp:1) | C++ unit tests: trajectory projection, window cadence, stationary==fixed-grid equivalence, per-window decode match, moving-source recovery, validation rejections. |
+| [`tests/python/test_plot_tracker_results.py`](tests/python/test_plot_tracker_results.py:1) | Python unit tests: trajectory math, resolution/buffer validation, intensity load round-trip, dashboard PNG render. |
 | [`CMakeLists.txt`](CMakeLists.txt:1) | `src/beam_tracker.cpp` added to `beamformer_core`; `beam_tracker_cpu` executable; `test_beam_tracker` CTest target. |
 
 No existing tested file (`cpu_beamformer.*`, `cuda_beamformer.*`, `synthetic_data.*`, `weights.*`, `geometry.*`, `io.*`) was modified to add behavior — the only edited existing files are `tools/generate_fake_data.cpp` (new single-shard `moving-point-source` branch, additive) and `CMakeLists.txt` (new targets, additive).
@@ -385,7 +385,7 @@ Start 5: beam_tracker
 100% tests passed, 0 tests failed out of 1
 ```
 
-The Python plotting helper module is covered by `tests/test_plot_tracker_results.py` (run
+The Python plotting helper module is covered by `tests/python/test_plot_tracker_results.py` (run
 under the project's conda env, see §9.5).
 
 ## 9.4 End-to-end example (single shard)
@@ -435,7 +435,7 @@ stationary beam — a visual confirmation that per-window steering tracks the so
 ## 9.5 Tests for the plotting helper
 
 ```bash
-conda run -n kotekan_test python tests/test_plot_tracker_results.py
+conda run -n kotekan_test python tests/python/test_plot_tracker_results.py
 ```
 
 These cover trajectory projection, window steering, off-disk rejection, intensity loading,

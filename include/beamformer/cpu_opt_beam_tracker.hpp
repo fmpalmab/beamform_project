@@ -16,7 +16,7 @@
 // `PackedVoltage` / `Intensities` / `Dimensions` / `Vec3` data contracts, the
 // `read_packed_voltage` / `write_intensities` IO, and emit the standard
 // `[time][freq][beam=1]` float32 intensity cube so the existing CLI
-// (`tools/beam_tracker_cpu.cpp`), test fixtures (`tests/test_beam_tracker.cpp`)
+// (`tools/beam_tracker_cpu.cpp`), test fixtures (`tests/cpu/test_beam_tracker.cpp`)
 // and CSV metrics (`tools/plot_tracker_results.py`) carry over unchanged.
 //
 // Only algorithmic optimizations are in scope here. SIMD/AVX, threading and
@@ -25,7 +25,7 @@
 //
 // Default-constructed `CpuOptTrackerConfig` reproduces the naive open-loop
 // output exactly (scan disabled → supplied trajectory direction), preserving
-// the regression anchor in `tests/test_beam_tracker.cpp`.
+// the regression anchor in `tests/cpu/test_beam_tracker.cpp`.
 
 #include "beamformer/beam_tracker.hpp"  // TrackerConfig, tracker_*, tracker_beam_count
 #include "beamformer/complex.hpp"
@@ -49,7 +49,7 @@ enum class TrackerEstimator {
 // defaults so a default-constructed struct reproduces the naive open-loop
 // output exactly (zero search grid → direction supplied by the trajectory,
 // same as the existing behavior; this is the back-compat / equivalence test
-// anchor in tests/test_beam_tracker.cpp).
+// anchor in tests/cpu/test_beam_tracker.cpp).
 struct CpuOptTrackerConfig {
     // Steering / estimation.
     TrackerEstimator estimator = TrackerEstimator::Bartlett;

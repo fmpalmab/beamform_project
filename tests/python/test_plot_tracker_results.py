@@ -13,7 +13,7 @@ import numpy as np
 # plot_tracker_results.py imports shared helpers from plot_results via a
 # bare module import, so the tools/ directory must be importable before we
 # exec the script under test.
-TOOLS_DIR = Path(__file__).parents[1] / "tools"
+TOOLS_DIR = Path(__file__).parents[2] / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 

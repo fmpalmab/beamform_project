@@ -30,7 +30,7 @@
 //      and window_direction count == tracker_window_count.
 //
 // These tests deliberately mirror the assertion style of
-// tests/test_beam_tracker.cpp (assert-based, no external framework) so they
+// tests/cpu/test_beam_tracker.cpp (assert-based, no external framework) so they
 // integrate with the existing `-UNDEBUG` CMake pattern. They use only the
 // public API (seed_trajectory / run_into / window_direction / config / dims).
 

@@ -15,7 +15,7 @@
 # Runs the full V3 pipeline (Build, Unit Tests, Astro Validation, Benchmark Sweep).
 #
 # Usage:
-#   sbatch submit_v3_complete_suite.sh
+#   sbatch scripts/slurm/submit_v3_complete_suite.sh
 # ==============================================================================
 
 set -e
@@ -25,4 +25,4 @@ cd "${SLURM_SUBMIT_DIR}"
 mkdir -p results/v3_suite
 
 # Execute master validation script
-bash run_all_v3_validation.sh
+bash scripts/run_all_v3_validation.sh

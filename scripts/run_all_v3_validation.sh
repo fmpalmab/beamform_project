@@ -16,7 +16,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${PROJECT_ROOT}"
 
 # ------------------------------------------------------------------------------
 # 0. Environment Setup & Module Loading (Trillium / Compute Canada / HPC)
@@ -42,11 +43,11 @@ elif [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
-export PYTHONPATH="${SCRIPT_DIR}/tools:${PYTHONPATH}"
+export PYTHONPATH="${PROJECT_ROOT}/tools:${PYTHONPATH}"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-24}
 export OMP_PROC_BIND=true
 
-RESULTS_DIR="${SCRIPT_DIR}/results/v3_suite"
+RESULTS_DIR="${PROJECT_ROOT}/results/v3_suite"
 mkdir -p "${RESULTS_DIR}/astronomical_validation"
 mkdir -p "${RESULTS_DIR}/benchmarks"
 mkdir -p "${RESULTS_DIR}/plots"

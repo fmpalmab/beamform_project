@@ -13,7 +13,7 @@
 # on a 192-core CPU node -- see submit_benchmark_v2.sh for that CPU-only
 # path, left untouched).
 #
-# This version switches to tools/benchmark_cuda_tracker_v2 (see
+# This version switches to benchmarks/benchmark_cuda_tracker_v2 (see
 # benchmark_cuda_tracker_v2.cpp), which times ALL EIGHT engines together in a
 # single invocation -- CPU Naive, CPU Opt v1, CPU Opt v2, CUDA TwoPass,
 # CUDA Fused, CUDA WarpReduction, CUDA FusedWarpShuffle, and CUDA BatchedStream
@@ -33,7 +33,7 @@
 # Per Trillium's docs, job output must land on the scratch file system, and
 # jobs should be submitted from $SCRATCH -- submit from there so the relative
 # build/bench path resolves correctly:
-#   $ sbatch submit_tracker_comparision.sh
+#   $ sbatch scripts/slurm/submit_tracker_comparision.sh
 
 set -e
 

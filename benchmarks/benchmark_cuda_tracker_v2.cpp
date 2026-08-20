@@ -1,4 +1,4 @@
-// tools/benchmark_cuda_tracker_v2.cpp
+// benchmarks/benchmark_cuda_tracker_v2.cpp
 //
 // Benchmark: CPU vs CUDA tracker implementations.
 // Sweeps through CPU Naive, CPU Opt v1, CPU Opt v2, and the three CUDA v2
@@ -68,7 +68,7 @@
 #include "beamformer/beam_tracker_opt.hpp"
 #include "beamformer/beam_tracker_opt_v2.hpp"
 #include "beamformer/cuda_beamformer.hpp"  // beamformer::CudaDeviceInfo, reused from the
-                                            // direct-beamformer benchmark (tools/benchmark_cpu_cuda.cpp)
+                                            // direct-beamformer benchmark (benchmarks/benchmark_cpu_cuda.cpp)
                                             // for the metadata.json's hardware-info block.
 #include "beamformer/cuda_tracker_v2.hpp"
 #include "beamformer/cuda_beam_tracker_fused_warp_shuffle.hpp"
@@ -493,7 +493,7 @@ void write_window_stats_csv(const std::filesystem::path& path,
 // info that the plotting dashboard's metadata-legend panel needs and no CSV
 // row is a natural place for (they are per-invocation constants, not
 // per-window or per-engine data). Mirrors the _metadata.json convention
-// tools/benchmark_cpu_cuda.cpp already uses for the direct-beamformer
+// benchmarks/benchmark_cpu_cuda.cpp already uses for the direct-beamformer
 // benchmark, including reusing beamformer::CudaDeviceInfo for the hardware
 // block, so both tools' metadata files share a shape.
 void write_metadata_json(const std::filesystem::path& path, const Dimensions& dims,

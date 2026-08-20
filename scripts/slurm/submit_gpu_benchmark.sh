@@ -8,7 +8,7 @@
 #SBATCH --output=build/bench/slurm_gpu_%j.out
 #SBATCH --error=build/bench/slurm_gpu_%j.err
 
-# Runs tools/benchmark_cuda_tracker_v2 (see benchmark_cuda_tracker_v2.cpp) on
+# Runs benchmarks/benchmark_cuda_tracker_v2 (see benchmark_cuda_tracker_v2.cpp) on
 # Trillium's GPU subcluster. That binary times ALL SIX engines in one
 # invocation -- CPU Naive, CPU Opt v1, CPU Opt v2, and the three CUDA v2
 # kernels (TwoPass, Fused, WarpReduction) -- and re-verifies tolerance
@@ -26,7 +26,7 @@
 # jobs should be *submitted* from $SCRATCH (home/project are read-only on
 # compute nodes) -- submit this script from your $SCRATCH directory so the
 # relative build/bench path below resolves there:
-#   $ sbatch submit_gpu_benchmark.sh
+#   $ sbatch scripts/slurm/submit_gpu_benchmark.sh
 #
 # For a quick sanity check before committing to a full compute-partition
 # job, you can instead run this same script via debugjob, or submit with

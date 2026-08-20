@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the CPU-vs-GPU beam-tracker comparison dashboard.
 
-Reads the four CSV/JSON files a `tools/benchmark_cuda_tracker_v2` run writes
+Reads the four CSV/JSON files a `benchmarks/benchmark_cuda_tracker_v2` run writes
 under --outdir (prefix "benchmark_cuda_tracker_v2"):
 
   <prefix>_summary.csv            sweep-friendly, one row per (n_ant, threads)
@@ -40,7 +40,7 @@ import numpy as np
 # (engine, kernel, display label, plot color) -- shared across every panel so
 # a given implementation always gets the same color/label, and the legend
 # order matches the CPU-then-GPU, slow-to-fast order used in the console
-# output of tools/benchmark_cuda_tracker_v2.
+# output of benchmarks/benchmark_cuda_tracker_v2.
 ENGINES: list[tuple[str, str, str, str]] = [
     ("cpu", "naive", "CPU Naive", "#7f7f7f"),
     ("cpu", "opt_v1", "CPU Opt v1", "#1f77b4"),

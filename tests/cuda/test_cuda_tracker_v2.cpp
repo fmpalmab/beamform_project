@@ -1,4 +1,4 @@
-// tests/test_cuda_tracker_v2.cpp
+// tests/cuda/test_cuda_tracker_v2.cpp
 //
 // Correctness test for the CUDA v2 beam tracker implementations.
 // Validates three kernels against the optimized CPU reference path

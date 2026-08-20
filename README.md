@@ -1,486 +1,372 @@
-# CHARTS Voltage Beamformer PoC
+# CHARTS Voltage Beamformer & Dynamic Beam Tracker
 
-Small standalone proof of concept for comparing a direct CPU voltage beamformer with an
-equivalent CUDA implementation.
+High-performance radio astronomy voltage beamformer and dynamic beam tracking engine for the Canadian Hydrogen Observatory and Radio-transient Detector System (CHARTS / CHIME).
 
-## Current implementation
+Provides direct fixed-grid beamforming, real-time dynamic celestial source tracking, adaptive direction-of-arrival (DOA) estimation, and an end-to-end astronomical validation pipeline with CPU (OpenMP / SIMD) and GPU (CUDA) acceleration.
 
-The input foundation, synthetic data, weight generation, serial CPU reference, and direct
-CUDA implementation are available:
+---
 
-- CMake/C++17 project with optional CUDA detection;
-- the packed output layout produced by `rfsocHandlerShuffle`;
-- signed complex `int4` packing and unpacking;
-- common voltage, weight, and intensity indexing and size contracts;
-- regular 4x8 and 8x8 array geometries with 0.6 m spacing in x and y;
-- 336 local-frequency centers per shard; two shards map the full 672-channel band;
-- optional position and frequency overrides from text files;
-- deterministic zero-padded FFT-bin beam grids in direction cosines;
-- 1 to 128 beams for 32- or 64-element arrays;
-- one-hot, constant, point-source, and seeded-noise voltage generation;
-- a small `generate_fake_data` CLI that writes headerless RFSoC-layout files;
-- geometric complex `float32` weights in `[beam][frequency][element]` order;
-- a serial CPU beamformer that produces `float32` intensity in
-  `[time][frequency][beam]` order;
-- a CUDA beamformer with one thread per `[time][frequency][beam]` output and a direct
-  complex sum over all elements;
-- packed-input CPU and CUDA references that decode signed `int4` samples inline and produce
-  `float32` intensity without a full unpacked voltage tensor or expanded H2D transfer;
-- strict binary-size validation and optional per-run CSV timing metrics.
+## Table of Contents
 
-Compact CPU/CUDA validation, a repeatable GPU-only timing sweep, summary tables, and
-comparison plots are available. CPU point-source validation and full-sky beam-coverage
-plots are also included.
+1. [Overview & Architecture](#overview--architecture)
+2. [Beamforming & Tracking Engines](#beamforming--tracking-engines)
+   - [Direct Fixed-Grid Beamformer](#1-direct-fixed-grid-beamformer)
+   - [Dynamic Beam Tracker](#2-dynamic-beam-tracker)
+   - [Adaptive Direction-of-Arrival (DOA) Estimator](#3-adaptive-direction-of-arrival-doa-estimator)
+   - [CUDA High-Throughput Tracker Suite (V1–V3)](#4-cuda-high-throughput-tracker-suite-v1v3)
+3. [Repository Layout](#repository-layout)
+4. [Data Contracts & Layouts](#data-contracts--layouts)
+5. [Build Instructions](#build-instructions)
+6. [Testing & Verification](#testing--verification)
+7. [Benchmarks & Performance Sweeps](#benchmarks--performance-sweeps)
+8. [Astronomical Validation Suite](#astronomical-validation-suite)
+9. [CLI Tools & Standalone Utilities](#cli-tools--standalone-utilities)
+10. [Visualization & Plotting Utilities](#visualization--plotting-utilities)
 
-## Build and test
+---
+
+## Overview & Architecture
+
+The CHARTS Voltage Beamformer processes channelized raw baseband voltage streams from RFSoC digitizers and synthesizes high-gain directional beams across antenna arrays ($N_{\text{ant}} \in \{32, 64\}$) and frequency bands ($N_{\text{freq}} = 336$ channels/shard, $672$ channels full-band).
+
+### Key Capabilities
+
+- **Inline Signed $\text{int4}$ Complex Unpacking**: Direct real-time arithmetic on packed nibbles ($[-8, 7]$) without intermediate full-tensor expansions.
+- **Fixed-Grid & Dynamic Tracking**: Supports static pre-computed beam grids (FFT-bin centers, line grids) and continuous dynamic tracking of moving celestial sources (e.g. Fast Radio Bursts, pulsars).
+- **Sub-Millisecond Real-Time Target**: Achieves the hard real-time latency objective ($\le 0.5\text{ ms}$ per integration window) across modern multi-core CPUs and NVIDIA GPUs.
+- **Astronomical Physical Parity**: Validated against physical radio propagation models, point-source response geometry, dispersion measures ($\text{DM}$ sweeps up to $1000\text{ pc cm}^{-3}$), and real CHIME Catalog 2 benchmarks.
+
+---
+
+## Beamforming & Tracking Engines
+
+```
+                           Raw Packed Voltage [T][F][E]
+                                        │
+             ┌──────────────────────────┴──────────────────────────┐
+             ▼                                                     ▼
+   Direct Fixed-Grid Beamformer                          Dynamic Beam Tracker
+   (Multi-Beam Fixed Directions)                 (Dynamic Direction of Moving Source)
+             │                                                     │
+   ┌─────────┴─────────┐                         ┌─────────────────┴─────────────────┐
+   ▼                   ▼                         ▼                                   ▼
+CPU Direct         CUDA Direct             CPU Trackers                        CUDA Trackers
+(OpenMP Loop)    (Tiled / Int8)          - Naive Baseline                   - Legacy TwoPass / Fused
+                                         - Optimized v1 / v2                - Phase 4 Fused Warp-Shuffle (FWS)
+                                         - Adaptive Covariance (DOA)        - V3 Direct / Streaming / Graph
+```
+
+### 1. Direct Fixed-Grid Beamformer
+- **CPU Reference**: Serial and OpenMP-parallelized baseline calculating $I[t][f][b] = \left| \sum_a x[t][f][a] w^*[b][f][a] \right|^2$.
+- **CUDA Direct / Tiled**: GPU acceleration synthesizing up to 128 simultaneous beams with optional fused temporal integration ($10$ or $320$ spectra) and 8-bit quantization (`int8` output).
+
+### 2. Dynamic Beam Tracker
+- **Naive CPU Tracker**: Baseline dynamic beamformer computing updated geometric phase weights per integration cadence ($W = \text{ceil}(T / \Delta T_{\text{int}})$).
+- **Optimized CPU Tracker (v1 & v2)**: Vectorized OpenMP implementation with NUMA first-touch page placement, zero-redundancy direction projection, and pointer aliasing optimizations delivering bit-exact parity with the naive baseline.
+
+### 3. Adaptive Direction-of-Arrival (DOA) Estimator
+- **Covariance-Based Search**: Computes sample spatial covariance matrix $R[f] = \frac{1}{K} \sum_{t} x[t][f] x[t][f]^H$ with exponential forgetting factors ($\alpha$).
+- **Bartlett & Capon (MVDR)**: Spatial spectrum scanning with spatial smoothing for coherent multipath suppression and sub-beamwidth quadratic interpolation.
+
+### 4. CUDA High-Throughput Tracker Suite (V1–V3)
+- **Legacy V2 Suite**: `TwoPass`, `Fused`, and `WarpReduction` kernels.
+- **Phase 4 Fused Warp-Shuffle (FWS)**: Fused tile reduction via intra-warp register exchange (`__shfl_down_sync`) and shared-memory inter-warp accumulation.
+- **CUDA V3 Suite**:
+  - *Direct ILP*: Instruction-level parallelism ($T_{\text{unroll}} \in \{2, 4\}$) with PTX bit-field extraction (`bfe.s32`).
+  - *Multi-Stream Pipelining*: Double-buffered asynchronous compute/transfer overlaps.
+  - *CUDA Graph Batched Streaming*: Zero-driver-overhead GPU execution for latency-critical streaming.
+  - *Device-Resident Mode*: In-place execution for pipelines where voltages remain in GPU VRAM.
+
+---
+
+## Repository Layout
+
+The codebase is organized into modular directories:
+
+```
+beamform_project/
+├── CMakeLists.txt                    # CMake build configuration (CPU & CUDA)
+├── README.md                         # Project documentation
+├── requirements.txt                  # Python dependencies
+│
+├── include/                          # Public C++ Header API
+│   └── beamformer/                   #   Header files for formats, config, trackers, CUDA
+│
+├── src/                              # Core C++ & CUDA Implementations
+│   ├── *.cpp                         #   CPU beamformers, geometry, IO, weights
+│   ├── *.cu                          #   CUDA kernels, offline runner, quantized int8
+│   └── *.hpp                         #   Internal headers
+│
+├── tools/                            # Production Utilities & CLI Tools
+│   ├── beam_tracker_cpu.cpp          #   CLI: Standalone CPU beam tracker
+│   ├── beamformer_cpu.cpp            #   CLI: Standalone CPU direct beamformer
+│   ├── beamformer_cuda.cpp           #   CLI: Standalone CUDA direct beamformer
+│   ├── generate_fake_data.cpp        #   CLI: Synthetic voltage stream generator
+│   ├── generate_weights.cpp          #   CLI: Geometric complex weights generator
+│   ├── run_tracker_stream.cpp        #   CLI: Offline tracker streaming bridge
+│   ├── plot_results.py               #   Python: Beam patterns & full-sky response
+│   ├── plot_tracker_results.py       #   Python: Dynamic tracker trajectory visualizer
+│   ├── plot_tracker_comparison.py    #   Python: CPU vs CUDA comparison dashboard
+│   ├── plot_cpu_opt_beam_tracker.py  #   Python: Adaptive tracker DOA diagnostics
+│   ├── plot_benchmark.py             #   Python: Throughput heatmap visualizer
+│   ├── run_astronomical_validation.py#   Python: Master astronomical validation CLI
+│   ├── run_temporal_integration_test.py # Python: Temporal integration harness
+│   └── astronomical_validation/      #   Python Package: FRB catalog, dispersion, fitter
+│
+├── benchmarks/                       # Dedicated C++ Benchmark Drivers
+│   ├── benchmark_cpu_opt_beam_tracker.cpp
+│   ├── benchmark_beam_tracker_opt.cpp
+│   ├── benchmark_beam_tracker_opt_v2.cpp
+│   ├── benchmark_cpu_cuda.cpp
+│   ├── benchmark_cuda_quantized.cpp
+│   ├── benchmark_cuda_tracker_v2.cpp
+│   └── benchmark_cuda_tracker_v3.cpp
+│
+├── tests/                            # Structured Test Suite
+│   ├── cpu/                          #   CPU unit, regression & integration tests
+│   │   ├── test_contract.cpp
+│   │   ├── test_geometry.cpp
+│   │   ├── test_synthetic_data.cpp
+│   │   ├── test_cpu_beamformer.cpp
+│   │   ├── test_beam_tracker.cpp
+│   │   ├── test_cpu_opt_beam_tracker.cpp
+│   │   ├── test_beam_tracker_opt.cpp
+│   │   ├── test_beam_tracker_opt_v2.cpp
+│   │   ├── test_temporal_integration.cpp
+│   │   ├── test_quantization.cpp
+│   │   ├── test_cuda_frame_contract.cpp
+│   │   └── beam_tracker_naive_cpu_test_suite.cpp
+│   ├── cuda/                         #   CUDA kernel, pipeline & numerical tests
+│   │   ├── test_cuda_point_source.cpp
+│   │   ├── test_cuda_packed.cu
+│   │   ├── test_cuda_temporal_integration.cpp
+│   │   ├── test_cuda_quantization.cpp
+│   │   ├── test_cuda_frame_pipeline.cpp
+│   │   ├── test_cuda_offline_runner.cpp
+│   │   ├── test_cuda_tracker_v2.cpp
+│   │   ├── test_cuda_beam_tracker_fused_warp_shuffle.cpp
+│   │   └── test_cuda_beam_tracker_v3.cpp
+│   └── python/                       #   Python unit tests
+│       ├── test_plot_benchmark.py
+│       ├── test_plot_results.py
+│       ├── test_plot_tracker_results.py
+│       └── test_temporal_integration_script.py
+│
+├── scripts/                          # Execution Runners & Cluster Batch Scripts
+│   ├── run_all_v3_validation.sh      #   Master end-to-end build, test & sweep script
+│   ├── run_beam_tracker_naive_cpu_tests.sh
+│   ├── run_cuda_tracker_benchmarks.sh
+│   ├── run_tracker_comparison_benchmarks.sh
+│   └── slurm/                        #   HPC SLURM submission scripts
+│       ├── submit_astronomical_validation.sh
+│       ├── submit_benchmark.sh
+│       ├── submit_benchmark_v2.sh
+│       ├── submit_gpu_benchmark.sh
+│       ├── submit_tracker_comparision.sh
+│       └── submit_v3_complete_suite.sh
+│
+├── info/                             # Architectural Specifications & Engineering Runbooks
+└── results/                          # Output binaries, validation JSONs, and plot figures
+```
+
+---
+
+## Data Contracts & Layouts
+
+### Binary Shards & Memory Dimensions
+- **Voltage Shard**: Packed signed `int4` byte stream of size $[T][F_{\text{local}}=336][N_{\text{ant}}]$ bytes.
+  - Low nibble (bits 0–3): Signed Real component $\in [-8, 7]$
+  - High nibble (bits 4–7): Signed Imaginary component $\in [-8, 7]$
+- **Weights**: Complex single-precision floats $\{ \text{real}, \text{imag} \}$ stored as $[N_{\text{beams}}][F][N_{\text{ant}}]$ or $[F][B_{\text{tile}}][N_{\text{ant}}][B_{\text{local}}]$.
+- **Intensity Output**: Single-precision `float32` power values $[T][F][N_{\text{beams}}]$ or $[W][F][N_{\text{beams}}]$ where $W = \text{ceil}(T / \Delta T_{\text{int}})$.
+- **Quantized `int8`**: $[W][F][N_{\text{beams}}]$ bytes with companion per-channel `(offset, scale)` float sidecars.
+
+---
+
+## Build Instructions
+
+### Prerequisites
+- C++17 compliant compiler (`g++` $\ge 11$, `clang++` $\ge 14$, or `MSVC` $\ge 2019$)
+- CMake $\ge 3.24$
+- OpenMP runtime
+- NVIDIA CUDA Toolkit $\ge 12.0$ (optional, automatically detected)
+- Python $\ge 3.9$ with `numpy`, `scipy`, `matplotlib`
+
+### Building with CMake
 
 ```bash
-cmake -S . -B build \
-    -DBEAMFORMER_ENABLE_CUDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES=native \
-    -DCMAKE_BUILD_TYPE=Release
+# 1. Configure release build with CUDA enabled
+cmake -B build -S . \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBEAMFORMER_ENABLE_CUDA=ON
+
+# 2. Compile all targets
+cmake --build build --config Release -j
+```
+
+To build a CPU-only target (e.g. for development or CI without GPUs):
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBEAMFORMER_ENABLE_CUDA=OFF
 cmake --build build -j
+```
+
+---
+
+## Testing & Verification
+
+### Running CTest (C++ Unit Tests)
+```bash
+# Run full CTest suite
 ctest --test-dir build --output-on-failure
+
+# Run only CPU tracker tests
+ctest --test-dir build -R "cpu_opt_beam_tracker|beam_tracker" --output-on-failure
+
+# Run only CUDA kernel tests
+ctest --test-dir build -R "cuda_" --output-on-failure
 ```
 
-When CUDA is enabled, CTest also runs a physical point-source check with a static 32-beam
-rectangular grid, 32 antennas, all 672 channels, and `n_time=1,2,3,4`. A source is placed
-exactly at non-central beam 12. The test requires the frequency- and time-integrated CPU
-and GPU maxima, as well as every per-time maximum, to recover beam 12; it also checks all
-CPU/GPU intensities with `atol=1e-3`, `rtol=1e-5`.
-
-On the tested RTX 4090, all four time sizes recovered beam 12 on both backends. The
-integrated target-to-runner-up power ratio was `28.675` and the maximum absolute CPU/GPU
-error was `0.0078125`, with no output outside the combined tolerance.
-
+### Running Python Unit Tests
 ```bash
-ctest --test-dir build -R cuda_point_source --output-on-failure -V
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
-The graphical realization uses `T=4` and the exact beam-12 direction
-`(l,m)=(0.078070952604,-0.156141905208)`. After generating the common packed voltage and
-weight files and running both backends, reproduce the separate CPU and GPU dashboards
-with:
+---
 
+## Benchmarks & Performance Sweeps
+
+### Running Standalone C++ Benchmarks
 ```bash
-conda run -n kotekan_test python tools/plot_results.py \
-    --input results/point_source_32beam_nxd_grid_cpu_intensity.bin --label CPU \
-    --n-time 4 --n-freq 672 --n-ant 32 --n-beams 32 \
-    --beam-grid legacy-rectangular \
-    --synthetic-type point-source \
-    --source-l 0.078070952604 --source-m -0.156141905208 --amplitude 4 \
-    --output results/cpu_32beam_point_source_validation_nxd_grid.png
+# Run CUDA Tracker V3 multi-engine benchmark
+./build/benchmark_cuda_tracker_v3 \
+    --n-time 15360 --n-ant 64 --integration-spectra 320 \
+    --threads 24 --repeat 5 --window-repeats 3 --outdir results/benchmarks
 
-conda run -n kotekan_test python tools/plot_results.py \
-    --input results/point_source_32beam_nxd_grid_gpu_intensity.bin --label GPU \
-    --n-time 4 --n-freq 672 --n-ant 32 --n-beams 32 \
-    --beam-grid legacy-rectangular \
-    --synthetic-type point-source \
-    --source-l 0.078070952604 --source-m -0.156141905208 --amplitude 4 \
-    --output results/gpu_32beam_point_source_validation_nxd_grid.png
+# Run CPU tracker three-way comparison (Naive vs Opt v1 vs Opt v2)
+./build/benchmark_beam_tracker_opt_v2 \
+    --n-time 15360 --n-ant 64 --integration-spectra 320 --threads 24
 ```
 
-When a CUDA compiler is found, CMake builds `beamformer_cuda`; otherwise the CPU-only
-targets remain available. `CMAKE_CUDA_ARCHITECTURES=89` can replace `native` for the
-tested RTX 4090. The CPU code remains serial as a transparent numerical reference.
+### HPC / SLURM Batch Execution
+```bash
+# Submit full V3 validation & benchmark suite on Trillium / HPC
+sbatch scripts/slurm/submit_v3_complete_suite.sh
 
-## Generate synthetic voltage files
+# Submit GPU tracker comparison sweep
+sbatch scripts/slurm/submit_tracker_comparision.sh
 
-The single-shard commands below write exactly `n_time * 336 * n_ant` payload bytes:
+# Submit CPU thread-scaling benchmark
+sbatch scripts/slurm/submit_benchmark_v2.sh
+```
+
+---
+
+## Astronomical Validation Suite
+
+The project includes an astronomical validation framework to verify tracker outputs against physical transients and FRB signatures.
 
 ```bash
-./build/generate_fake_data \
-    --type one-hot --n-time 32 --n-ant 64 \
-    --active-time 1 --active-frequency 100 --active-element 63 \
-    --output one_hot.bin
+# Run astronomical validation across all bursts for CUDA V3
+python tools/run_astronomical_validation.py \
+    --engine cuda_v3 \
+    --burst all \
+    --outdir results/astronomical_validation/v3
 
-./build/generate_fake_data \
-    --type constant --n-time 32 --n-ant 64 \
-    --value-real 1 --value-imag 0 \
-    --output constant.bin
+# Run astronomical validation for Phase 4 Fused Warp-Shuffle
+python tools/run_astronomical_validation.py \
+    --engine cuda_fws \
+    --burst all \
+    --outdir results/astronomical_validation/phase4_fws
+```
 
+### Validation Checks
+1. **Dispersion Measure ($\text{DM}$) Recovery**: Injects dispersion delay $\Delta t = k_{\text{DM}} \cdot \text{DM} \cdot (\nu^{-2} - \nu_{\text{top}}^{-2})$ and verifies peak $\text{SNR}$ recovery after dedispersion.
+2. **Spectro-Temporal Feature Preservation**: Gaussian pulse width ($\sigma_t$), spectral index ($\gamma$), and center frequency alignment.
+3. **Array Scaling Gain**: Coherent gain scaling verification across array transitions ($N=32 \to 64$).
+
+---
+
+## CLI Tools & Standalone Utilities
+
+### 1. Synthetic Voltage Generator (`generate_fake_data`)
+```bash
+# Stationary point source
 ./build/generate_fake_data \
-    --type point-source --n-time 32 --n-ant 64 \
+    --type point-source --n-time 15360 --n-ant 64 \
     --source-l 0.04 --source-m 0.0 --amplitude 4 \
     --output point_source.bin
 
+# Moving celestial source for beam tracker
 ./build/generate_fake_data \
-    --type noise --n-time 32 --n-ant 64 --seed 1 \
-    --output noise.bin
+    --type moving-point-source --n-time 15360 --n-ant 64 \
+    --track-l0 0.0 --track-m0 0.0 --dl-per-sample 1e-4 --dm-per-sample 0.0 \
+    --output moving_source.bin
 ```
 
-For the production-shaped two-shard input, use a prefix. This writes two independent
-payloads, two one-byte-per-`[T][F_local]` loss masks, and one metadata file per shard:
-
+### 2. Weight Generator (`generate_weights`)
 ```bash
-./build/generate_fake_data \
-    --type noise --n-time 15360 --n-ant 64 --seed 1 \
-    --shard-output-prefix results/voltage
-```
-
-The files are `voltage.shard{0,1}.bin`, `.mask`, and `.meta`. Each payload is exactly
-`n_time * 336 * n_ant` bytes; the payloads are never concatenated.
-
-The point source uses
-`x_a[f] = A * exp(-j * 2*pi*frequency[f]*dot(position[a], direction)/c)`,
-quantized to signed `int4`, and repeats that spectrum for every requested time sample.
-Default weights use centers selected from the native bin bank of a zero-padded `(2M,2N)`
-FFT geometry. This only defines beam directions: the CPU and CUDA implementations remain
-direct voltage beamformers. At the 400 MHz design frequency,
-`du=lambda/(2*M*d)` and `dv=lambda/(2*N*d)`. A centered candidate window is ranked by
-radial distance and truncated to `n_beams`; the selected directions stay fixed while
-weights remain frequency-dependent. `--beam-grid line` retains the earlier one-dimensional
-grid, and `--beam-grid legacy-rectangular` reproduces existing 32/64-beam artifacts.
-
-For 32 antennas, `(M,N)=(8,4)` gives a `16x8` bank and exactly 128 possible centers. For
-64 antennas, `(M,N)=(8,8)` gives a `16x16` bank; 128 beams use a centered `12x11` candidate
-window followed by radial truncation. Hexagonal FoV count and target-lattice helpers are
-available for design studies, but are not yet mapped to hardware FFT bins.
-
-## Generate weights and run CPU/CUDA
-
-The following commands use five beams at `l = -0.04, -0.02, 0, 0.02, 0.04`, matching
-the default synthetic point source with the last beam:
-
-```bash
+# Line grid weights for 64 antennas and 5 beams
 ./build/generate_weights \
     --n-ant 64 --n-beams 5 --beam-grid line \
     --output weights.bin
+```
 
+### 3. Standalone CPU & CUDA Beamformers
+```bash
+# Execute CPU beamformer
 ./build/beamformer_cpu \
     --input point_source.bin --weights weights.bin \
-    --n-time 32 --n-ant 64 --n-beams 5 \
-    --output cpu_intensity.bin --metrics metrics.csv
+    --n-time 32 --n-ant 64 --n-beams 5 --output cpu_intensity.bin
 
+# Execute CUDA beamformer
 ./build/beamformer_cuda \
     --input point_source.bin --weights weights.bin \
-    --n-time 32 --n-ant 64 --n-beams 5 \
-    --output cuda_intensity.bin --metrics metrics.csv
+    --n-time 32 --n-ant 64 --n-beams 5 --output cuda_intensity.bin
 ```
 
-Both executables report the peak integrated beam and write the same output layout. CPU and
-CUDA decode each packed byte inside their direct accumulation loops, so `unpack_ms` is zero
-rather than a separate full-tensor conversion stage. CUDA timing separates device/context
-setup, packed-byte host-to-device copies, kernel execution, and device-to-host copy. In the
-common CSV, `compute_ms` means the packed serial loop for CPU and the kernel event time for
-CUDA; CPU rows store zero for CUDA-only stages. Throughput and complex GMAC/s are derived
-from `compute_ms`. Repeated invocations append rows to one table, but a proper benchmark
-should include warmup and repeated samples rather than use the first smoke run.
-
-## Binary products
-
-- Voltage: one byte per complex signed `int4` sample, `[T][F][E]`.
-- Weights: `{float real, float imag}`, `[B][F][E]`.
-- Intensity: one native `float32` (little-endian on the tested x86-64 host), `[T][F][B]`.
-
-All products are headerless. Dimensions are supplied on the command line, and readers
-reject files whose byte count differs from the exact expected size.
-
-## Select buffer(s) in plots
-
-The plotting tools follow the local-shard contract. plot_results.py defaults to buffer 0
-with 336 channels. Select the other local buffer with --buffer 1; its default frequency
-origin is 400.8 MHz. Use --buffer both for the 672-channel band. For that mode, a single
-precombined intensity file is accepted, or two independent output files can be combined only
-inside the plotting step:
-
+### 4. Standalone CPU Beam Tracker
 ```bash
-conda run -n kotekan_test python tools/plot_results.py \
-    --buffer 0 --input results/shard0_intensity.bin \
-    --n-time 32 --n-ant 64 --n-beams 64 \
-    --output results/shard0_validation.png
-
-conda run -n kotekan_test python tools/plot_results.py \
-    --buffer both \
-    --input results/shard0_intensity.bin \
-    --input-shard1 results/shard1_intensity.bin \
-    --n-time 32 --n-ant 64 --n-beams 64 \
-    --output results/full_band_validation.png
+./build/beam_tracker_cpu \
+    --input moving_source.bin \
+    --n-time 15360 --n-ant 64 --integration-spectra 320 \
+    --track-l0 0.0 --track-m0 0.0 --dl-per-sample 1e-4 \
+    --output tracker_intensity.bin --metrics metrics.csv
 ```
 
-The same --input-shard1 and --compare-shard1 options apply to CPU/CUDA comparison
-plots. plot_benchmark.py --buffer 0 filters local-buffer rows (n_freq=336), while
---buffer both filters full-band rows (n_freq=672). If a benchmark CSV contains only one
-frequency width, no filter is required.
+---
 
-## Visualize and compare results
+## Visualization & Plotting Utilities
 
-Run the backend-independent visualizer with the same dimensions and synthetic-source
-parameters used to generate the input:
-
+### Beamformer Response & Sky Maps (`plot_results.py`)
 ```bash
-conda run -n kotekan_test python tools/plot_results.py \
-    --input cpu_intensity.bin \
-    --n-time 32 --n-freq 672 --n-ant 64 --n-beams 5 \
-    --beam-grid line \
-    --synthetic-type point-source \
-    --source-l 0.04 --source-m 0.0 --amplitude 4 \
-    --label CPU \
-    --output results/cpu_point_source_validation.png
-```
-
-The validation dashboard shows:
-
-- array geometry and output-element blocks;
-- `u-v` baseline coverage in wavelengths for a selected frequency channel;
-- beam and injected-source positions in the directional `l-m` plane;
-- integrated intensity by beam;
-- spectra for the recovered and offset beams;
-- frequency-integrated intensity versus time and beam.
-
-The default spectrum uses the physical centers from 300 to 501.3 MHz. `--frequency-hz`
-remains available only as an explicit constant-frequency override, and a frequency text
-file can replace all default centers.
-
-### Full-sky 32/64-beam coverage
-
-Generate the complete local `l-m` coverage without requiring an intensity file:
-
-```bash
-conda run -n kotekan_test python tools/plot_results.py \
+# Generate full-sky array beam coverage
+python tools/plot_results.py \
     --n-ant 32 --n-beams 32 \
     --beam-grid legacy-rectangular \
-    --spacing-m 0.6 \
-    --frequency-start-hz 300000000 \
-    --channel-width-hz 300000 \
-    --design-frequency-hz 400000000 \
-    --overlap-db -3 \
     --sky-output results/beam_grid_32_full_sky.png
-```
 
-The sky dashboard contains dominant-beam regions, individual -3 dB contours and maximum
-absolute gain at 300/400/500 MHz, an exact 672-channel average, and the number of
-overlapping beams at 400 MHz. Antenna `BW_E`, `BW_H`, and `gain_dBi` are linearly
-interpolated and extrapolated from the supplied 300/400/500 MHz values. Absolute array
-gain assumes uniform weights with fixed total power, so the coherent array contribution is
-`10*log10(n_ant)` above the interpolated element gain.
-
-The current generated artifacts are:
-
-- `results/beam_grid_32_full_sky.png`;
-- `results/cpu_32beam_point_source_validation.png`;
-- `results/cpu_cuda_point_source_32beam_validation.png`;
-- `results/cpu_cuda_point_source_32beam_comparison.png`;
-- `results/cpu_cuda_point_source_32beam_metrics.json`;
-- `results/cpu_32beam_point_source_validation_nxd_grid.png`;
-- `results/gpu_32beam_point_source_validation_nxd_grid.png`.
-
-Use the same script for numerical and graphical CPU/CUDA comparison:
-
-```bash
-conda run -n kotekan_test python tools/plot_results.py \
-    --input cpu_intensity.bin --label CPU \
-    --compare cuda_intensity.bin --compare-label CUDA \
+# Compare CPU vs CUDA numerical outputs
+python tools/plot_results.py \
+    --input results/cpu_intensity.bin --label CPU \
+    --compare results/cuda_intensity.bin --compare-label CUDA \
     --n-time 32 --n-freq 672 --n-ant 64 --n-beams 5 \
-    --beam-grid line \
-    --synthetic-type point-source --source-l 0.04 --source-m 0.0 \
-    --output results/cpu_cuda_validation.png \
-    --comparison-output results/cpu_cuda_comparison.png \
-    --summary-json results/cpu_cuda_errors.json
+    --beam-grid line --synthetic-type point-source \
+    --output results/cpu_cuda_validation.png
 ```
 
-This second dashboard contains an intensity scatter plot, relative-error histogram,
-maximum absolute error over frequency, and per-beam integrated-power difference. The JSON
-reports maximum absolute error, mean/p99/maximum relative error, correlation, and the
-number of samples outside the selected tolerances.
-
-The plotting helpers have standalone tests:
-
+### Dynamic Tracker Dashboard (`plot_tracker_results.py`)
 ```bash
-conda run -n kotekan_test python tests/test_plot_results.py
+python tools/plot_tracker_results.py \
+    --input results/tracker_intensity.bin \
+    --output results/tracker_dashboard.png \
+    --n-time 15360 --n-ant 64 --integration-spectra 320 \
+    --track-l0 0.0 --track-m0 0.0 --dl-per-sample 1e-4
 ```
 
-## Input contract
-
-A production input is one headerless binary shard with one packed complex byte per sample:
-
-```text
-voltage[time][local_frequency][element]
-index = (time * 336 + local_frequency) * n_elements + element
-```
-
-The real handler creates two independent `[T][336][64]` buffers, one per NIC. The PoC
-keeps them as separate allocations. Shard 0 maps local frequencies `0..335` to absolute
-frequencies `0..335`; shard 1 maps them to `336..671`. A downstream consumer may combine
-outputs using metadata, but no input file or H2D buffer concatenates the shards.
-
-The two-shard CLI writes payload files plus `.meta` and `.mask` sidecars. Metadata records
-shard identity, local width, absolute-frequency origin, timestamp start/step, and loss-mask
-identity. The loss mask has one byte per `[time][local_frequency]` frame (`1=valid`,
-`0=lost`) and is independent for each shard; payload bytes are not rewritten when a frame
-is marked lost.
-
-The element order reproduces the handler:
-
-```text
-element = (1 - rfsoc_id) * 32 + packet_element
-RFSoC 1 -> element 0..31
-RFSoC 0 -> element 32..63
-```
-
-Each byte uses signed two's-complement `int4`, with real in the low nibble and imaginary
-in the high nibble. The one-hot, constant, seeded-noise, and analytical point-source
-functions in `beamformer/synthetic_data.hpp` generate both shards without materializing
-an unpacked complex-float voltage tensor. The packed CPU and CUDA references use the same
-nibble rule at the point of accumulation and emit `float32` intensity in `[T][F][B]`.
-
-## Initial CUDA smoke check
-
-The first manual check used `T=4`, `F=672`, `E=32`, and five beams with the synthetic
-point source at `l=0.04`, `m=0`. CPU and CUDA both selected beam 4. Across 13440 output
-values, `max_abs_error=0.005859375`, `max_relative_error=4.76e-7`, and NumPy
-`allclose(rtol=1e-5, atol=1e-3)` passed. On the tested RTX 4090 the tiny workload took
-about 0.070 ms in the kernel, while the first-process CUDA setup took about 91 ms. These
-numbers only establish that the implementation runs and is numerically sensible; they are
-not the final CPU/GPU performance result.
-
-## Reproducible GPU benchmark with compact CPU validation
-
-The benchmark keeps `F=672` fixed and uses this default matrix:
-
-- `n_ant={32,64}`;
-- `n_beams={16,32,64,128}`;
-- GPU timing at `n_time={15360,24576,30720}`;
-- one CPU/CUDA numerical comparison per antenna/beam pair at `n_time=16`;
-- three GPU warmups and ten measured repetitions.
-
-The 24 long configurations never execute the serial CPU implementation. First verify the
-matrix and maximum allocations without creating a CUDA context or output files:
-
+### Engine Comparison Visualizer (`plot_tracker_comparison.py`)
 ```bash
-./build/benchmark_cpu_cuda --dry-run
+python tools/plot_tracker_comparison.py \
+    --input-prefix results/benchmarks/benchmark_cuda_tracker_v2 \
+    --output results/plots/tracker_comparison_dashboard.png \
+    --budget-ms 0.5
 ```
-
-The dry run reports the current packed-input host/GPU working-set estimates. Then run and
-plot with:
-
-```bash
-./build/benchmark_cpu_cuda \
-    --output-prefix results/gpu_benchmark_fft
-
-conda run -n kotekan_test python tools/plot_benchmark.py \
-    --input-prefix results/gpu_benchmark_fft
-```
-
-The process generates one deterministic signed-`int4` noise spectrum per antenna count
-and repeats it over time outside timed regions. Compact CPU validation and all GPU runs
-consume the same packed prefix and FFT-grid weights. The principal steady-state metric
-keeps weights resident on the GPU. It reports resident CUDA kernel time and pipeline wall
-time containing voltage H2D, kernel, output D2H, and synchronization; context/buffer setup
-and the one-time weight upload are recorded separately.
-
-Work and throughput use these conventions:
-
-```text
-Ncmac = n_time * n_freq * n_beams * n_ant
-estimated_FLOP = 8 * Ncmac + 3 * (n_time * n_freq * n_beams)
-```
-
-`Ncmac/time` is reported as CMAC/s. Estimated FLOP/s counts eight real operations per
-complex multiply-accumulate and three for the final squared magnitude. CSV results contain
-every GPU repetition; plots use medians and p25/p75 intervals. Speedups are intentionally
-not reported because the long CPU cases are not measured.
-
-Generated products are:
-
-- `results/gpu_benchmark_fft_timings.csv`;
-- `results/gpu_benchmark_fft_validation.csv`;
-- `results/gpu_benchmark_fft_metadata.json`;
-- `results/gpu_benchmark_fft_summary.csv`;
-- `results/gpu_benchmark_fft_performance.png`;
-- `results/gpu_benchmark_fft_gpu_time_heatmaps.png`;
-- `results/gpu_benchmark_fft_validation.png`.
-
-Temporal chunking remains intentionally pending. Each current configuration allocates and
-transfers its complete `n_time` voltage and intensity products; do not increase the default
-maximum beyond the available device memory without implementing chunked execution.
-
-For a short functional check before a full run:
-
-```bash
-./build/benchmark_cpu_cuda \
-    --output-prefix /tmp/gpu_benchmark_fft_smoke \
-    --n-ant 32 --beams 16 --times 16 --validation-time 2 \
-    --warmup 1 --repetitions 2
-```
-
-The existing `results/cpu_cuda_benchmark_*` files are the archived pre-change CPU/CUDA
-sweep. The new default prefix deliberately avoids overwriting them.
-
-## Measure Direct versus Tiled
-
-To compare both kernels in the target configuration (`64` antennas, `336` local
-frequencies, `64` beams, and `15360` time samples), use different prefixes so the
-measurements remain separate:
-
-```bash
-./build-cuda/benchmark_cpu_cuda \
-    --kernel direct \
-    --n-ant 64 --times 15360 --beams 64 \
-    --validation-time 8 --warmup 1 --repetitions 3 \
-    --output-prefix /tmp/beamformer_direct
-
-./build-cuda/benchmark_cpu_cuda \
-    --kernel tiled \
-    --n-ant 64 --times 15360 --beams 64 \
-    --validation-time 8 --warmup 1 --repetitions 3 \
-    --output-prefix /tmp/beamformer_tiled
-```
-
-The benchmark internally generates weights in the layout required by each kernel. To also
-generate the tiled file consumed by `beamformer_cuda`, run:
-
-```bash
-./build-cuda/generate_weights \
-    --n-ant 64 --n-beams 64 \
-    --directions results/hex64_directions.txt \
-    --layout tiled \
-    --output results/weights_hex64_tiled.bin
-```
-
-Measurements are written to `*_timings.csv`, `*_validation.csv`, and `*_metadata.json`.
-The `Direct` kernel uses weights in `[beam][frequency][antenna]` order; `Tiled` uses
-`[frequency][beam_tile][antenna][local_beam]`, with 32 beams per tile.
-
-## CUDA temporal integration
-
-The CUDA executable fuses float32 temporal integration into the selected beamforming kernel
-before D2H. This is still separate from the upchannelizer: Tiled supports 10 and 320 spectra,
-while Direct supports 320 only for debugging. The output file is
-`[ceil(T / integration_spectra)][336][beam]` float32.
-
-```bash
-./build-cuda/beamformer_cuda \
-    --kernel tiled \
-    --input results/fake_data.bin \
-    --weights results/weights_hex64_tiled.bin \
-    --output /tmp/beamformed_tiled_integrated_320.bin \
-    --n-time 15360 --n-ant 64 --n-beams 64 \
-    --integration-spectra 320
-```
-
-For a separate post-upchannelizer tensor with `T=480`, change `--n-time 480` and use
-`--integration-spectra 10`. Both cases produce 48 output time intervals. Omitting
-`--integration-spectra` preserves the unintegrated float32 debug output.
-
-## Quantized int8 integrated output
-
-To quantize on the GPU after temporal integration, use `--output-format int8` and provide
-sidecar paths for the local `(offset, scale)` parameters and metadata. The codes remain in
-`[integration_window][336][beam]` order; `-128` is reserved for non-finite values.
-
-```bash
-./build-cuda/beamformer_cuda \
-    --kernel tiled \
-    --input results/temporal_15360_noise_hex64/voltage.bin \
-    --weights results/weights_hex64_tiled.bin \
-    --output /tmp/beamformed_tiled_int8.bin \
-    --quantization-params /tmp/beamformed_tiled_int8.params.bin \
-    --quantization-metadata /tmp/beamformed_tiled_int8.meta \
-    --shard-id 0 \
-    --n-time 15360 --n-ant 64 --n-beams 64 \
-    --integration-spectra 320 --output-format int8
-```
-
-At `[48][336][64]`, the codes consume 1,032,192 bytes and the parameter sidecar consumes
-32,256 bytes, versus 4,128,768 bytes for integrated float32.
