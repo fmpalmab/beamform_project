@@ -373,7 +373,7 @@ if(BUILD_TESTING)
         target_link_libraries(test_cuda_beam_tracker_v3 PRIVATE beamformer_cuda_core)
         target_compile_options(test_cuda_beam_tracker_v3 PRIVATE -UNDEBUG)
         add_test(NAME cuda_beam_tracker_v3 COMMAND test_cuda_beam_tracker_v3)
-        set_tests_properties(test_cuda_beam_tracker_v3 PROPERTIES
+        set_tests_properties(cuda_beam_tracker_v3 PROPERTIES
             LABELS "cuda;tracker;validation"
             TIMEOUT 120
         )

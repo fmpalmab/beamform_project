@@ -102,6 +102,8 @@ fi
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/tools:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-24}
 export OMP_PROC_BIND=true
+export MPLCONFIGDIR="/tmp/matplotlib_${USER:-charts}"
+mkdir -p "${MPLCONFIGDIR}"
 
 # Capture hardware & system diagnostics
 ENV_LOG="${RESULTS_DIR}/env_info.txt"
