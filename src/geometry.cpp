@@ -57,7 +57,13 @@ std::vector<Vec3> default_positions(const std::size_t n_ant, const float spacing
     if (n_ant == 64) {
         return regular_array(8, 8, spacing_m);
     }
-    throw std::invalid_argument("default geometry is available only for 32 or 64 antennas");
+    if (n_ant == 128) {
+        return regular_array(8, 16, spacing_m);
+    }
+    if (n_ant == 256) {
+        return regular_array(16, 16, spacing_m);
+    }
+    throw std::invalid_argument("default geometry is available only for 32, 64, 128, or 256 antennas");
 }
 
 std::vector<float> constant_frequencies(const std::size_t n_freq, const float frequency_hz) {

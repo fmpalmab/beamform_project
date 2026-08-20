@@ -31,6 +31,12 @@ int main() {
     assert(positions_64.size() == 64);
     assert((positions_64[63] == Vec3{3.5F, 3.5F, 0.0F}));
 
+    const auto positions_128 = default_positions(128, 0.5F);
+    assert(positions_128.size() == 128);
+
+    const auto positions_256 = default_positions(256, 0.5F);
+    assert(positions_256.size() == 256);
+
     const auto frequencies = channelized_frequencies();
     assert(frequencies.size() == default_frequency_channels);
     assert(frequencies.front() == 300'000'000.0F);

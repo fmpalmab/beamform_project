@@ -156,6 +156,8 @@ if(BEAMFORMER_HAS_CUDA)
         src/cuda_beam_tracker_v2.cu
         src/cuda_beam_tracker_fused_warp_shuffle.cu
         src/cuda_beam_tracker_v3.cu
+        src/cuda_beam_tracker_v4.cu
+        src/cuda_beam_tracker_v5.cu
     )
     target_include_directories(beamformer_cuda_core
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -194,6 +196,28 @@ if(BEAMFORMER_HAS_CUDA)
         OpenMP::OpenMP_CXX
     )
     target_compile_options(benchmark_cuda_tracker_v3 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+    )
+
+    # Benchmark for CUDA Tracker V4 (Tensor Core WMMA, Half2 SIMD, Deep ILP, Graph)
+    add_executable(benchmark_cuda_tracker_v4 benchmarks/benchmark_cuda_tracker_v4.cpp)
+    target_link_libraries(benchmark_cuda_tracker_v4 
+        PRIVATE 
+        beamformer_cuda_core 
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(benchmark_cuda_tracker_v4 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+    )
+
+    # Benchmark for CUDA Tracker V5 (Unified Warp Reduction Single Engine)
+    add_executable(benchmark_cuda_tracker_v5 benchmarks/benchmark_cuda_tracker_v5.cpp)
+    target_link_libraries(benchmark_cuda_tracker_v5 
+        PRIVATE 
+        beamformer_cuda_core 
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(benchmark_cuda_tracker_v5 PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
     )
 endif()
@@ -374,6 +398,26 @@ if(BUILD_TESTING)
         target_compile_options(test_cuda_beam_tracker_v3 PRIVATE -UNDEBUG)
         add_test(NAME cuda_beam_tracker_v3 COMMAND test_cuda_beam_tracker_v3)
         set_tests_properties(cuda_beam_tracker_v3 PROPERTIES
+            LABELS "cuda;tracker;validation"
+            TIMEOUT 120
+        )
+
+        add_executable(test_cuda_beam_tracker_v4
+                       tests/cuda/test_cuda_beam_tracker_v4.cpp)
+        target_link_libraries(test_cuda_beam_tracker_v4 PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_beam_tracker_v4 PRIVATE -UNDEBUG)
+        add_test(NAME cuda_beam_tracker_v4 COMMAND test_cuda_beam_tracker_v4)
+        set_tests_properties(cuda_beam_tracker_v4 PROPERTIES
+            LABELS "cuda;tracker;validation"
+            TIMEOUT 120
+        )
+
+        add_executable(test_cuda_beam_tracker_v5
+                       tests/cuda/test_cuda_beam_tracker_v5.cpp)
+        target_link_libraries(test_cuda_beam_tracker_v5 PRIVATE beamformer_cuda_core)
+        target_compile_options(test_cuda_beam_tracker_v5 PRIVATE -UNDEBUG)
+        add_test(NAME cuda_beam_tracker_v5 COMMAND test_cuda_beam_tracker_v5)
+        set_tests_properties(cuda_beam_tracker_v5 PROPERTIES
             LABELS "cuda;tracker;validation"
             TIMEOUT 120
         )

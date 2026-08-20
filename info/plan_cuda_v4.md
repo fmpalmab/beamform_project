@@ -32,6 +32,11 @@ The beamforming equation $Y(t, b) = \sum_{a=1}^{N_{\text{ant}}} W(b, a) \cdot X(
 - Port the `v3_device_resident` methodology to a permanent persistent-thread paradigm.
 - Eliminate host-side PCIe launch latencies by having warps spin-wait on atomic flags updated by RDMA network packets (GPUDirect RDMA).
 
+### 2.5 Block-Level Cooperative Reduction for Large Arrays ($N_{\text{ant}} \ge 128$)
+Currently, the V3 and early V4 fallback kernels map $N_{\text{ant}}$ antennas to a single 32-thread warp. As the telescope expands to 128 or 256 antennas, this single-warp mapping creates severe register pressure (forcing threads to process 4-8 antennas each) and causes a collapse in SM occupancy.
+- **V4 Design Pivot:** V4 will implement **Block-Level Reductions** using `__shared__` memory or Cooperative Groups for large antenna configurations.
+- By mapping a block of 128 or 256 threads to a single time sample (e.g., 1 thread = 1 antenna), register pressure remains bounded at a constant low baseline (~20 registers/thread), ensuring 100% SM occupancy even at $N_{\text{ant}} = 256$.
+
 ---
 
 ## 3. Development Phases
@@ -55,4 +60,4 @@ The beamforming equation $Y(t, b) = \sum_{a=1}^{N_{\text{ant}}} W(b, a) \cdot X(
 - **Dynamic Range Loss:** Astronomical signals can have high dynamic range (e.g., strong RFI mixed with faint thermal noise). FP16 provides only ~11 bits of mantissa. 
   - *Mitigation:* Conduct rigorous astronomical validation (FRB injection sweeps) early in Phase 1 to ensure DM recovery and SNR are not degraded. Implement block-floating-point (BFP) scaling if necessary.
 - **Hardware Compatibility:** Older GPUs (like the Quadro P1000 Pascal) do not have Tensor Cores.
-  - *Mitigation:* V4 will compile conditionally via CMake (`#if __CUDA_ARCH__ >= 700`). The runtime dispatcher will automatically fall back to the V3 Batched kernel on unsupported hardware.
+  - *Mitigation:* V4 will compile conditionally via CMake (`#if __CUDA_ARCH__ >= 700`). The runtime dispatcher will automatically fall back to the V4 Block-Level Reductions or V3 Batched kernel on unsupported hardware.

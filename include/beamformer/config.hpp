@@ -85,8 +85,8 @@ inline void validate_dimensions(const Dimensions& dims) {
     if (dims.n_freq != default_frequency_channels) {
         throw std::invalid_argument("the local-shard contract requires exactly 336 frequency channels");
     }
-    if (dims.n_ant != 32 && dims.n_ant != 64) {
-        throw std::invalid_argument("n_ant must be either 32 or 64");
+    if (dims.n_ant != 32 && dims.n_ant != 64 && dims.n_ant != 128 && dims.n_ant != 256) {
+        throw std::invalid_argument("n_ant must be 32, 64, 128, or 256");
     }
     if (dims.n_beams == 0 || dims.n_beams > maximum_beams) {
         throw std::invalid_argument("n_beams must be between 1 and 128");

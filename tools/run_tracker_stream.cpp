@@ -13,6 +13,8 @@
 #if BEAMFORMER_HAS_CUDA
 #include "beamformer/cuda_beam_tracker_fused_warp_shuffle.hpp"
 #include "beamformer/cuda_beam_tracker_v3.hpp"
+#include "beamformer/cuda_beam_tracker_v4.hpp"
+#include "beamformer/cuda_beam_tracker_v5.hpp"
 #include "beamformer/cuda_tracker_v2.hpp"
 #endif
 
@@ -140,6 +142,28 @@ int main(int argc, char** argv) {
         beamformer::cuda_beam_tracker_v3_stream(packed, dims, tracker_cfg, intensity, 3);
     } else if (engine == "cuda_v3_direct") {
         beamformer::cuda_beam_tracker_v3_into(packed, dims, tracker_cfg, intensity);
+    } else if (engine == "cuda_v4" || engine == "cuda_v4_stream") {
+        beamformer::cuda_beam_tracker_v4_stream(packed, dims, tracker_cfg, intensity, 3);
+    } else if (engine == "cuda_v4_direct" || engine == "cuda_v4_u4") {
+        beamformer::V4ExecutionConfig cfg;
+        cfg.time_unroll = 4;
+        beamformer::cuda_beam_tracker_v4_into(packed, dims, tracker_cfg, intensity, cfg);
+    } else if (engine == "cuda_v4_u8") {
+        beamformer::V4ExecutionConfig cfg;
+        cfg.time_unroll = 8;
+        beamformer::cuda_beam_tracker_v4_into(packed, dims, tracker_cfg, intensity, cfg);
+    } else if (engine == "cuda_v4_half2") {
+        beamformer::V4ExecutionConfig cfg;
+        cfg.mode = beamformer::V4KernelMode::Half2VectorSimd;
+        beamformer::cuda_beam_tracker_v4_into(packed, dims, tracker_cfg, intensity, cfg);
+    } else if (engine == "cuda_v5" || engine == "cuda_v5_u8") {
+        beamformer::V5ExecutionConfig cfg;
+        cfg.time_unroll = 8;
+        beamformer::cuda_beam_tracker_v5_into(packed, dims, tracker_cfg, intensity, cfg);
+    } else if (engine == "cuda_v5_u4") {
+        beamformer::V5ExecutionConfig cfg;
+        cfg.time_unroll = 4;
+        beamformer::cuda_beam_tracker_v5_into(packed, dims, tracker_cfg, intensity, cfg);
     }
 #endif
     else {

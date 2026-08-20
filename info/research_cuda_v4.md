@@ -54,3 +54,16 @@ Hardcoding block sizes, tile sizes, and memory layouts is brittle across differe
 
 ## 6. Conclusion
 The path to `cuda_beam_tracker_v4` is clear: the architecture must shift from scalar, register-heavy ILP to **warp-synchronous matrix math** utilizing **Tensor Cores**, fueled by **asynchronous memory pipelines** and **mixed-precision (FP16/INT8)** data representations. This synthesis of AI hardware primitives applied to radio astronomy will ensure the CHARTS backend remains capable of handling the bandwidths of next-generation observatories.
+
+## 7. Antenna Scaling Limits: Why Deep ILP Fails at >64 Antennas
+A critical observation in evaluating early V4 scalar prototypes against V3 is the architectural bottleneck encountered as the number of antennas scales. While V3 and V4 scalar kernels achieved parity at $N_{\text{ant}} = 64$ (using `fmaf` optimizations), the single-warp processing model hits a fundamental wall as the array expands to 128 or 256 antennas.
+
+In the V3 architecture (and the scalar fallback for V4), a single warp (32 threads) processes the entire antenna array for a specific beam and time sample. 
+- For $N_{\text{ant}} = 64$, each thread processes 2 antennas.
+- For $N_{\text{ant}} = 256$, each thread must process 8 antennas.
+
+**The Register Pressure Crisis:** 
+Processing 8 antennas per thread requires loading 8 complex steering weights, unpacking 8 voltage samples, and maintaining multiple accumulation pipelines. This pushes the register count well beyond 64 registers per thread. On modern NVIDIA architectures, exceeding 32 registers halves active SM warp occupancy, and exceeding 64 registers drops it to 25%. This explains why heavily unrolled V4 variants initially lost to simpler V3 variants at 64 antennas before `fmaf` optimizations lowered the register footprint back to 49. At 256 antennas, no amount of instruction tuning can save the single-warp ILP model from register spilling and occupancy collapse.
+
+**The Solution:**
+To scale to $N_{\text{ant}} = 256$ and beyond, V4 must abandon single-warp scalar reductions. Instead, it will map larger thread blocks (e.g., 256 threads) to the antenna array (1 thread per antenna) using **Block-Level Reductions** via Shared Memory or Cooperative Groups, or bypass the scalar ALUs entirely by packing the antenna dimension into the $K$-dimension of a **Tensor Core WMMA** matrix multiplication.
