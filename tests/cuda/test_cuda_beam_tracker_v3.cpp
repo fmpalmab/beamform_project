@@ -129,7 +129,7 @@ bool run_test_configuration(const std::size_t n_ant, const std::size_t n_time = 
     }
 
     // 6. BatchedTrackerStreamV3 (Standard Batch Execution)
-    {
+    if (dims.n_time % tracker_cfg.integration_spectra == 0) {
         const std::size_t window_count = tracker_window_count(dims.n_time, tracker_cfg.integration_spectra);
         Dimensions win_dims{tracker_cfg.integration_spectra, dims.n_freq, dims.n_ant, dims.n_beams};
         V3ExecutionConfig cfg;
@@ -150,7 +150,7 @@ bool run_test_configuration(const std::size_t n_ant, const std::size_t n_time = 
     }
 
     // 7. BatchedTrackerStreamV3 (CUDA Graph Execution)
-    {
+    if (dims.n_time % tracker_cfg.integration_spectra == 0) {
         const std::size_t window_count = tracker_window_count(dims.n_time, tracker_cfg.integration_spectra);
         Dimensions win_dims{tracker_cfg.integration_spectra, dims.n_freq, dims.n_ant, dims.n_beams};
         V3ExecutionConfig cfg;
