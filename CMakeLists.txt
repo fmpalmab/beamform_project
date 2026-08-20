@@ -158,6 +158,7 @@ if(BEAMFORMER_HAS_CUDA)
         src/cuda_beam_tracker_v3.cu
         src/cuda_beam_tracker_v4.cu
         src/cuda_beam_tracker_v5.cu
+        src/cuda_beam_tracker_v5_rtx5090.cu
     )
     target_include_directories(beamformer_cuda_core
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
