@@ -248,7 +248,25 @@ python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ### HPC / SLURM Batch Execution
+
 ```bash
+# ==============================================================================
+# MASTER RUNNER: ALL Tests, Astronomical Validations & Benchmarks in 1 Job
+# ==============================================================================
+# Submit master Slurm job on Trillium (runs everything under identical runtime conditions)
+sbatch submit_everything.sh
+
+# Or run interactively (in a debugjob or compute node session):
+bash scripts/run_everything.sh
+
+# Quick smoke test run (reduced thread counts & repetitions):
+sbatch submit_everything.sh --quick
+
+# All results are aggregated into a single directory (e.g. results/everything_<TIMESTAMP>)
+# and packaged as a .tar.gz archive. Retrieve in a single command:
+#   scp -r user@trillium.scinet.utoronto.ca:/path/to/results/everything_latest ./
+# ==============================================================================
+
 # Submit full V3 validation & benchmark suite on Trillium / HPC
 sbatch scripts/slurm/submit_v3_complete_suite.sh
 
