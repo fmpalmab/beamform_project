@@ -66,7 +66,7 @@ bool run_test_configuration(const std::size_t n_ant, const std::size_t n_time = 
     // 2. Direct Registers
     Intensities gpu_direct(total_cells);
     cuda_beam_tracker_fused_warp_shuffle_into(
-        packed, dims, tracker_cfg, gpu_direct, FwsLoadStrategy::DirectRegisters);
+        packed, dims, tracker_cfg, gpu_direct, FwsLoadStrategy::Direct);
     if (!check_tolerance(cpu_ref, gpu_direct)) {
         std::fprintf(stderr, "  -> FAIL: Direct Registers mode failed for n_ant=%zu\n", n_ant);
         return false;
@@ -86,7 +86,7 @@ bool run_test_configuration(const std::size_t n_ant, const std::size_t n_time = 
     // 4. Double-Buffered Streaming
     Intensities gpu_stream(total_cells);
     cuda_beam_tracker_fused_warp_shuffle_stream(
-        packed, dims, tracker_cfg, gpu_stream, /*n_streams=*/2, FwsLoadStrategy::DirectRegisters);
+        packed, dims, tracker_cfg, gpu_stream, /*n_streams=*/2, FwsLoadStrategy::Direct);
     if (!check_tolerance(cpu_ref, gpu_stream)) {
         std::fprintf(stderr, "  -> FAIL: Streamed pipeline failed for n_ant=%zu\n", n_ant);
         return false;
