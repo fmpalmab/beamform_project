@@ -48,9 +48,16 @@ ENGINES: list[tuple[str, str, str, str]] = [
     ("gpu", "twopass", "CUDA TwoPass", "#ff7f0e"),
     ("gpu", "fused", "CUDA Fused", "#d62728"),
     ("gpu", "warp_reduction", "CUDA WarpReduction", "#9467bd"),
-    ("gpu", "fused_warp_shuffle", "CUDA Fused WarpShuffle", "#2ca02c"),
+    ("gpu", "fused_warp_shuffle", "CUDA Fused WarpShuffle (P4)", "#2ca02c"),
+    ("gpu", "fused_warp_shuffle_p4", "CUDA Fused WarpShuffle (P4)", "#2ca02c"),
     ("gpu", "batched_stream", "CUDA Batched Stream", "#e377c2"),
     ("gpu", "batched_kernel", "CUDA Batched Kernel", "#bcbd22"),
+    ("gpu", "v3_direct", "CUDA V3 Direct", "#8c564b"),
+    ("gpu", "v3_stream", "CUDA V3 Stream", "#e377c2"),
+    ("gpu", "v3_batched_stream", "CUDA V3 Batched Stream", "#bcbd22"),
+    ("gpu", "v3_batched_graph", "CUDA V3 Batched Graph", "#00bcd4"),
+    ("gpu", "v3_batched_kernel_only", "CUDA V3 Batched Kernel", "#4caf50"),
+    ("gpu", "v3_device_resident", "CUDA V3 Device Resident", "#ff5722"),
 ]
 
 

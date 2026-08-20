@@ -12,6 +12,7 @@
 
 #if BEAMFORMER_HAS_CUDA
 #include "beamformer/cuda_beam_tracker_fused_warp_shuffle.hpp"
+#include "beamformer/cuda_beam_tracker_v3.hpp"
 #include "beamformer/cuda_tracker_v2.hpp"
 #endif
 
@@ -135,6 +136,10 @@ int main(int argc, char** argv) {
         beamformer::cuda_tracker_v2_packed_intensity_into(packed, dims, tracker_cfg, intensity, beamformer::CudaTrackerKernelV2::WarpReduction);
     } else if (engine == "cuda_fws") {
         beamformer::cuda_beam_tracker_fused_warp_shuffle_stream(packed, dims, tracker_cfg, intensity, 3);
+    } else if (engine == "cuda_v3" || engine == "cuda_v3_stream") {
+        beamformer::cuda_beam_tracker_v3_stream(packed, dims, tracker_cfg, intensity, 3);
+    } else if (engine == "cuda_v3_direct") {
+        beamformer::cuda_beam_tracker_v3_into(packed, dims, tracker_cfg, intensity);
     }
 #endif
     else {
