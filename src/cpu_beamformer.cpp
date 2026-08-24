@@ -53,6 +53,7 @@ void cpu_beamform_packed_intensity_into(const PackedVoltage& packed,
         throw std::invalid_argument("intensity output is smaller than dimensions");
     }
 
+    #pragma omp parallel for collapse(2) schedule(static)
     for (std::size_t time = 0; time < dims.n_time; ++time) {
         for (std::size_t frequency = 0; frequency < dims.n_freq; ++frequency) {
             for (std::size_t beam = 0; beam < dims.n_beams; ++beam) {

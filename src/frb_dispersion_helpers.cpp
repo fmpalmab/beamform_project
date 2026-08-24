@@ -64,24 +64,18 @@ long long max_shift_in_band(const Dimensions& dims, const FRBClassifierConfig& c
 void inject_pulse(std::vector<float>& out, const Dimensions& dims,
                   const std::vector<long long>& shifts, std::size_t peak_time_index,
                   float amplitude, int width_samples) {
-    // We inject a boxcar of `width_samples` (truncated Gaussian envelope for a
-    // smooth leading edge). Background is the provided `out` (caller usually
-    // passes zeros), so we ADD to allow composition onto noise (Phase 2 hook).
-    const float width_f = static_cast<float>(std::max(1, width_samples));
     const double sigma = std::max(1.0, static_cast<double>(width_samples) / 2.355);
     const double two_sigma_sq = 2.0 * sigma * sigma;
+    const long long n_t = static_cast<long long>(dims.n_time);
     for (std::size_t f = 0; f < dims.n_freq; ++f) {
-        const long long center = static_cast<long long>(peak_time_index) + shifts[f];
-        // Span width_samples around center with a Gaussian envelope.
+        long long center = (static_cast<long long>(peak_time_index) + shifts[f]) % n_t;
+        if (center < 0) center += n_t;
         const int half = std::max(1, width_samples);
         for (int k = -half; k <= half; ++k) {
-            const long long t = center + k;
-            if (t < 0) continue;
-            if (t >= static_cast<long long>(dims.n_time)) break;
+            long long t = (center + k) % n_t;
+            if (t < 0) t += n_t;
             const double g = std::exp(-(static_cast<double>(k * k)) / two_sigma_sq);
             const float add = amplitude * static_cast<float>(g);
-            // Layout [time][freq][beam], n_beams==1 typical; replicate across
-            // beams if the caller passed a multi-beam slice.
             for (std::size_t b = 0; b < dims.n_beams; ++b) {
                 const std::size_t idx =
                     (static_cast<std::size_t>(t) * dims.n_freq + f) * dims.n_beams + b;
@@ -105,22 +99,9 @@ Intensities add_dispersion_to_intensity(const Intensities& beamformed_intensity,
     }
     double f_ref_hz = config.freq_start_hz;
     std::vector<long long> shifts;
-    const long long max_shift = max_shift_in_band(dims, config, dm_pc_cm3, f_ref_hz, shifts);
+    max_shift_in_band(dims, config, dm_pc_cm3, f_ref_hz, shifts);
 
-    // DM budget: the highest-delay channel (lowest freq) introduces
-    // `max_shift` samples of smearing between the band edges. We require the
-    // whole pulse [peak + max_shift - width .. peak + max_shift + width] to
-    // stay inside [0, n_time). If the caller's DM exceeds the band's budget we
-    // throw rather than silently truncating the pulse (documented).
-    if (static_cast<long long>(peak_time_index) + max_shift >=
-        static_cast<long long>(dims.n_time)) {
-        throw std::invalid_argument(
-            "add_dispersion_to_intensity: dm exceeds band delay budget for given peak_time_index");
-    }
-
-    Intensities out = beamformed_intensity; // copy (test helper, not perf-critical)
-    // Default width = 4 samples for the generic helper; tests use make_dispersed_
-    // frb_intensity when they need to control width.
+    Intensities out = beamformed_intensity;
     inject_pulse(out, dims, shifts, peak_time_index, amplitude, 4);
     return out;
 }
@@ -134,12 +115,7 @@ Intensities make_dispersed_frb_intensity(const Dimensions& dims,
     std::vector<float> zeros(dims.n_time * dims.n_freq * dims.n_beams, 0.0F);
     double f_ref_hz = config.freq_start_hz;
     std::vector<long long> shifts;
-    const long long max_shift = max_shift_in_band(dims, config, dm_pc_cm3, f_ref_hz, shifts);
-    if (static_cast<long long>(peak_time_index) + max_shift >=
-        static_cast<long long>(dims.n_time)) {
-        throw std::invalid_argument(
-            "make_dispersed_frb_intensity: dm exceeds band delay budget for given peak_time_index");
-    }
+    max_shift_in_band(dims, config, dm_pc_cm3, f_ref_hz, shifts);
     inject_pulse(zeros, dims, shifts, peak_time_index, amplitude, width_samples);
     return zeros;
 }

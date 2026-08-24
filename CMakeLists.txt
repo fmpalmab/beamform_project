@@ -160,6 +160,8 @@ if(BEAMFORMER_HAS_CUDA)
         src/cuda_beam_tracker_v4.cu
         src/cuda_beam_tracker_v5.cu
         src/cuda_beam_tracker_v5_rtx5090.cu
+        src/cuda_beamformer_v2.cu            # NEW — Unified single-engine warp-reduction beamformer V2
+        src/cuda_upchannelizer.cu            # NEW — Warp-level FFT/PFB upchannelizer
         src/frb_classifier.cu                # NEW — Phase 1 FRB dedisp+boxcar+NMS kernels + stream
         src/frb_classifier_rules.cpp         # NEW — host rule classifier (R1-R2) + JSON emitter
     )
@@ -222,6 +224,28 @@ if(BEAMFORMER_HAS_CUDA)
         OpenMP::OpenMP_CXX
     )
     target_compile_options(benchmark_cuda_tracker_v5 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+    )
+
+    # Benchmark for CUDA Beamformer V2 (Unified Warp Reduction vs V1 & CPU)
+    add_executable(benchmark_cuda_beamformer_v2 benchmarks/benchmark_cuda_beamformer_v2.cpp)
+    target_link_libraries(benchmark_cuda_beamformer_v2 
+        PRIVATE 
+        beamformer_cuda_core 
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(benchmark_cuda_beamformer_v2 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+    )
+
+    # Benchmark for Real-time CUDA FRB Dedispersion + Matched Filtering Search Pipeline
+    add_executable(benchmark_frb_classifier benchmarks/benchmark_frb_classifier.cpp)
+    target_link_libraries(benchmark_frb_classifier 
+        PRIVATE 
+        beamformer_cuda_core 
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(benchmark_frb_classifier PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
     )
 endif()
@@ -423,6 +447,28 @@ if(BUILD_TESTING)
         add_test(NAME cuda_beam_tracker_v5 COMMAND test_cuda_beam_tracker_v5)
         set_tests_properties(cuda_beam_tracker_v5 PROPERTIES
             LABELS "cuda;tracker;validation"
+            TIMEOUT 120
+        )
+
+        # CUDA Beamformer V2 test suite
+        add_executable(test_cuda_beamformer_v2
+                       tests/cuda/test_cuda_beamformer_v2.cpp)
+        target_link_libraries(test_cuda_beamformer_v2 PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
+        target_compile_options(test_cuda_beamformer_v2 PRIVATE -UNDEBUG)
+        add_test(NAME cuda_beamformer_v2 COMMAND test_cuda_beamformer_v2)
+        set_tests_properties(cuda_beamformer_v2 PROPERTIES
+            LABELS "cuda;beamformer;validation"
+            TIMEOUT 120
+        )
+
+        # CUDA Upchannelizer test suite
+        add_executable(test_cuda_upchannelizer
+                       tests/cuda/test_cuda_upchannelizer.cpp)
+        target_link_libraries(test_cuda_upchannelizer PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
+        target_compile_options(test_cuda_upchannelizer PRIVATE -UNDEBUG)
+        add_test(NAME cuda_upchannelizer COMMAND test_cuda_upchannelizer)
+        set_tests_properties(cuda_upchannelizer PROPERTIES
+            LABELS "cuda;upchannelizer;validation"
             TIMEOUT 120
         )
 

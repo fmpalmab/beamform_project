@@ -81,16 +81,36 @@ std::vector<Candidate> classify_candidates(std::vector<Candidate> candidates,
     const float r2_threshold = std::max(config.dm_min + 1.5F * std::max(2.0F * dm_step, 1.0F),
                                          config.dm_min + 3.0F * dm_step);
 
+    // Find zero-DM peak and overall peak across candidates for zero-DM veto
+    float max_zero_dm_snr = 0.0F;
+    float global_max_snr = 0.0F;
+    float global_max_dm = 0.0F;
+    for (const auto& c : candidates) {
+        if (c.dm <= r1_upper) {
+            if (c.snr > max_zero_dm_snr) max_zero_dm_snr = c.snr;
+        }
+        if (c.snr > global_max_snr) {
+            global_max_snr = c.snr;
+            global_max_dm = c.dm;
+        }
+    }
+
+    const bool zero_dm_dominant = (max_zero_dm_snr >= config.snr_threshold &&
+                                   max_zero_dm_snr >= 0.5F * global_max_snr &&
+                                   global_max_dm <= r1_upper);
+
     for (auto& c : candidates) {
+        // If zero-DM RFI burst dominates the batch, all candidates are RFI or sweep artifacts
+        if (zero_dm_dominant) {
+            c.label = CandidateLabel::RFI;
+            continue;
+        }
+
         // R1: zero-DM test.
         const bool r1_fails = (c.dm <= r1_upper);
         // R2: DM dependence — accept the dependence if DM is clearly above the floor.
         const bool r2_passes = (c.dm >= r2_threshold);
-        // R3/R4 (Phase 1 placeholders): would inspect width_curve unimodality
-        // and SNR-vs-DM slope across a DM-neighbour sweep. Phase 1 has no sweep
-        // so we leave these as Unknown-aware tie-breakers:
-        //   - if width_curve exists and peaks strictly above width_idx==0,
-        //     tentatively accept R4 (else Borderline).
+
         bool r4_peak_above_w0 = false;
         const float w0 = c.width_curve[0];
         for (std::size_t i = 1; i < c.width_curve.size(); ++i) {
@@ -102,8 +122,11 @@ std::vector<Candidate> classify_candidates(std::vector<Candidate> candidates,
         } else if (r2_passes) {
             // R7 default path: passes R2, R4 (or no curve info), and SNR threshold.
             if (c.snr >= config.snr_threshold) {
-                c.label = r4_peak_above_w0 ? CandidateLabel::AstrophyicalFRB
-                                            : CandidateLabel::AstrophyicalFRB;
+                if (c.snr < 0.1F * global_max_snr && global_max_snr > 100.0F) {
+                    c.label = CandidateLabel::Borderline;
+                } else {
+                    c.label = CandidateLabel::AstrophyicalFRB;
+                }
             } else {
                 c.label = CandidateLabel::Borderline; // SNR borderline (R5)
             }
@@ -111,9 +134,6 @@ std::vector<Candidate> classify_candidates(std::vector<Candidate> candidates,
             // Between r1_upper and r2_threshold: not enough DM dependence evidence.
             c.label = CandidateLabel::Borderline;
         }
-
-        // R6 (spectral sanity) and R3 (SNR-vs-DM slope) need a DM sweep / a
-        // spectral_index_est field — Phase 1 has neither; left as comments.
     }
     return candidates;
 }

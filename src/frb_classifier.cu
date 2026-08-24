@@ -63,7 +63,7 @@ constexpr double kSpectrumPeriodS = (10.0 / 3.0) * 1.0e-6;
 // (Quadro P1000). Each block owns one DM trial + 128 time slots; for the
 // Phase 1 recovery tests this is more than fine and the boxcar widths up to
 // 512 may extend beyond the tile boundary (clamped to the tile — documented).
-constexpr int kTimeTile = 128;
+constexpr int kTimeTile = 512;
 constexpr int kNumWidths = 10; // matches FRBClassifierConfig default
 
 void check_cuda(const cudaError_t result, const char* operation) {
@@ -123,11 +123,9 @@ __global__ void fused_dedisp_boxcar_kernel(
     if (t_idx_base < n_time) {
         for (int ch = 0; ch < static_cast<int>(n_freq); ++ch) {
             const int shift = dm_shifts[shifts_base + ch];
-            const std::size_t src = t_idx_base + static_cast<std::size_t>(shift);
-            if (src < n_time) {
-                prof += intensity[(src * n_freq + static_cast<std::size_t>(ch)) * n_beams
-                                  + static_cast<std::size_t>(beam)];
-            }
+            const std::size_t src = (t_idx_base + static_cast<std::size_t>(shift)) % n_time;
+            prof += intensity[(src * n_freq + static_cast<std::size_t>(ch)) * n_beams
+                              + static_cast<std::size_t>(beam)];
         }
     }
 
@@ -288,17 +286,20 @@ __global__ void nms_ring_writer_kernel(
     if (tx != 0) return;
 
     const float dm_value = d_dms[dm];
-    int last_global_t = -1000;
-    float last_snr = 0.0F;
-    bool have_last = false;
+    float max_snr = -1e30F;
+    int best_tile = -1;
 
     for (int tile = 0; tile < n_time_tiles; ++tile) {
         const DmBest best = dm_best[dm * n_time_tiles + tile];
-        if (best.snr < snr_threshold) continue;
-        const int global_t = static_cast<int>(tile) * static_cast<int>(n_time_per_tile) + best.time_local;
-        if (have_last && (global_t - last_global_t) < 3 && last_snr >= best.snr) {
-            continue; // previous tile wins; suppress duplicate
+        if (best.snr > max_snr) {
+            max_snr = best.snr;
+            best_tile = tile;
         }
+    }
+
+    if (best_tile >= 0 && max_snr >= snr_threshold) {
+        const DmBest best = dm_best[dm * n_time_tiles + best_tile];
+        const int global_t = best_tile * static_cast<int>(n_time_per_tile) + best.time_local;
         unsigned int slot = atomicAdd(ring_counter, 1u);
         if (slot < ring_capacity) {
             Candidate c;
@@ -309,23 +310,14 @@ __global__ void nms_ring_writer_kernel(
             c.width_samples = width_list[best.width_idx];
             c.baseline_mean = best.baseline_mean;
             c.baseline_std = best.baseline_std;
-            c.label = CandidateLabel::Unknown; // host classifier sets label
-            // std::array::operator[] is a constexpr host function and is not
-            // callable from a __global__ kernel; alias the contiguous 10-float
-            // storage of c.width_curve and write through the raw pointer.
+            c.label = CandidateLabel::Unknown;
             float* wc = reinterpret_cast<float*>(&c.width_curve);
             #pragma unroll
             for (int i = 0; i < kNumWidths; ++i) wc[i] = best.width_curve[i];
             d_ring[slot] = c;
         } else {
-            // Phase 1: basic NMS won't overflow in tests, but we wire the
-            // slot. atomicAdd into the overflow counter for observability;
-            // ring_overflow_count() still returns 0 in Phase 1 per the spec.
             atomicAdd(overflow_counter, 1u);
         }
-        last_global_t = global_t;
-        last_snr = best.snr;
-        have_last = true;
     }
 }
 
@@ -415,20 +407,20 @@ struct FRBClassifierStreamV5::Impl {
         const std::size_t best_bytes = static_cast<std::size_t>(n_time_tiles) * config.n_dm * sizeof(DmBest);
         const std::size_t ring_bytes = ring_capacity_eff * sizeof(Candidate);
 
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_dm_shifts), shift_bytes, cuda_stream),
-                   "cudaMallocAsync d_dm_shifts");
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_dms), dms_bytes, cuda_stream),
-                   "cudaMallocAsync d_dms");
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_widths), width_bytes, cuda_stream),
-                   "cudaMallocAsync d_widths");
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_dm_best), best_bytes, cuda_stream),
-                   "cudaMallocAsync d_dm_best");
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_ring), ring_bytes, cuda_stream),
-                   "cudaMallocAsync d_ring");
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_ring_counter), sizeof(unsigned int), cuda_stream),
-                   "cudaMallocAsync d_ring_counter");
-        check_cuda(cudaMallocAsync(reinterpret_cast<void**>(&d_overflow_counter), sizeof(unsigned int), cuda_stream),
-                   "cudaMallocAsync d_overflow_counter");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_dm_shifts), shift_bytes),
+                   "cudaMalloc d_dm_shifts");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_dms), dms_bytes),
+                   "cudaMalloc d_dms");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_widths), width_bytes),
+                   "cudaMalloc d_widths");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_dm_best), best_bytes),
+                   "cudaMalloc d_dm_best");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_ring), ring_bytes),
+                   "cudaMalloc d_ring");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_ring_counter), sizeof(unsigned int)),
+                   "cudaMalloc d_ring_counter");
+        check_cuda(cudaMalloc(reinterpret_cast<void**>(&d_overflow_counter), sizeof(unsigned int)),
+                   "cudaMalloc d_overflow_counter");
         check_cuda(cudaMallocHost(reinterpret_cast<void**>(&h_ring_pinned), ring_bytes),
                    "cudaMallocHost h_ring_pinned");
 
@@ -440,19 +432,19 @@ struct FRBClassifierStreamV5::Impl {
                                    cudaMemcpyHostToDevice, cuda_stream), "H2D widths");
         check_cuda(cudaMemsetAsync(d_ring_counter, 0, sizeof(unsigned int), cuda_stream),
                    "memset d_ring_counter");
-        check_cuda(cudaMemsetAsync(d_overflow_counter, 0, sizeof(unsigned int), cuda_stream),
-                   "memset d_overflow_counter");
+        check_cuda(cudaEventCreate(&start_event), "cudaEventCreate start_event");
+        check_cuda(cudaEventCreate(&stop_event), "cudaEventCreate stop_event");
         check_cuda(cudaStreamSynchronize(cuda_stream), "init sync");
     }
 
     ~Impl() {
-        if (d_dm_shifts) cudaFreeAsync(d_dm_shifts, cuda_stream);
-        if (d_dms) cudaFreeAsync(d_dms, cuda_stream);
-        if (d_widths) cudaFreeAsync(d_widths, cuda_stream);
-        if (d_dm_best) cudaFreeAsync(d_dm_best, cuda_stream);
-        if (d_ring) cudaFreeAsync(d_ring, cuda_stream);
-        if (d_ring_counter) cudaFreeAsync(d_ring_counter, cuda_stream);
-        if (d_overflow_counter) cudaFreeAsync(d_overflow_counter, cuda_stream);
+        if (d_dm_shifts) cudaFree(d_dm_shifts);
+        if (d_dms) cudaFree(d_dms);
+        if (d_widths) cudaFree(d_widths);
+        if (d_dm_best) cudaFree(d_dm_best);
+        if (d_ring) cudaFree(d_ring);
+        if (d_ring_counter) cudaFree(d_ring_counter);
+        if (d_overflow_counter) cudaFree(d_overflow_counter);
         if (h_ring_pinned) cudaFreeHost(h_ring_pinned);
         if (start_event) cudaEventDestroy(start_event);
         if (stop_event) cudaEventDestroy(stop_event);
