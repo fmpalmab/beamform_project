@@ -38,6 +38,7 @@ add_library(beamformer_core
     src/synthetic_data.cpp
     src/temporal_integration.cpp
     src/weights.cpp
+    src/frb_dispersion_helpers.cpp   # NEW — CPU dispersion-injection helper (Phase 1 FRB)
 )
 target_include_directories(beamformer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(beamformer_core PUBLIC BEAMFORMER_HAS_CUDA=$<BOOL:${BEAMFORMER_HAS_CUDA}>)
@@ -159,6 +160,8 @@ if(BEAMFORMER_HAS_CUDA)
         src/cuda_beam_tracker_v4.cu
         src/cuda_beam_tracker_v5.cu
         src/cuda_beam_tracker_v5_rtx5090.cu
+        src/frb_classifier.cu                # NEW — Phase 1 FRB dedisp+boxcar+NMS kernels + stream
+        src/frb_classifier_rules.cpp         # NEW — host rule classifier (R1-R2) + JSON emitter
     )
     target_include_directories(beamformer_cuda_core
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -420,6 +423,23 @@ if(BUILD_TESTING)
         add_test(NAME cuda_beam_tracker_v5 COMMAND test_cuda_beam_tracker_v5)
         set_tests_properties(cuda_beam_tracker_v5 PROPERTIES
             LABELS "cuda;tracker;validation"
+            TIMEOUT 120
+        )
+
+        # Phase 1 FRB real-time candidate detector + rule-based classifier test.
+        # Gated on BEAMFORMER_HAS_CUDA; label set cuda;frb;classifier, TIMEOUT 120.
+        # Self-contained: allocates its own device intensity buffer + stream and
+        # does NOT instantiate BatchedTrackerStreamV5.
+        add_executable(test_frb_classifier tests/cuda/test_frb_classifier.cpp)
+        target_link_libraries(test_frb_classifier PRIVATE beamformer_cuda_core)
+        # dispersion-injection helper header lives in src/ (its .cpp is in
+        # beamformer_core); expose src/ to this test so the relative header
+        # include resolves (mirrored by V5's relative self-includes).
+        target_include_directories(test_frb_classifier PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_options(test_frb_classifier PRIVATE -UNDEBUG)
+        add_test(NAME frb_classifier COMMAND test_frb_classifier)
+        set_tests_properties(frb_classifier PROPERTIES
+            LABELS "cuda;frb;classifier"
             TIMEOUT 120
         )
 

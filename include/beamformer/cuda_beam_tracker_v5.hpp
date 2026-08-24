@@ -1,6 +1,6 @@
 #pragma once
 
-// CUDA Beam Tracker V5 — Unified Single-Engine Warp-Reduction Architecture.
+// CUDA Beam Tracker V5 — Unified Single-Engine Warp-Reduction Architecture with Dynamic Multi-Beam Support.
 //
 // V5 establishes the peak-efficiency beam tracking engine by unifying all array
 // dimensions (32, 64, 128, 256 antennas) into a single, maximally optimized kernel:
@@ -26,14 +26,15 @@
 // 5. Hardware-Accelerated Bitfield Extraction:
 //    PTX `bfe.s32` single-cycle signed nibble decoding directly into 32-bit registers.
 //
-// 6. Device-Resident & Persistent Execution:
-//    Direct zero-copy in-place execution on GPU device memory and persistent
-//    streaming with optional CUDA Graph capture.
+// 6. Dynamic Multi-Beam Active Counter & 24/7 Live Reconfiguration:
+//    Pre-allocates output slots with dynamic active beam count (0 to MAX_TRACKER_BEAMS)
+//    and atomic zero-overhead trajectory updating.
 
 #include "beamformer/beam_tracker.hpp"
 #include "beamformer/config.hpp"
 #include "beamformer/formats.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -41,11 +42,20 @@
 
 namespace beamformer {
 
+constexpr std::size_t MAX_TRACKER_BEAMS = 8;
+
 // Execution configuration for V5 kernel tuning
 struct V5ExecutionConfig {
     std::size_t time_chunk_size = 80;
     std::size_t time_unroll = 8; // 2, 4, or 8
     bool enable_cuda_graph = false;
+};
+
+// Multi-beam configuration for dynamic active slot management
+struct MultiTrackerConfig {
+    std::size_t num_active_beams = 1;
+    std::array<TrackerTrajectoryConfig, MAX_TRACKER_BEAMS> trajectories;
+    std::size_t integration_spectra = 320;
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +94,14 @@ void cuda_beam_tracker_v5_device_resident(
     const V5ExecutionConfig& config = V5ExecutionConfig{},
     void* stream = nullptr);
 
+// Multi-Beam Device-Resident variant with pre-allocated max_beams output stride.
+void cuda_beam_tracker_v5_multibeam_device_resident(
+    const std::uint8_t* d_packed, float* d_intensity,
+    const Dimensions& dims, std::size_t max_beams_allocated,
+    const MultiTrackerConfig& multi_tracker,
+    const V5ExecutionConfig& config = V5ExecutionConfig{},
+    void* stream = nullptr);
+
 // ---------------------------------------------------------------------------
 // Batched Tracker Stream V5 (Persistent Pipeline / CUDA Graph Execution)
 // ---------------------------------------------------------------------------
@@ -98,18 +116,14 @@ public:
     BatchedTrackerStreamV5(const BatchedTrackerStreamV5&) = delete;
     BatchedTrackerStreamV5& operator=(const BatchedTrackerStreamV5&) = delete;
 
-    // Process a full batch of windows from host memory to host memory.
     void process_batch(std::size_t first_window_index,
                        const std::uint8_t* host_packed,
                        float* host_intensity);
 
-    // Executes ONLY GPU kernel computation on persistent device buffers.
     void process_batch_kernel_only(std::size_t first_window_index);
 
-    // Returns the GPU execution time in milliseconds for the most recent batch.
     float last_kernel_time_ms() const;
 
-    // Direct access to device buffers for zero-copy device-resident pipelines.
     std::uint8_t* device_packed_buffer();
     float* device_intensity_buffer();
     void* device_stream();
@@ -118,6 +132,47 @@ public:
     std::size_t window_bytes() const;
     std::size_t batch_voltage_bytes() const;
     std::size_t batch_output_floats() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// Multi-Beam Batched Tracker Stream with Live Dynamic Updates
+// ---------------------------------------------------------------------------
+class MultiBeamBatchedTrackerStreamV5 {
+public:
+    MultiBeamBatchedTrackerStreamV5(
+        const Dimensions& single_window_dims,
+        std::size_t max_beams,
+        const MultiTrackerConfig& initial_tracker,
+        std::size_t batch_size,
+        const V5ExecutionConfig& config = V5ExecutionConfig{});
+    ~MultiBeamBatchedTrackerStreamV5();
+
+    MultiBeamBatchedTrackerStreamV5(const MultiBeamBatchedTrackerStreamV5&) = delete;
+    MultiBeamBatchedTrackerStreamV5& operator=(const MultiBeamBatchedTrackerStreamV5&) = delete;
+
+    // Dynamic live controls (0 ns / thread-safe host updates)
+    void set_trajectory(std::size_t beam_id, const TrackerTrajectoryConfig& traj);
+    void set_num_active_beams(std::size_t count);
+    std::size_t num_active_beams() const;
+
+    void process_batch(std::size_t first_window_index,
+                       const std::uint8_t* host_packed,
+                       float* host_intensity);
+
+    void process_batch_kernel_only(std::size_t first_window_index);
+
+    float last_kernel_time_ms() const;
+
+    std::uint8_t* device_packed_buffer();
+    float* device_intensity_buffer();
+    void* device_stream();
+
+    std::size_t batch_size() const;
+    std::size_t max_beams() const;
 
 private:
     struct Impl;
