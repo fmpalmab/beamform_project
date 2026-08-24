@@ -12,6 +12,7 @@ Generates complete publication- and presentation-grade visualizations covering:
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -64,7 +65,7 @@ def set_presentation_style():
 # ---------------------------------------------------------------------------
 def generate_astronomical_dashboards(outdir: Path, engine: str = "cuda_v5"):
     """Run astronomical test on V5 for 64, 128, and 256 antennas and plot dashboards."""
-    print("\n[1/6] Generating Multi-Antenna Astronomical Dashboards on V5...")
+    print(f"\n[1/6] Generating Multi-Antenna Astronomical Dashboards on {engine}...")
     params = get_frb_benchmark("FRB20180916B_canonical")
     n_time = 15360
     n_freq = 336
@@ -75,67 +76,70 @@ def generate_astronomical_dashboards(outdir: Path, engine: str = "cuda_v5"):
     antenna_configs = [64, 128, 256]
 
     for n_ant in antenna_configs:
-        print(f"  -> Running V5 astronomical test for N_ant={n_ant}...")
-        packed, _ = generate_frb_packed_voltage_stream(params, n_time=n_time, n_ant=n_ant, n_freq=n_freq)
-        waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
+        print(f"  -> Running {engine} astronomical test for N_ant={n_ant}...")
+        try:
+            packed, _ = generate_frb_packed_voltage_stream(params, n_time=n_time, n_ant=n_ant, n_freq=n_freq)
+            waterfall = run_beam_tracker(packed, n_time=n_time, n_ant=n_ant, n_freq=n_freq, engine=engine)
 
-        dedispersed, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
-        sweep = run_dispersion_sweep(waterfall, params.dm, freqs_hz=freqs_hz)
+            dedispersed, profile = dedisperse_waterfall(waterfall, params.dm, freqs_hz=freqs_hz)
+            sweep = run_dispersion_sweep(waterfall, params.dm, freqs_hz=freqs_hz)
 
-        fig, axes = plt.subplots(2, 2, figsize=(15, 11), constrained_layout=True)
-        fig.suptitle(f"CUDA Beam Tracker V5: Astronomical FRB Validation Dashboard (N_ant = {n_ant})\n"
-                     f"Source: {params.name} | DM = {params.dm:.2f} pc cm⁻³ | Width = {params.width_s * 1000.0:.1f} ms",
-                     fontsize=15, fontweight="bold")
+            fig, axes = plt.subplots(2, 2, figsize=(15, 11), constrained_layout=True)
+            fig.suptitle(f"CUDA Beam Tracker {engine.upper()}: Astronomical FRB Validation Dashboard (N_ant = {n_ant})\n"
+                         f"Source: {params.name} | DM = {params.dm:.2f} pc cm⁻³ | Width = {params.width_s * 1000.0:.1f} ms",
+                         fontsize=15, fontweight="bold")
 
-        # 1. Dedispersed Pulse Profile
-        ax1 = axes[0, 0]
-        ax1.plot(time_ms, profile, color="#0066cc", linewidth=1.5, label="Beamformed Coherent Profile")
-        snr, peak_val, _, _ = compute_profile_snr(profile)
-        ax1.set_title(f"Dedispersed Pulse Profile (Peak S/N = {snr:.1f})")
-        ax1.set_xlabel("Time [ms]")
-        ax1.set_ylabel("Integrated Intensity [a.u.]")
-        ax1.legend(loc="upper right")
+            # 1. Dedispersed Pulse Profile
+            ax1 = axes[0, 0]
+            ax1.plot(time_ms, profile, color="#0066cc", linewidth=1.5, label="Beamformed Coherent Profile")
+            snr, peak_val, _, _ = compute_profile_snr(profile)
+            ax1.set_title(f"Dedispersed Pulse Profile (Peak S/N = {snr:.1f})")
+            ax1.set_xlabel("Time [ms]")
+            ax1.set_ylabel("Integrated Intensity [a.u.]")
+            ax1.legend(loc="upper right")
 
-        # Zoom into the pulse burst
-        burst_center_ms = params.arrival_time_s * 1000.0
-        ax1.set_xlim(max(0, burst_center_ms - 600), min(n_time * dt_ms, burst_center_ms + 600))
+            # Zoom into the pulse burst
+            burst_center_ms = params.arrival_time_s * 1000.0
+            ax1.set_xlim(max(0, burst_center_ms - 600), min(n_time * dt_ms, burst_center_ms + 600))
 
-        # 2. Butterfly DM Sweep
-        ax2 = axes[0, 1]
-        ax2.plot(sweep["trial_dms"], sweep["snrs"], marker="o", markersize=4, color="#e65c00", linewidth=1.8, label="S/N vs Trial DM")
-        ax2.axvline(params.dm, color="black", linestyle="--", linewidth=1.5, label=f"Injected DM ({params.dm:.1f})")
-        ax2.axvline(sweep["best_dm"], color="red", linestyle=":", linewidth=2, label=f"Recovered Peak DM ({sweep['best_dm']:.1f})")
-        ax2.set_title(f"Blind Dispersion Sweep & Butterfly Curve (Error = {sweep['dm_error']:.2f} pc cm⁻³)")
-        ax2.set_xlabel("Trial DM [pc cm⁻³]")
-        ax2.set_ylabel("Profile S/N")
-        ax2.legend(loc="upper right")
+            # 2. Butterfly DM Sweep
+            ax2 = axes[0, 1]
+            ax2.plot(sweep["trial_dms"], sweep["snrs"], marker="o", markersize=4, color="#e65c00", linewidth=1.8, label="S/N vs Trial DM")
+            ax2.axvline(params.dm, color="black", linestyle="--", linewidth=1.5, label=f"Injected DM ({params.dm:.1f})")
+            ax2.axvline(sweep["best_dm"], color="red", linestyle=":", linewidth=2, label=f"Recovered Peak DM ({sweep['best_dm']:.1f})")
+            ax2.set_title(f"Blind Dispersion Sweep & Butterfly Curve (Error = {sweep['dm_error']:.2f} pc cm⁻³)")
+            ax2.set_xlabel("Trial DM [pc cm⁻³]")
+            ax2.set_ylabel("Profile S/N")
+            ax2.legend(loc="upper right")
 
-        # 3. Dynamic Spectrum (Dispersed Waterfall vs Dedispersed Waterfall)
-        ax3 = axes[1, 0]
-        # Downsample time for clean visualization
-        t_sub = 8
-        wf_sub = waterfall.reshape(n_time // t_sub, t_sub, n_freq).mean(axis=1)
-        extent = [0, n_time * dt_ms, freqs_hz[-1] / 1e6, freqs_hz[0] / 1e6]
-        im3 = ax3.imshow(wf_sub.T, aspect="auto", origin="upper", extent=extent, cmap="viridis")
-        ax3.set_title(f"Dynamic Spectrum Waterfall [Time × Frequency] (N_ant={n_ant})")
-        ax3.set_xlabel("Time [ms]")
-        ax3.set_ylabel("Frequency [MHz]")
-        fig.colorbar(im3, ax=ax3, label="Intensity [dB / linear]")
+            # 3. Dynamic Spectrum (Dispersed Waterfall vs Dedispersed Waterfall)
+            ax3 = axes[1, 0]
+            # Downsample time for clean visualization
+            t_sub = 8
+            wf_sub = waterfall.reshape(n_time // t_sub, t_sub, n_freq).mean(axis=1)
+            extent = [0, n_time * dt_ms, freqs_hz[-1] / 1e6, freqs_hz[0] / 1e6]
+            im3 = ax3.imshow(wf_sub.T, aspect="auto", origin="upper", extent=extent, cmap="viridis")
+            ax3.set_title(f"Dynamic Spectrum Waterfall [Time × Frequency] (N_ant={n_ant})")
+            ax3.set_xlabel("Time [ms]")
+            ax3.set_ylabel("Frequency [MHz]")
+            fig.colorbar(im3, ax=ax3, label="Intensity [dB / linear]")
 
-        # 4. Dedispersed Waterfall
-        ax4 = axes[1, 1]
-        dedisp_sub = dedispersed.reshape(n_time // t_sub, t_sub, n_freq).mean(axis=1)
-        im4 = ax4.imshow(dedisp_sub.T, aspect="auto", origin="upper", extent=extent, cmap="magma")
-        ax4.set_title("Coherently Dedispersed Waterfall (Pulse Time-Aligned)")
-        ax4.set_xlabel("Time [ms]")
-        ax4.set_ylabel("Frequency [MHz]")
-        ax4.set_xlim(max(0, burst_center_ms - 600), min(n_time * dt_ms, burst_center_ms + 600))
-        fig.colorbar(im4, ax=ax4, label="Intensity [a.u.]")
+            # 4. Dedispersed Waterfall
+            ax4 = axes[1, 1]
+            dedisp_sub = dedispersed.reshape(n_time // t_sub, t_sub, n_freq).mean(axis=1)
+            im4 = ax4.imshow(dedisp_sub.T, aspect="auto", origin="upper", extent=extent, cmap="magma")
+            ax4.set_title("Coherently Dedispersed Waterfall (Pulse Time-Aligned)")
+            ax4.set_xlabel("Time [ms]")
+            ax4.set_ylabel("Frequency [MHz]")
+            ax4.set_xlim(max(0, burst_center_ms - 600), min(n_time * dt_ms, burst_center_ms + 600))
+            fig.colorbar(im4, ax=ax4, label="Intensity [a.u.]")
 
-        dashboard_png = outdir / f"presentation_1_astronomical_dashboard_{n_ant}_ant.png"
-        fig.savefig(dashboard_png, dpi=180)
-        plt.close(fig)
-        print(f"  -> Saved: {dashboard_png}")
+            dashboard_png = outdir / f"presentation_1_astronomical_dashboard_{n_ant}_ant.png"
+            fig.savefig(dashboard_png, dpi=180)
+            plt.close(fig)
+            print(f"  -> Saved: {dashboard_png}")
+        except Exception as e:
+            print(f"  (Warning) Failed generating astronomical dashboard for N_ant={n_ant}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -454,15 +458,31 @@ def generate_benchmark_comparison(outdir: Path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Comprehensive Presentation Material & Visualization Suite for Beam Tracker")
+    parser.add_argument("--outdir", type=Path, default=Path("results/presentation_assets"),
+                        help="Output directory for generated plots (default: results/presentation_assets)")
+    parser.add_argument("--engine", type=str, default="cuda_v5",
+                        help="Tracker engine for live astronomical test (default: cuda_v5)")
+    parser.add_argument("--skip-astro", action="store_true",
+                        help="Skip live tracker astronomical dashboards and render theoretical/kinematics/benchmark plots only")
+    args = parser.parse_args()
+
     set_presentation_style()
-    outdir = Path("results/presentation_assets")
+    outdir = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 75)
-    print("  CUDA BEAM TRACKER V5: PRESENTATION MATERIAL & VISUALIZATION GENERATOR")
+    print("  CUDA BEAM TRACKER: PRESENTATION MATERIAL & VISUALIZATION GENERATOR")
+    print("=" * 75)
+    print(f"Output Directory : {outdir.resolve()}")
+    print(f"Target Engine    : {args.engine}")
     print("=" * 75)
 
-    generate_astronomical_dashboards(outdir, engine="cuda_v5")
+    if not args.skip_astro:
+        generate_astronomical_dashboards(outdir, engine=args.engine)
+    else:
+        print("\n[1/6] Skipping Live Astronomical Dashboards (--skip-astro)")
+
     generate_tracker_kinematics(outdir)
     generate_proximity_dynamics(outdir)
     generate_dispersion_physics(outdir)

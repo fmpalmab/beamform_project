@@ -189,6 +189,29 @@ def parse_tracker_v3_log(log_file: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def parse_tracker_v5_v4_summary(csv_file: Path) -> List[Dict[str, Any]]:
+    rows = []
+    if not csv_file.exists():
+        return rows
+
+    with csv_file.open(newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({
+                "backend": r.get("backend", ""),
+                "engine": r.get("engine", ""),
+                "median_ms": float(r.get("median_ms", 0.0)),
+                "min_ms": float(r.get("min_ms", 0.0)),
+                "max_ms": float(r.get("max_ms", 0.0)),
+                "speedup_vs_p4": float(r.get("speedup_vs_p4", 1.0)),
+                "speedup_vs_cpu_naive": float(r.get("speedup_vs_cpu_naive", 1.0)),
+                "n_ant": r.get("n_ant", ""),
+                "n_time": r.get("n_time", ""),
+                "spectra": r.get("spectra", ""),
+            })
+    return rows
+
+
 def parse_tracker_v2_summary(csv_file: Path) -> List[Dict[str, Any]]:
     rows = []
     if not csv_file.exists():
@@ -244,6 +267,8 @@ def generate_markdown_summary(
     env_info: Dict[str, str],
     test_res: Dict[str, Any],
     astro_reports: List[Dict[str, Any]],
+    v5_summary: List[Dict[str, Any]],
+    v4_summary: List[Dict[str, Any]],
     v3_log_rows: List[Dict[str, Any]],
     v2_summary: List[Dict[str, Any]],
     cpu_opt_metrics: List[Dict[str, Any]],
@@ -297,6 +322,24 @@ def generate_markdown_summary(
 
     lines.append("## 4. Multi-Engine Beam Tracker Benchmark Highlights")
     lines.append("")
+    if v5_summary:
+        lines.append("### CUDA Tracker V5 Master Benchmark (Unified Multi-Generation Engine)")
+        lines.append("")
+        lines.append("| N_ant | Backend | Engine / Mode | Median Latency (ms) | Speedup vs CPU Naive | Speedup vs Phase 4 |")
+        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: |")
+        for r in v5_summary:
+            lines.append(f"| {r['n_ant']} | `{r['backend']}` | `{r['engine']}` | **{r['median_ms']:.3f} ms** | {r['speedup_vs_cpu_naive']:.2f}x | {r['speedup_vs_p4']:.2f}x |")
+        lines.append("")
+
+    if v4_summary:
+        lines.append("### CUDA Tracker V4 Master Benchmark (Tensor Core / Deep ILP)")
+        lines.append("")
+        lines.append("| N_ant | Backend | Engine / Mode | Median Latency (ms) | Speedup vs CPU Naive | Speedup vs Phase 4 |")
+        lines.append("| :---: | :---: | :--- | :---: | :---: | :---: |")
+        for r in v4_summary:
+            lines.append(f"| {r['n_ant']} | `{r['backend']}` | `{r['engine']}` | **{r['median_ms']:.3f} ms** | {r['speedup_vs_cpu_naive']:.2f}x | {r['speedup_vs_p4']:.2f}x |")
+        lines.append("")
+
     if v3_log_rows:
         lines.append("### CUDA Tracker V3 Master Benchmark (13 Engines Swept)")
         lines.append("")
@@ -313,7 +356,7 @@ def generate_markdown_summary(
         lines.append("| :---: | :---: | :--- | :---: | :---: |")
         for r in v2_summary:
             lines.append(f"| {r.get('n_ant')} | {r.get('threads')} | `{r.get('engine')}` | {r.get('latency_median_ms', 0.0):.3f} ms | {r.get('speedup_vs_cpu_opt_v2', 1.0):.2f}x |")
-    lines.append("")
+        lines.append("")
 
     if cpu_opt_metrics:
         lines.append("### CPU Optimized Tracker Performance")
@@ -330,7 +373,7 @@ def generate_markdown_summary(
 
     lines.append("## 5. Artifact & Results Manifest")
     lines.append("")
-    lines.append("All output files and visualization plots have been aggregated in this directory:")
+    lines.append("All output files, presentation materials, and visualization plots have been aggregated in this directory:")
     lines.append("")
     lines.append("```")
     lines.append(f"{results_dir.name}/")
@@ -341,6 +384,7 @@ def generate_markdown_summary(
     lines.append("├── tests/                           # CTest, Naive CPU, and Python test logs")
     lines.append("├── astronomical_validation/         # FRB injection reports (JSON) & plots")
     lines.append("├── benchmarks/                      # All CSV summaries, frame latencies, sweeps")
+    lines.append("├── presentation_assets/             # Publication & presentation figure suite")
     lines.append("├── plots/                           # Multi-panel comparison dashboards (PNG)")
     lines.append(f"└── {results_dir.name}.tar.gz        # Compressed single-file archive")
     lines.append("```")
@@ -367,6 +411,8 @@ def generate_text_summary(
     env_info: Dict[str, str],
     test_res: Dict[str, Any],
     astro_reports: List[Dict[str, Any]],
+    v5_summary: List[Dict[str, Any]],
+    v4_summary: List[Dict[str, Any]],
     v3_log_rows: List[Dict[str, Any]],
     v2_summary: List[Dict[str, Any]],
     cpu_opt_metrics: List[Dict[str, Any]],
@@ -403,7 +449,13 @@ def generate_text_summary(
     lines.append("================================================================================")
     lines.append("3. MULTI-ENGINE BENCHMARK HIGHLIGHTS")
     lines.append("--------------------------------------------------------------------------------")
-    if v3_log_rows:
+    if v5_summary:
+        lines.append("  --- CUDA Tracker V5 Master Benchmark ---")
+        lines.append(f"  {'N_ant':<6} {'Backend':<8} {'Engine':<28} {'Median (ms)':<14} {'vs Naive':<10} {'vs P4':<10}")
+        lines.append("  " + "-" * 76)
+        for r in v5_summary:
+            lines.append(f"  {r['n_ant']:<6} {r['backend']:<8} {r['engine']:<28} {r['median_ms']:<14.3f} {r['speedup_vs_cpu_naive']:<10.2f}x {r['speedup_vs_p4']:<10.2f}x")
+    elif v3_log_rows:
         lines.append(f"  {'N_ant':<6} {'Thr':<4} {'Backend':<8} {'Engine':<26} {'Latency (ms)':<14} {'Speedup':<10}")
         lines.append("  " + "-" * 76)
         for r in v3_log_rows:
@@ -438,15 +490,17 @@ def main() -> int:
     env_info = parse_env_info(results_dir / "env_info.txt")
     test_res = parse_test_results(results_dir / "tests")
     astro_reports = parse_astronomical_validation(results_dir / "astronomical_validation")
+    v5_summary = parse_tracker_v5_v4_summary(results_dir / "benchmarks" / "tracker_v5" / "benchmark_cuda_tracker_v5_summary.csv")
+    v4_summary = parse_tracker_v5_v4_summary(results_dir / "benchmarks" / "tracker_v4" / "benchmark_cuda_tracker_v4_summary.csv")
     v3_log_rows = parse_tracker_v3_log(results_dir / "benchmarks" / "tracker_v3" / "tracker_v3_sweep.log")
     v2_summary = parse_tracker_v2_summary(results_dir / "benchmarks" / "tracker_v2" / "benchmark_cuda_tracker_v2_summary.csv")
     cpu_opt_metrics = parse_cpu_opt_metrics(results_dir / "benchmarks" / "cpu_opt_tracker" / "cpu_opt_metrics_sweep.csv")
 
     md_summary = generate_markdown_summary(
-        results_dir, env_info, test_res, astro_reports, v3_log_rows, v2_summary, cpu_opt_metrics, args.slurm_job_id
+        results_dir, env_info, test_res, astro_reports, v5_summary, v4_summary, v3_log_rows, v2_summary, cpu_opt_metrics, args.slurm_job_id
     )
     txt_summary = generate_text_summary(
-        results_dir, env_info, test_res, astro_reports, v3_log_rows, v2_summary, cpu_opt_metrics, args.slurm_job_id
+        results_dir, env_info, test_res, astro_reports, v5_summary, v4_summary, v3_log_rows, v2_summary, cpu_opt_metrics, args.slurm_job_id
     )
 
     (results_dir / "SUMMARY.md").write_text(md_summary, encoding="utf-8")

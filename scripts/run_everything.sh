@@ -3,23 +3,26 @@
 # run_everything.sh
 #
 # Master Test, Astronomical Validation, and Benchmark Runner for CHARTS Voltage
-# Beamformer & Dynamic Beam Tracker.
+# Beamformer & Dynamic Beam Tracker on Trillium / Linux.
 #
 # Runs:
 #   1. Environment & Hardware Diagnostics (GPU, CPU topology, OS, modules)
 #   2. Clean CMake Build of all CPU and CUDA targets in Release mode
 #   3. Full Unit & Correctness Test Suite (CTest, Naive CPU suite, Python tests)
-#   4. Astronomical Validation Suite (CHIME FRB injection, DM sweep, array scaling)
-#   5. Comprehensive Benchmark Sweeps:
+#   4. Astronomical Validation Suite (CHIME FRB injection across V5, V4, V3, CPU)
+#   5. Comprehensive Multi-Generation Benchmark Sweeps:
+#        - CUDA Tracker V5 master sweep (Unified Engine, 32-256 ant)
+#        - CUDA Tracker V4 master sweep (Tensor Core, Half2, Deep ILP)
 #        - CUDA Tracker V3 multi-model sweep (11+ engines)
 #        - CUDA Tracker V2 comparison sweep (CSV summaries & frame latencies)
 #        - CPU Opt tracker sweep (per-window latency vs 0.5 ms target)
 #        - CPU Naive vs Opt v1 vs Opt v2 sweeps
 #        - Naive CPU matrix sweep
 #        - CPU vs CUDA offline direct beamformer sweep
-#   6. Multi-Panel Visualization Dashboards & Plots
-#   7. Automated Unified Summary Generation (SUMMARY.md & SUMMARY.txt)
-#   8. Archive Packaging & One-Command SCP Retrieval
+#   6. Publication & Presentation Visual Suite (generate_presentation_suite.py)
+#   7. Multi-Panel Visualization Dashboards & Plots
+#   8. Automated Unified Summary Generation (SUMMARY.md & SUMMARY.txt)
+#   9. Archive Packaging & One-Command SCP Retrieval
 #
 # Usage:
 #   bash scripts/run_everything.sh                   # Full standard sweep
@@ -75,10 +78,14 @@ fi
 
 # Directory hierarchy
 mkdir -p "${RESULTS_DIR}/tests"
+mkdir -p "${RESULTS_DIR}/astronomical_validation/v5"
+mkdir -p "${RESULTS_DIR}/astronomical_validation/v4"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/v3"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/phase4_fws"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/cpu_opt_v2"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/cpu_naive"
+mkdir -p "${RESULTS_DIR}/benchmarks/tracker_v5"
+mkdir -p "${RESULTS_DIR}/benchmarks/tracker_v4"
 mkdir -p "${RESULTS_DIR}/benchmarks/tracker_v3"
 mkdir -p "${RESULTS_DIR}/benchmarks/tracker_v2"
 mkdir -p "${RESULTS_DIR}/benchmarks/cpu_opt_tracker"
@@ -86,6 +93,7 @@ mkdir -p "${RESULTS_DIR}/benchmarks/cpu_naive_opt_v1"
 mkdir -p "${RESULTS_DIR}/benchmarks/cpu_naive_opt_v2"
 mkdir -p "${RESULTS_DIR}/benchmarks/naive_cpu_matrix"
 mkdir -p "${RESULTS_DIR}/benchmarks/cpu_cuda_offline"
+mkdir -p "${RESULTS_DIR}/presentation_assets"
 mkdir -p "${RESULTS_DIR}/plots"
 
 echo "========================================================================"
@@ -104,27 +112,29 @@ echo ""
 # ------------------------------------------------------------------------------
 # 1. Environment & Hardware Diagnostics
 # ------------------------------------------------------------------------------
-echo "--- [1/7] Capturing System Diagnostics & Hardware Environment ---"
-
+echo "--- [1/8] Environment Setup & Hardware Diagnostics ---"
 if command -v module &> /dev/null; then
-    echo "Loading HPC modules (StdEnv/2023, gcc/12.3, cuda/12.6, python/3.11)..."
+    echo "Loading HPC modules (StdEnv/2023, gcc/12.3, cuda/12.6, python/3.11, scipy-stack)..."
     module load StdEnv/2023 2>/dev/null || true
     module load gcc/12.3 2>/dev/null || true
     module load cuda/12.6 2>/dev/null || true
     module load python/3.11 2>/dev/null || true
+    module load scipy-stack 2>/dev/null || true
 fi
 
 if [[ -d ".venv" ]]; then
-    echo "Activating Python venv (.venv)..."
+    echo "Activating Python virtual environment (.venv)..."
     source .venv/bin/activate
 elif [[ -d "venv" ]]; then
-    echo "Activating Python venv (venv)..."
+    echo "Activating Python virtual environment (venv)..."
     source venv/bin/activate
 fi
 
-export PYTHONPATH="${PROJECT_ROOT}/tools:${PYTHONPATH:-}"
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-24}
+export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/tools:${PYTHONPATH:-}"
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-24}}
 export OMP_PROC_BIND=true
+export MPLCONFIGDIR="/tmp/matplotlib_${USER:-charts}_${TIMESTAMP}"
+mkdir -p "${MPLCONFIGDIR}"
 
 ENV_LOG="${RESULTS_DIR}/env_info.txt"
 {
@@ -158,96 +168,111 @@ ENV_LOG="${RESULTS_DIR}/env_info.txt"
         module list 2>&1 || true
     fi
 } > "${ENV_LOG}"
-
 cat "${ENV_LOG}"
 echo ""
 
 # ------------------------------------------------------------------------------
-# 2. Compilation (Clean Release Build with CUDA)
+# 2. Compilation
 # ------------------------------------------------------------------------------
-echo "--- [2/7] Compiling Project Targets (Release with CUDA) ---"
+echo "--- [2/8] Compiling Project Targets (Release with CUDA) ---"
 BUILD_LOG="${RESULTS_DIR}/build.log"
 
-if [[ "${REBUILD}" -eq 1 && -d "build" ]]; then
-    echo "Cleaning previous build directory..."
+if [[ "${REBUILD}" -eq 1 || ! -f "build/CMakeCache.txt" || ! -f "build/benchmark_cuda_tracker_v5" || ! -f "build/run_tracker_stream" ]]; then
+    echo "Configuring clean build with CUDA support..."
     rm -rf build
 fi
 
 cmake -B build -S . \
     -DCMAKE_BUILD_TYPE=Release \
     -DBEAMFORMER_ENABLE_CUDA=ON \
-    >"${BUILD_LOG}" 2>&1
+    -DBUILD_TESTING=ON \
+    2>&1 | tee "${BUILD_LOG}"
 
-NPROC=$(nproc 2>/dev/null || echo 8)
-cmake --build build --config Release -j "${NPROC}" >>"${BUILD_LOG}" 2>&1
+NPROC=$(nproc 2>/dev/null || echo 24)
+cmake --build build --config Release -j "${NPROC}" 2>&1 | tee -a "${BUILD_LOG}"
 
-echo "Build complete. (See ${BUILD_LOG})"
+echo "Build complete. (Log: ${BUILD_LOG})"
 echo ""
 
 # ------------------------------------------------------------------------------
-# 3. Unit & Correctness Tests
+# 3. Unit & Parity Correctness Tests
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_TESTS}" -eq 0 ]]; then
-    echo "--- [3/7] Running Complete Unit & Parity Correctness Tests ---"
+    echo "--- [3/8] Running Unit & Parity Correctness Tests ---"
 
-    # 3.1 CTest Engine Suite
+    # CTest Suite
     echo ">>> Running CTest Suite (All C++ and CUDA unit tests)..."
-    ctest --test-dir build --output-on-failure >"${RESULTS_DIR}/tests/ctest.log" 2>&1 || {
+    ctest --test-dir build --output-on-failure 2>&1 | tee "${RESULTS_DIR}/tests/ctest.log" || {
         echo "(Warning: Some CTest tests reported failures; see ${RESULTS_DIR}/tests/ctest.log)"
     }
-    grep -E "tests passed|Test project" "${RESULTS_DIR}/tests/ctest.log" || true
 
-    # 3.2 Naive CPU Test Suite (Trivial + Base + Complex)
+    # Naive CPU Test Suite
     if [[ -x "./build/beam_tracker_naive_cpu_test_suite" ]]; then
-        echo ">>> Running Naive CPU Test Suite (trivial, base, complex tests)..."
-        ./build/beam_tracker_naive_cpu_test_suite --skip-benchmark >"${RESULTS_DIR}/tests/naive_cpu_suite.log" 2>&1 || true
-        grep -E "tests ran|tests passed|tests failed" "${RESULTS_DIR}/tests/naive_cpu_suite.log" || true
+        echo ">>> Running Naive CPU Test Suite..."
+        ./build/beam_tracker_naive_cpu_test_suite --skip-benchmark 2>&1 | tee "${RESULTS_DIR}/tests/naive_cpu_suite.log" || true
     fi
 
-    # 3.3 Python Unit Tests
-    echo ">>> Running Python unit tests..."
-    python3 -m unittest discover -s tests/python -p "test_*.py" -v >"${RESULTS_DIR}/tests/python_tests.log" 2>&1 || true
-    tail -n 2 "${RESULTS_DIR}/tests/python_tests.log" || true
+    # Python Unit Tests
+    echo ">>> Running Python unit test suite..."
+    python3 -m unittest discover -s tests/python -p "test_*.py" -v 2>&1 | tee "${RESULTS_DIR}/tests/python_tests.log" || true
+
+    if [[ -f "tools/run_temporal_integration_test.py" ]]; then
+        echo ">>> Running temporal integration verification test..."
+        python3 tools/run_temporal_integration_test.py 2>&1 | tee -a "${RESULTS_DIR}/tests/python_tests.log" || true
+    fi
 
     echo "Unit test suite completed."
     echo ""
 else
-    echo "--- [3/7] Skipping Unit Tests (--skip-tests) ---"
+    echo "--- [3/8] Skipping Unit Tests (--skip-tests) ---"
     echo ""
 fi
 
 # ------------------------------------------------------------------------------
-# 4. Astronomical Validation Suite (FRB Injection & Sensitivity Scaling)
+# 4. Astronomical Validation Suite
 # ------------------------------------------------------------------------------
-echo "--- [4/7] Running Astronomical Validation Suite ---"
-
+echo "--- [4/8] Running Astronomical Validation Suite ---"
 ASTRO_SCRIPT="tools/run_astronomical_validation.py"
 if [[ -f "${ASTRO_SCRIPT}" && -x "./build/run_tracker_stream" ]]; then
-    echo ">>> Running Astronomical Validation: CUDA V3 Engine (all bursts)..."
+    echo ">>> Astronomical Validation: CUDA V5 Engine..."
+    python3 "${ASTRO_SCRIPT}" \
+        --engine cuda_v5 \
+        --burst all \
+        --outdir "${RESULTS_DIR}/astronomical_validation/v5" || true
+
+    echo ">>> Astronomical Validation: CUDA V4 Engine..."
+    python3 "${ASTRO_SCRIPT}" \
+        --engine cuda_v4 \
+        --burst all \
+        --outdir "${RESULTS_DIR}/astronomical_validation/v4" || true
+
+    echo ">>> Astronomical Validation: CUDA V3 Engine..."
     python3 "${ASTRO_SCRIPT}" \
         --engine cuda_v3 \
         --burst all \
         --outdir "${RESULTS_DIR}/astronomical_validation/v3" || true
 
-    echo ">>> Running Astronomical Validation: CUDA Phase 4 FWS Engine (all bursts)..."
+    echo ">>> Astronomical Validation: CUDA Phase 4 FWS Engine..."
     python3 "${ASTRO_SCRIPT}" \
         --engine cuda_fws \
         --burst all \
         --outdir "${RESULTS_DIR}/astronomical_validation/phase4_fws" || true
 
-    echo ">>> Running Astronomical Validation: CPU Opt v2 Engine (all bursts)..."
+    echo ">>> Astronomical Validation: CPU Opt v2 Engine..."
     python3 "${ASTRO_SCRIPT}" \
         --engine cpu_v2 \
         --burst all \
         --outdir "${RESULTS_DIR}/astronomical_validation/cpu_opt_v2" || true
 
-    echo ">>> Running Astronomical Validation: CPU Naive Engine (canonical burst)..."
+    echo ">>> Astronomical Validation: CPU Naive Engine..."
     python3 "${ASTRO_SCRIPT}" \
         --engine cpu_naive \
         --burst FRB20180916B_canonical \
         --outdir "${RESULTS_DIR}/astronomical_validation/cpu_naive" || true
 
     # Copy dashboard PNGs to plots directory
+    cp "${RESULTS_DIR}/astronomical_validation/v5/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_v5.png" 2>/dev/null || true
+    cp "${RESULTS_DIR}/astronomical_validation/v4/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_v4.png" 2>/dev/null || true
     cp "${RESULTS_DIR}/astronomical_validation/v3/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_v3.png" 2>/dev/null || true
     cp "${RESULTS_DIR}/astronomical_validation/phase4_fws/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_phase4_fws.png" 2>/dev/null || true
     cp "${RESULTS_DIR}/astronomical_validation/cpu_opt_v2/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_cpu_opt_v2.png" 2>/dev/null || true
@@ -260,10 +285,10 @@ fi
 echo ""
 
 # ------------------------------------------------------------------------------
-# 5. Multi-Engine Benchmark Sweeps
+# 5. Comprehensive Multi-Engine Benchmark Sweeps
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_BENCH}" -eq 0 ]]; then
-    echo "--- [5/7] Executing Comprehensive Benchmark Matrix & Performance Sweeps ---"
+    echo "--- [5/8] Executing Comprehensive Benchmark Sweeps ---"
 
     if [[ "${QUICK}" -eq 1 ]]; then
         THREAD_COUNTS=(1 24)
@@ -272,7 +297,7 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
         WINDOW_REPEATS=2
     else
         THREAD_COUNTS=(1 2 4 8 16 24)
-        ANT_COUNTS=(32 64)
+        ANT_COUNTS=(32 64 128 256)
         REPEAT=5
         WINDOW_REPEATS=3
     fi
@@ -280,11 +305,47 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
     N_TIME=15360
     INT_SPEC=320
 
-    # 5.1 CUDA Tracker V3 Master Benchmark (Evaluates all 11+ engines)
-    if [[ -x "./build/benchmark_cuda_tracker_v3" ]]; then
-        echo ">>> [5.1] Sweeping benchmark_cuda_tracker_v3 across thread counts & antenna sizes..."
-        V3_LOG="${RESULTS_DIR}/benchmarks/tracker_v3/tracker_v3_sweep.log"
+    # 5.1 CUDA Tracker V5 Master Benchmark
+    if [[ -x "./build/benchmark_cuda_tracker_v5" ]]; then
+        echo ">>> [5.1] benchmark_cuda_tracker_v5 sweep..."
+        V5_LOG="${RESULTS_DIR}/benchmarks/tracker_v5/tracker_v5_sweep.log"
         for N_ANT in "${ANT_COUNTS[@]}"; do
+            echo "--- benchmark_cuda_tracker_v5: n_ant=${N_ANT} ---" | tee -a "${V5_LOG}"
+            ./build/benchmark_cuda_tracker_v5 \
+                --n-time ${N_TIME} \
+                --n-ant ${N_ANT} \
+                --integration-spectra ${INT_SPEC} \
+                --repeat ${REPEAT} \
+                --window-repeats ${WINDOW_REPEATS} \
+                --outdir "${RESULTS_DIR}/benchmarks/tracker_v5" >>"${V5_LOG}" 2>&1 || true
+            echo "" >>"${V5_LOG}"
+        done
+        echo "CUDA Tracker V5 sweep finished."
+    fi
+
+    # 5.2 CUDA Tracker V4 Master Benchmark
+    if [[ -x "./build/benchmark_cuda_tracker_v4" ]]; then
+        echo ">>> [5.2] benchmark_cuda_tracker_v4 sweep..."
+        V4_LOG="${RESULTS_DIR}/benchmarks/tracker_v4/tracker_v4_sweep.log"
+        for N_ANT in 32 64; do
+            echo "--- benchmark_cuda_tracker_v4: n_ant=${N_ANT} ---" | tee -a "${V4_LOG}"
+            ./build/benchmark_cuda_tracker_v4 \
+                --n-time ${N_TIME} \
+                --n-ant ${N_ANT} \
+                --integration-spectra ${INT_SPEC} \
+                --repeat ${REPEAT} \
+                --window-repeats ${WINDOW_REPEATS} \
+                --outdir "${RESULTS_DIR}/benchmarks/tracker_v4" >>"${V4_LOG}" 2>&1 || true
+            echo "" >>"${V4_LOG}"
+        done
+        echo "CUDA Tracker V4 sweep finished."
+    fi
+
+    # 5.3 CUDA Tracker V3 Master Benchmark
+    if [[ -x "./build/benchmark_cuda_tracker_v3" ]]; then
+        echo ">>> [5.3] benchmark_cuda_tracker_v3 sweep..."
+        V3_LOG="${RESULTS_DIR}/benchmarks/tracker_v3/tracker_v3_sweep.log"
+        for N_ANT in 32 64; do
             for T in "${THREAD_COUNTS[@]}"; do
                 export OMP_NUM_THREADS=${T}
                 echo "--- benchmark_cuda_tracker_v3: n_ant=${N_ANT} | threads=${T} ---" | tee -a "${V3_LOG}"
@@ -302,11 +363,11 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
         echo "CUDA Tracker V3 sweep finished."
     fi
 
-    # 5.2 CUDA Tracker V2 Comparison Sweep (Emits summary, frame latencies, validation CSVs)
+    # 5.4 CUDA Tracker V2 Comparison Sweep
     if [[ -x "./build/benchmark_cuda_tracker_v2" ]]; then
-        echo ">>> [5.2] Running benchmark_cuda_tracker_v2 sweep..."
+        echo ">>> [5.4] benchmark_cuda_tracker_v2 sweep..."
         V2_OUTDIR="${RESULTS_DIR}/benchmarks/tracker_v2"
-        for N_ANT in "${ANT_COUNTS[@]}"; do
+        for N_ANT in 32 64; do
             for T in "${THREAD_COUNTS[@]}"; do
                 export OMP_NUM_THREADS=${T}
                 ./build/benchmark_cuda_tracker_v2 \
@@ -319,14 +380,14 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
                     --outdir "${V2_OUTDIR}" || true
             done
         done
-        echo "CUDA Tracker V2 sweep finished. (CSVs written to ${V2_OUTDIR})"
+        echo "CUDA Tracker V2 sweep finished. (CSVs in ${V2_OUTDIR})"
     fi
 
-    # 5.3 CPU Optimized Tracker Benchmark (0.5 ms/frame target)
+    # 5.5 CPU Optimized Tracker Benchmark
     if [[ -x "./build/benchmark_cpu_opt_beam_tracker" ]]; then
-        echo ">>> [5.3] Running benchmark_cpu_opt_beam_tracker..."
+        echo ">>> [5.5] benchmark_cpu_opt_beam_tracker..."
         CPU_OPT_DIR="${RESULTS_DIR}/benchmarks/cpu_opt_tracker"
-        for N_ANT in "${ANT_COUNTS[@]}"; do
+        for N_ANT in 32 64; do
             for T in "${THREAD_COUNTS[@]}"; do
                 export OMP_NUM_THREADS=${T}
                 ./build/benchmark_cpu_opt_beam_tracker \
@@ -341,9 +402,9 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
         echo "CPU Opt Tracker benchmark finished."
     fi
 
-    # 5.4 CPU Naive vs Opt v1 Sweep
+    # 5.6 CPU Naive vs Opt v1 Sweep
     if [[ -x "./build/benchmark_beam_tracker_opt" ]]; then
-        echo ">>> [5.4] Running benchmark_beam_tracker_opt..."
+        echo ">>> [5.6] benchmark_beam_tracker_opt..."
         OPT1_DIR="${RESULTS_DIR}/benchmarks/cpu_naive_opt_v1"
         for T in "${THREAD_COUNTS[@]}"; do
             ./build/benchmark_beam_tracker_opt \
@@ -356,9 +417,9 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
         done
     fi
 
-    # 5.5 CPU Naive vs Opt v1 vs Opt v2 Sweep (+ NUMA check)
+    # 5.7 CPU Naive vs Opt v1 vs Opt v2 Sweep
     if [[ -x "./build/benchmark_beam_tracker_opt_v2" ]]; then
-        echo ">>> [5.5] Running benchmark_beam_tracker_opt_v2..."
+        echo ">>> [5.7] benchmark_beam_tracker_opt_v2..."
         OPT2_DIR="${RESULTS_DIR}/benchmarks/cpu_naive_opt_v2"
         for T in "${THREAD_COUNTS[@]}"; do
             ./build/benchmark_beam_tracker_opt_v2 \
@@ -369,21 +430,11 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
                 --repeat ${REPEAT} \
                 --outdir "${OPT2_DIR}" || true
         done
-        if command -v numactl &>/dev/null; then
-            echo "Running NUMA diagnostic under numactl --interleave=all..."
-            numactl --interleave=all ./build/benchmark_beam_tracker_opt_v2 \
-                --n-time ${N_TIME} \
-                --n-ant 64 \
-                --integration-spectra ${INT_SPEC} \
-                --threads 24 \
-                --repeat ${REPEAT} \
-                --outdir "${OPT2_DIR}" || true
-        fi
     fi
 
-    # 5.6 Naive CPU Matrix Sweep
+    # 5.8 Naive CPU Matrix Sweep
     if [[ -x "./build/beam_tracker_naive_cpu_test_suite" ]]; then
-        echo ">>> [5.6] Running beam_tracker_naive_cpu_test_suite matrix sweep..."
+        echo ">>> [5.8] beam_tracker_naive_cpu_test_suite matrix sweep..."
         ./build/beam_tracker_naive_cpu_test_suite \
             --skip-trivial --skip-base --skip-complex \
             --n-ant 32,64 \
@@ -392,9 +443,9 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
             --metrics "${RESULTS_DIR}/benchmarks/naive_cpu_matrix/benchmark_naive_cpu_matrix.csv" || true
     fi
 
-    # 5.7 Direct Offline CPU vs CUDA Beamformer Benchmark
+    # 5.9 Direct Offline CPU vs CUDA Beamformer Benchmark
     if [[ -x "./build/benchmark_cpu_cuda" ]]; then
-        echo ">>> [5.7] Running direct offline beamformer benchmark (benchmark_cpu_cuda)..."
+        echo ">>> [5.9] direct offline beamformer benchmark (benchmark_cpu_cuda)..."
         ./build/benchmark_cpu_cuda \
             --output-prefix "${RESULTS_DIR}/benchmarks/cpu_cuda_offline/gpu_benchmark_direct" \
             --n-ant 32,64 \
@@ -405,20 +456,57 @@ if [[ "${SKIP_BENCH}" -eq 0 ]]; then
             --repetitions 5 || true
     fi
 
+    # 5.10 Quantized CUDA Beamformer Benchmark
+    if [[ -x "./build/benchmark_cuda_quantized" && -x "./build/generate_fake_data" && -x "./build/generate_weights" ]]; then
+        echo ">>> [5.10] quantized CUDA beamformer benchmark (benchmark_cuda_quantized)..."
+        mkdir -p "${RESULTS_DIR}/benchmarks/quantized"
+        TMP_DATA="${RESULTS_DIR}/benchmarks/quantized/fake_data.bin"
+        TMP_WEIGHTS="${RESULTS_DIR}/benchmarks/quantized/fake_weights.bin"
+        ./build/generate_fake_data --output "${TMP_DATA}" --n-time 15360 --n-ant 64 >/dev/null 2>&1 || true
+        ./build/generate_weights --output "${TMP_WEIGHTS}" --n-ant 64 --beams 16 >/dev/null 2>&1 || true
+        if [[ -f "${TMP_DATA}" && -f "${TMP_WEIGHTS}" ]]; then
+            ./build/benchmark_cuda_quantized \
+                --input "${TMP_DATA}" \
+                --weights "${TMP_WEIGHTS}" \
+                --log "${RESULTS_DIR}/benchmarks/quantized/quantized_log.txt" \
+                --summary "${RESULTS_DIR}/benchmarks/quantized/quantized_summary.txt" \
+                --n-time 15360 \
+                --integration-spectra 320 \
+                --kernel tiled \
+                --warmups 2 \
+                --repetitions 5 || true
+            rm -f "${TMP_DATA}" "${TMP_WEIGHTS}"
+        fi
+    fi
+
     echo "All benchmarks completed."
     echo ""
 else
-    echo "--- [5/7] Skipping Benchmarks (--skip-bench) ---"
+    echo "--- [5/8] Skipping Benchmarks (--skip-bench) ---"
     echo ""
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Visualization Dashboards & Plot Generation
+# 6. Publication & Presentation Visual Material Generation
 # ------------------------------------------------------------------------------
-echo "--- [6/7] Rendering Multi-Panel Comparison Dashboards & Visualizations ---"
+echo "--- [6/8] Generating Presentation Visual Suite ---"
+if [[ -f "tools/generate_presentation_suite.py" ]]; then
+    python3 tools/generate_presentation_suite.py \
+        --outdir "${RESULTS_DIR}/presentation_assets" \
+        --engine cuda_v5 || true
 
+    # Copy presentation figures to plots directory
+    cp "${RESULTS_DIR}/presentation_assets/"*.png "${RESULTS_DIR}/plots/" 2>/dev/null || true
+    echo "Presentation suite generated in ${RESULTS_DIR}/presentation_assets/"
+fi
+echo ""
+
+# ------------------------------------------------------------------------------
+# 7. Visualization Dashboards & Plot Generation
+# ------------------------------------------------------------------------------
+echo "--- [7/8] Rendering Comparison Dashboards & Timings Visualizations ---"
 if python3 -c "import matplotlib, numpy" 2>/dev/null; then
-    # 6.1 CPU vs GPU Comparison Dashboard
+    # Tracker Comparison Dashboard
     if [[ -f "${RESULTS_DIR}/benchmarks/tracker_v2/benchmark_cuda_tracker_v2_summary.csv" ]]; then
         echo ">>> Plotting tracker comparison dashboard..."
         python3 tools/plot_tracker_comparison.py \
@@ -427,7 +515,7 @@ if python3 -c "import matplotlib, numpy" 2>/dev/null; then
             --budget-ms 0.5 || true
     fi
 
-    # 6.2 CPU Opt Tracker Dashboard
+    # CPU Opt Tracker Dashboard
     if [[ -f "${RESULTS_DIR}/benchmarks/cpu_opt_tracker/cpu_opt_metrics_sweep.csv" ]]; then
         echo ">>> Plotting CPU opt tracker dashboard..."
         LATEST_FRAMES=$(find "${RESULTS_DIR}/benchmarks/cpu_opt_tracker" -name "frames_*.csv" | head -n 1)
@@ -439,30 +527,27 @@ if python3 -c "import matplotlib, numpy" 2>/dev/null; then
         fi
     fi
 
-    # 6.3 Direct Offline Beamformer Plots
+    # Direct Offline Beamformer Plots
     if [[ -f "${RESULTS_DIR}/benchmarks/cpu_cuda_offline/gpu_benchmark_direct_timings.csv" ]]; then
         echo ">>> Plotting direct beamformer benchmark..."
         python3 tools/plot_benchmark.py \
             --input-prefix "${RESULTS_DIR}/benchmarks/cpu_cuda_offline/gpu_benchmark_direct" \
             --output-prefix "${RESULTS_DIR}/plots/direct_beamformer_benchmark" || true
     fi
-else
-    echo "(Warning: Python matplotlib/numpy not available in current environment; skipping plotting)"
 fi
 echo ""
 
 # ------------------------------------------------------------------------------
-# 7. Summary Generation, Packaging & SCP Instructions
+# 8. Summary Generation, Packaging & SCP Instructions
 # ------------------------------------------------------------------------------
-echo "--- [7/7] Compiling Unified Summary & Packaging All Results ---"
-
+echo "--- [8/8] Compiling Unified Summary & Packaging All Results ---"
 if [[ -f "tools/generate_run_summary.py" ]]; then
     python3 tools/generate_run_summary.py \
         --results-dir "${RESULTS_DIR}" \
         --slurm-job-id "${SLURM_JOB_ID:-}" || true
 fi
 
-# Print text summary inline
+# Print text summary inline to job output
 if [[ -f "${RESULTS_DIR}/SUMMARY.txt" ]]; then
     echo ""
     cat "${RESULTS_DIR}/SUMMARY.txt"
@@ -478,6 +563,12 @@ ln -s "${RESULTS_DIR}" "${LATEST_LINK}" 2>/dev/null || true
 TAR_FILE="${RESULTS_DIR}.tar.gz"
 echo "Creating compressed archive: ${TAR_FILE}..."
 tar -czf "${TAR_FILE}" -C "$(dirname "${RESULTS_DIR}")" "$(basename "${RESULTS_DIR}")" 2>/dev/null || true
+
+# Copy Slurm logs into the results directory if running under batch
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    cp "${PROJECT_ROOT}/results/slurm_everything_${SLURM_JOB_ID}.out" "${RESULTS_DIR}/" 2>/dev/null || true
+    cp "${PROJECT_ROOT}/results/slurm_everything_${SLURM_JOB_ID}.err" "${RESULTS_DIR}/" 2>/dev/null || true
+fi
 
 echo ""
 echo "========================================================================"
@@ -498,4 +589,6 @@ echo ""
 echo "  # Or download the single compressed tarball:"
 echo "  scp <user>@trillium.scinet.utoronto.ca:${TAR_FILE} ./"
 echo ""
+echo "  # Download only the presentation figures & plots:"
+echo "  scp -r <user>@trillium.scinet.utoronto.ca:${RESULTS_DIR}/plots ./"
 echo "========================================================================"
