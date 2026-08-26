@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=beamform_pres_val
+#SBATCH --job-name=beamform_presentation
 #SBATCH --account=def-vanderli
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
@@ -9,9 +9,10 @@
 #SBATCH --error=results/slurm_pres_%j.err
 
 # ==============================================================================
-# scripts/slurm/submit_presentation_and_validation.sh
+# scripts/slurm/submit_presentation.sh
 #
-# Wrapper delegating to scripts/run_presentation.sh.
+# Dedicated Slurm Batch Submission Script for SciNet Trillium GPU Nodes.
+# (Delegates to project root scripts/run_presentation.sh)
 # ==============================================================================
 
 if [[ -n "${SLURM_SUBMIT_DIR:-}" && -d "${SLURM_SUBMIT_DIR}" ]]; then
