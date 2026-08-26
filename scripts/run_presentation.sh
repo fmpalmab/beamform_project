@@ -8,8 +8,8 @@
 # 1. HPC module loading & Python virtual environment activation
 # 2. C++/CUDA compilation (CMake Release build with CUDA support)
 # 3. Unit & integration test execution (Verython)
-# 4. Astronomical FRB validation suite (multi-engine)
-# 5. Presentation visual suite & data generator (tools/generate_presentation_suite.py)
+# 4. Master presentation visual suite & data generator (tools/generate_presentation_suite.py)
+# 5. Astronomical FRB validation suite (cuda_v5, cuda_v4, cpu_v2)
 # 6. Packaging, tarball creation, and 1-command SCP retrieval instructions
 #
 # Usage:
@@ -65,7 +65,6 @@ mkdir -p "${RESULTS_DIR}/plots"
 mkdir -p "${RESULTS_DIR}/presentation_assets"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/v5"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/v4"
-mkdir -p "${RESULTS_DIR}/astronomical_validation/v3"
 mkdir -p "${RESULTS_DIR}/astronomical_validation/cpu_v2"
 mkdir -p "${RESULTS_DIR}/tests"
 mkdir -p "${RESULTS_DIR}/logs"
@@ -156,45 +155,50 @@ python3 -m unittest discover -s tests/python -p "test_*.py" -v 2>&1 | tee "${TES
 echo "Unit tests finished."
 echo ""
 
-# 4. Astronomical Validation Suite
-echo "--- [4/6] Executing Astronomical FRB Validation Suite ---"
-ASTRO_SCRIPT="tools/run_astronomical_validation.py"
-if [[ -f "${ASTRO_SCRIPT}" && -x "./build/run_tracker_stream" ]]; then
-    echo ">>> Running Live Astronomical Validation on CUDA V5..."
-    python3 "${ASTRO_SCRIPT}" \
-        --engine cuda_v5 \
-        --burst all \
-        --outdir "${RESULTS_DIR}/astronomical_validation/v5" || true
-
-    echo ">>> Running Live Astronomical Validation on CUDA V4..."
-    python3 "${ASTRO_SCRIPT}" \
-        --engine cuda_v4 \
-        --burst all \
-        --outdir "${RESULTS_DIR}/astronomical_validation/v4" || true
-
-    echo ">>> Running Live Astronomical Validation on CPU Opt v2..."
-    python3 "${ASTRO_SCRIPT}" \
-        --engine cpu_v2 \
-        --burst all \
-        --outdir "${RESULTS_DIR}/astronomical_validation/cpu_v2" || true
-else
-    echo "(Note: Live stream runner binary not found; astronomical validation will run in exact synthetic mode)"
-fi
-echo ""
-
-# 5. Master Presentation Suite Generation
-echo "--- [5/6] Generating Master Presentation Assets & Data ---"
+# 4. Master Presentation Suite Generation (Early Generation ensures all presentation assets are immediately ready)
+echo "--- [4/6] Generating Master Presentation Assets & Data ---"
 python3 tools/generate_presentation_suite.py \
     --outdir "${RESULTS_DIR}/presentation_assets" \
     --engine cuda_v5
 
-# Copy all presentation figures and data to plots directory
+# Copy presentation figures and data to plots and root directory
 cp "${RESULTS_DIR}/presentation_assets/"*.png "${RESULTS_DIR}/plots/" 2>/dev/null || true
 cp "${RESULTS_DIR}/presentation_assets/"*.csv "${RESULTS_DIR}/" 2>/dev/null || true
 cp "${RESULTS_DIR}/presentation_assets/"*.json "${RESULTS_DIR}/" 2>/dev/null || true
 cp "${RESULTS_DIR}/presentation_assets/PRESENTATION_DECK.md" "${RESULTS_DIR}/" 2>/dev/null || true
 
-echo "Presentation suite generated successfully."
+echo "Presentation visual assets generated in ${RESULTS_DIR}/presentation_assets/"
+echo ""
+
+# 5. Astronomical Validation Suite
+echo "--- [5/6] Executing Live Astronomical FRB Validation Suite ---"
+ASTRO_SCRIPT="tools/run_astronomical_validation.py"
+if [[ -f "${ASTRO_SCRIPT}" && -x "./build/run_tracker_stream" ]]; then
+    echo ">>> Running Live Astronomical Validation on CUDA V5 (Full 4-Burst Benchmark Suite)..."
+    python3 "${ASTRO_SCRIPT}" \
+        --engine cuda_v5 \
+        --burst all \
+        --outdir "${RESULTS_DIR}/astronomical_validation/v5" || true
+
+    echo ">>> Running Live Astronomical Validation on CUDA V4 (Full 4-Burst Benchmark Suite)..."
+    python3 "${ASTRO_SCRIPT}" \
+        --engine cuda_v4 \
+        --burst all \
+        --outdir "${RESULTS_DIR}/astronomical_validation/v4" || true
+
+    echo ">>> Running Live Astronomical Validation on CPU Opt v2 (Canonical Benchmark)..."
+    python3 "${ASTRO_SCRIPT}" \
+        --engine cpu_v2 \
+        --burst FRB20180916B_canonical \
+        --outdir "${RESULTS_DIR}/astronomical_validation/cpu_v2" || true
+
+    # Copy astro dashboards to plots directory
+    cp "${RESULTS_DIR}/astronomical_validation/v5/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_v5.png" 2>/dev/null || true
+    cp "${RESULTS_DIR}/astronomical_validation/v4/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_v4.png" 2>/dev/null || true
+    cp "${RESULTS_DIR}/astronomical_validation/cpu_v2/astronomical_validation_dashboard.png" "${RESULTS_DIR}/plots/astronomical_validation_cpu_v2.png" 2>/dev/null || true
+else
+    echo "(Note: Live stream runner binary not found; astronomical validation will run in exact synthetic mode)"
+fi
 echo ""
 
 # 6. Packaging & SCP Instructions

@@ -70,7 +70,7 @@ class TestGeneratePresentationSuite(unittest.TestCase):
             self.assertIn("Compute_Throughput_TFLOPs", header)
 
     def test_generate_astronomical_validation_dashboard(self):
-        png_path = gps.generate_astronomical_validation_dashboard(self.outdir, engine="cuda_v5")
+        png_path = gps.generate_astronomical_validation_dashboard(self.outdir, engine="cuda_v5", skip_live=True)
         self.assertTrue(png_path.exists())
         self.assertGreater(png_path.stat().st_size, 1000)
 

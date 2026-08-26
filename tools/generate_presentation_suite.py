@@ -475,7 +475,7 @@ def generate_cuda_v5_benchmark_deepdive(outdir: Path) -> Path:
 # ==============================================================================
 # 3. Section 3: Astronomical & Physical Validation Dashboard
 # ==============================================================================
-def generate_astronomical_validation_dashboard(outdir: Path, engine: str = "cuda_v5") -> Path:
+def generate_astronomical_validation_dashboard(outdir: Path, engine: str = "cuda_v5", skip_live: bool = False) -> Path:
     """Generate high-resolution astronomical validation dashboard and JSON metrics."""
     print(f"\n[3/6] Generating Astronomical & Physical Validation Dashboard ({engine})...")
 
@@ -495,7 +495,7 @@ def generate_astronomical_validation_dashboard(outdir: Path, engine: str = "cuda
 
     # Synthesize physical waterfall or run live if engine available
     waterfall = None
-    if HAS_ASTRO_MODULES:
+    if HAS_ASTRO_MODULES and not skip_live:
         try:
             params = get_frb_benchmark("FRB20180916B_canonical")
             packed, _ = generate_frb_packed_voltage_stream(params, n_time=n_time, n_ant=n_ant, n_freq=n_freq)

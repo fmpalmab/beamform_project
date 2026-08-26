@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=24
-#SBATCH --time=01:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=results/slurm_pres_%j.out
 #SBATCH --error=results/slurm_pres_%j.err
 
