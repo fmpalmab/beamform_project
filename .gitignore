@@ -19,5 +19,10 @@ Testing/
 !CMakeLists.txt
 trillium_bench_results/
 .gemini/
+<<<<<<< HEAD
 *.npz
 artifacts/
+=======
+graphify-out/
+
+>>>>>>> 3a95335 (update to .gitignore)
