@@ -21,8 +21,21 @@ echo "Host Node    : $(hostname)"
 echo "========================================================================"
 echo ""
 
-# Find latest campaign log
-LATEST_CAMP_LOG=$(ls -t "${PROJECT_ROOT}/results"/campaign_*.log 2>/dev/null | head -n 1 || true)
+# Find active campaign log (matching running/pending jobs in squeue)
+ACTIVE_JOBS=$(squeue -u "${USER:-$USER}" -h -o "%i" 2>/dev/null || true)
+LATEST_CAMP_LOG=""
+for log in $(ls -t "${PROJECT_ROOT}/results"/campaign_*.log 2>/dev/null); do
+    for j in ${ACTIVE_JOBS}; do
+        if grep -q "^${j}|" "${log}" 2>/dev/null; then
+            LATEST_CAMP_LOG="${log}"
+            break 2
+        fi
+    done
+done
+
+if [[ -z "${LATEST_CAMP_LOG}" ]]; then
+    LATEST_CAMP_LOG=$(ls -t "${PROJECT_ROOT}/results"/campaign_*.log 2>/dev/null | head -n 1 || true)
+fi
 
 if [[ -z "${LATEST_CAMP_LOG}" || ! -f "${LATEST_CAMP_LOG}" ]]; then
     echo "No active campaign log found. Showing general Slurm queue status:"
@@ -30,7 +43,7 @@ if [[ -z "${LATEST_CAMP_LOG}" || ! -f "${LATEST_CAMP_LOG}" ]]; then
     exit 0
 fi
 
-echo "Campaign Log: ${LATEST_CAMP_LOG}"
+echo "Active Campaign Log: ${LATEST_CAMP_LOG}"
 echo ""
 
 # Check Slurm Queue for active jobs
