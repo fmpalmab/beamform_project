@@ -148,6 +148,13 @@ else()
     target_link_libraries(run_tracker_stream PRIVATE beamformer_core OpenMP::OpenMP_CXX)
 endif()
 
+add_executable(bench_continuous_stress_test tools/bench_continuous_stress_test.cpp)
+if(BEAMFORMER_HAS_CUDA)
+    target_link_libraries(bench_continuous_stress_test PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
+else()
+    target_link_libraries(bench_continuous_stress_test PRIVATE beamformer_core OpenMP::OpenMP_CXX)
+endif()
+
 if(BEAMFORMER_HAS_CUDA)
     find_package(CUDAToolkit REQUIRED)
     add_library(beamformer_cuda_core
