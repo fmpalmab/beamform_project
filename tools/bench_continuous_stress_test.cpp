@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -54,14 +55,6 @@ struct StressTestConfig {
     std::string engine = "cuda_v5";
     std::string outdir = "results/stress_test";
     double sample_cadence_us = 3.333333; // 300 kHz channel sample rate
-};
-
-struct WindowStats {
-    double latency_ms;
-    double throughput_gsamples;
-    double throughput_tflops;
-    bool has_nan_inf;
-    bool budget_overrun;
 };
 
 void print_usage(const char* prog) {
@@ -98,8 +91,8 @@ int main(int argc, char** argv) {
 
     const double real_time_budget_ms = config.spectra_per_window * (config.sample_cadence_us / 1000.0);
     const std::size_t window_samples = config.spectra_per_window * config.n_freq * config.n_ant;
-    const std::size_t total_ops_per_window = config.spectra_per_window * config.n_freq * config.n_ant * 8 // Beamformer MACs
-                                           + config.spectra_per_window * config.n_freq * 5 * config.upchan_factor; // Upchannelizer FFT MACs
+    const std::size_t total_ops_per_window = config.spectra_per_window * config.n_freq * config.n_ant * 8
+                                           + config.spectra_per_window * config.n_freq * 5 * config.upchan_factor;
 
     std::cout << "========================================================================\n"
               << "    BEAM TRACKER & UPCHANNELIZER: 2-HOUR CONTINUOUS STRESS TEST SUITE   \n"
@@ -113,9 +106,7 @@ int main(int argc, char** argv) {
               << "Output Directory   : " << config.outdir << "\n"
               << "========================================================================\n\n";
 
-    // Setup output directories & files
-    std::string mkdir_cmd = "mkdir -p " + config.outdir;
-    std::system(mkdir_cmd.c_str());
+    std::filesystem::create_directories(config.outdir);
 
     std::ofstream timeline_csv(config.outdir + "/stress_test_timeline.csv");
     timeline_csv << "Window_Idx,Elapsed_Sec,Latency_ms,Throughput_GSamples_s,Throughput_TFLOPs,VRAM_Used_MB,Overrun_Flag,Error_Flag\n";
@@ -135,26 +126,39 @@ int main(int argc, char** argv) {
     upchan_cfg.window = beamformer::UpchannelizerWindowType::Hann;
 
     beamformer::PackedVoltage packed_input(window_samples);
-    // Fill initial synthetic stream
     for (std::size_t i = 0; i < window_samples; ++i) {
         packed_input[i] = static_cast<std::uint8_t>((i & 0x07) | (( (i >> 3) & 0x07) << 4));
     }
 
     std::size_t out_fine_count = (config.spectra_per_window / config.upchan_factor) * (config.n_freq * config.upchan_factor) * dims.n_beams;
     beamformer::Intensities fine_output(out_fine_count, 0.0F);
+    beamformer::Intensities coarse_intensity(config.spectra_per_window * config.n_freq, 0.0F);
 
 #if BEAMFORMER_HAS_CUDA
     std::size_t free_vram_initial = 0, total_vram = 0;
     cudaMemGetInfo(&free_vram_initial, &total_vram);
     std::cout << "[Setup] Initial VRAM: " << (total_vram - free_vram_initial) / (1024 * 1024) << " MB used / "
-              << total_vram / (1024 * 1024) << " MB total.\n\n";
+              << total_vram / (1024 * 1024) << " MB total.\n";
 
     std::unique_ptr<beamformer::CudaUpchannelizerWorkspace> upchan_workspace;
     try {
         upchan_workspace = std::make_unique<beamformer::CudaUpchannelizerWorkspace>(dims, upchan_cfg);
+        std::cout << "[Setup] CudaUpchannelizerWorkspace initialized successfully.\n";
     } catch (const std::exception& e) {
         std::cerr << "[Warning] CudaUpchannelizerWorkspace initialization failed: " << e.what() << "\n";
     }
+
+    // Warmup step to initialize CUDA runtime context
+    std::cout << "[Setup] Performing CUDA driver warmup iteration...\n";
+    if (upchan_workspace) {
+        upchan_workspace->process_tracker(packed_input, tracker_cfg, fine_output);
+    } else {
+        beamformer::V5ExecutionConfig v5_cfg;
+        v5_cfg.time_unroll = 8;
+        beamformer::cuda_beam_tracker_v5_into(packed_input, dims, tracker_cfg, coarse_intensity, v5_cfg);
+    }
+    cudaDeviceSynchronize();
+    std::cout << "[Setup] Warmup complete.\n\n";
 #endif
 
     const auto start_wall_time = Clock::now();
@@ -192,24 +196,20 @@ int main(int argc, char** argv) {
 
         try {
 #if BEAMFORMER_HAS_CUDA
-            if (config.engine == "cuda_v5") {
-                beamformer::V5ExecutionConfig v5_cfg;
-                v5_cfg.time_unroll = 8;
-                // Execute V5 Tracker
-                beamformer::Intensities coarse_intensity(config.spectra_per_window * config.n_freq, 0.0F);
-                beamformer::cuda_beam_tracker_v5_into(packed_input, dims, tracker_cfg, coarse_intensity, v5_cfg);
-
-                // Execute Upchannelizer
+            if (config.engine == "cuda_v5" || config.engine == "cuda_v5_u8") {
                 if (upchan_workspace) {
+                    // Unified Fused Tracker + Upchannelizer in 1 device pass
                     upchan_workspace->process_tracker(packed_input, tracker_cfg, fine_output);
+                } else {
+                    beamformer::V5ExecutionConfig v5_cfg;
+                    v5_cfg.time_unroll = 8;
+                    beamformer::cuda_beam_tracker_v5_into(packed_input, dims, tracker_cfg, coarse_intensity, v5_cfg);
                 }
             } else if (config.engine == "cuda_v4") {
                 beamformer::V4ExecutionConfig v4_cfg;
-                beamformer::Intensities coarse_intensity(config.spectra_per_window * config.n_freq, 0.0F);
                 beamformer::cuda_beam_tracker_v4_into(packed_input, dims, tracker_cfg, coarse_intensity, v4_cfg);
             }
 #else
-            beamformer::Intensities coarse_intensity(config.spectra_per_window * config.n_freq, 0.0F);
             beamformer::beam_tracker_opt_v2_cpu_packed_intensity_into(packed_input, dims, tracker_cfg, coarse_intensity);
 #endif
         } catch (const std::exception& e) {
