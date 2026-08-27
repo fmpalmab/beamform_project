@@ -168,6 +168,8 @@ if(BEAMFORMER_HAS_CUDA)
         src/cuda_beam_tracker_v5.cu
         src/cuda_beam_tracker_v5_rtx5090.cu
         src/cuda_beamformer_v2.cu            # NEW — Unified single-engine warp-reduction beamformer V2
+        src/cuda_beamformer_v3.cu            # NEW — Multi-beam warp-cooperative beamformer V3
+        src/cuda_dual_parallel_pipeline.cu   # NEW — Joint parallel execution pipeline
         src/cuda_upchannelizer.cu            # NEW — Warp-level FFT/PFB upchannelizer
         src/frb_classifier.cu                # NEW — Phase 1 FRB dedisp+boxcar+NMS kernels + stream
         src/frb_classifier_rules.cpp         # NEW — host rule classifier (R1-R2) + JSON emitter
@@ -183,6 +185,9 @@ if(BEAMFORMER_HAS_CUDA)
 
     add_executable(beamformer_cuda tools/beamformer_cuda.cpp)
     target_link_libraries(beamformer_cuda PRIVATE beamformer_cuda_core)
+
+    add_executable(bench_dual_continuous_stress_test tools/bench_dual_continuous_stress_test.cpp)
+    target_link_libraries(bench_dual_continuous_stress_test PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
 
     add_executable(benchmark_cpu_cuda benchmarks/benchmark_cpu_cuda.cpp)
     target_link_libraries(benchmark_cpu_cuda PRIVATE beamformer_cuda_core)
@@ -242,6 +247,28 @@ if(BEAMFORMER_HAS_CUDA)
         OpenMP::OpenMP_CXX
     )
     target_compile_options(benchmark_cuda_beamformer_v2 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+    )
+
+    # Benchmark for CUDA Beamformer V3 (Dual-Beam Warp Co-Execution)
+    add_executable(benchmark_cuda_beamformer_v3 benchmarks/benchmark_cuda_beamformer_v3.cpp)
+    target_link_libraries(benchmark_cuda_beamformer_v3 
+        PRIVATE 
+        beamformer_cuda_core 
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(benchmark_cuda_beamformer_v3 PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
+    )
+
+    # Benchmark for Dual Engine Parallel Pipeline (Concurrent BF V3 + Tracker V5)
+    add_executable(benchmark_cuda_parallel_dual_engine benchmarks/benchmark_cuda_parallel_dual_engine.cpp)
+    target_link_libraries(benchmark_cuda_parallel_dual_engine 
+        PRIVATE 
+        beamformer_cuda_core 
+        OpenMP::OpenMP_CXX
+    )
+    target_compile_options(benchmark_cuda_parallel_dual_engine PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native;-Wall;-Wextra;-Wpedantic>
     )
 
@@ -465,6 +492,28 @@ if(BUILD_TESTING)
         add_test(NAME cuda_beamformer_v2 COMMAND test_cuda_beamformer_v2)
         set_tests_properties(cuda_beamformer_v2 PROPERTIES
             LABELS "cuda;beamformer;validation"
+            TIMEOUT 120
+        )
+
+        # CUDA Beamformer V3 test suite
+        add_executable(test_cuda_beamformer_v3
+                       tests/cuda/test_cuda_beamformer_v3.cpp)
+        target_link_libraries(test_cuda_beamformer_v3 PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
+        target_compile_options(test_cuda_beamformer_v3 PRIVATE -UNDEBUG)
+        add_test(NAME cuda_beamformer_v3 COMMAND test_cuda_beamformer_v3)
+        set_tests_properties(cuda_beamformer_v3 PROPERTIES
+            LABELS "cuda;beamformer;validation"
+            TIMEOUT 120
+        )
+
+        # CUDA Dual Parallel Pipeline test suite
+        add_executable(test_cuda_dual_parallel_pipeline
+                       tests/cuda/test_cuda_dual_parallel_pipeline.cpp)
+        target_link_libraries(test_cuda_dual_parallel_pipeline PRIVATE beamformer_cuda_core OpenMP::OpenMP_CXX)
+        target_compile_options(test_cuda_dual_parallel_pipeline PRIVATE -UNDEBUG)
+        add_test(NAME cuda_dual_parallel_pipeline COMMAND test_cuda_dual_parallel_pipeline)
+        set_tests_properties(cuda_dual_parallel_pipeline PROPERTIES
+            LABELS "cuda;parallel;validation"
             TIMEOUT 120
         )
 
