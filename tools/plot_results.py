@@ -12,20 +12,23 @@ from typing import Sequence
 import numpy as np
 
 
-SPEED_OF_LIGHT_M_PER_S = 299_792_458.0
-LOCAL_FREQUENCY_CHANNELS = 336
-FULL_BAND_FREQUENCY_CHANNELS = 672
-DEFAULT_N_FREQ = LOCAL_FREQUENCY_CHANNELS
-DEFAULT_FREQUENCY_START_HZ = 300_000_000.0
-DEFAULT_CHANNEL_WIDTH_HZ = 300_000.0
-BEAM_GRID_DESIGN_FREQUENCY_HZ = 400_000_000.0
-DEFAULT_SPACING_M = 0.6
-ETA_HEX = np.pi / (2.0 * np.sqrt(3.0))
-ANTENNA_SPECS = {
-    300e6: {"BW_E": 92.0, "BW_H": 66.0, "gain_dBi": 8.7},
-    400e6: {"BW_E": 108.0, "BW_H": 74.0, "gain_dBi": 7.75},
-    500e6: {"BW_E": 120.0, "BW_H": 87.0, "gain_dBi": 7.0},
-}
+import sys
+_tools_dir = Path(__file__).resolve().parent
+if str(_tools_dir) not in sys.path:
+    sys.path.insert(0, str(_tools_dir))
+
+from constants import (
+    SPEED_OF_LIGHT_M_PER_S,
+    LOCAL_FREQUENCY_CHANNELS,
+    FULL_BAND_FREQUENCY_CHANNELS,
+    DEFAULT_N_FREQ,
+    DEFAULT_FREQUENCY_START_HZ,
+    DEFAULT_CHANNEL_WIDTH_HZ,
+    BEAM_GRID_DESIGN_FREQUENCY_HZ,
+    DEFAULT_SPACING_M,
+    ETA_HEX,
+    ANTENNA_SPECS,
+)
 
 def resolve_frequency_configuration(
     buffer: str | None, requested_n_freq: int | None,

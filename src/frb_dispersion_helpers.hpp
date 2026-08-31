@@ -15,12 +15,11 @@
 
 namespace beamformer {
 
-// Dispersion constant K_DM in (s * MHz^2) / (pc * cm^-3). Same as the Python
-// helper tools/astronomical_validation/injector.py.
-inline constexpr double k_dm_dispersion = 4.148808e3;
+// Dispersion constant K_DM in (s * MHz^2) / (pc * cm^-3). Matches official CHARTS constants.
+inline constexpr double k_dm_dispersion = constants::k_dm;
 
-// Sample period in seconds: 10/3 us (defined in temporal_integration.hpp).
-inline constexpr double spectrum_period_s = (10.0 / 3.0) * 1.0e-6;
+// Sample period in seconds: 10/3 us (defined in temporal_integration.hpp and charts_constants).
+inline constexpr double spectrum_period_s = constants::cpt_delta_time_s;
 
 // Returns floor(K_DM * dm * (f_mhz^-2 - f_ref_mhz^-2) / dt) samples for the
 // given channel frequency in Hz, using f_ref_hz as the high-band reference.

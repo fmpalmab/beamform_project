@@ -4,3 +4,6 @@ matplotlib
 dash
 plotly
 pandas
+h5py
+astropy
+charts-constants @ git+https://github.com/charts-experiment/charts-constants.git

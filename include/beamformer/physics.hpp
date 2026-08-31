@@ -1,8 +1,11 @@
 #pragma once
 
+#include "beamformer/constants.hpp"
+
 namespace beamformer {
 
-inline constexpr double speed_of_light_m_per_s = 299'792'458.0;
-inline constexpr double two_pi = 6.283185307179586476925286766559;
+inline constexpr double speed_of_light_m_per_s = constants::speed_of_light_m_per_s;
+inline constexpr double k_dm = constants::k_dm;
+inline constexpr double two_pi = constants::two_pi;
 
 } // namespace beamformer

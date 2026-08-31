@@ -26,6 +26,21 @@ if(BEAMFORMER_ENABLE_CUDA)
     endif()
 endif()
 
+# Optional Python constants synchronization target
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_target(sync_constants
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/sync_constants.py
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Synchronizing include/beamformer/constants.hpp with CHARTS constants"
+    )
+    add_custom_target(check_constants
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/sync_constants.py --check
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Verifying parity between include/beamformer/constants.hpp and CHARTS constants"
+    )
+endif()
+
 add_library(beamformer_core
     src/cpu_beamformer.cpp
     src/beam_tracker.cpp

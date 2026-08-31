@@ -233,6 +233,25 @@ python -m unittest discover -s tests -p "test_*.py"
 
 ---
 
+## CHARTS Experiment Constants Integration
+
+This repository interfaces with the official `charts-constants` ecosystem:
+- **Single Source of Truth**: When `charts-constants` is installed or found in adjacent directories, physical ($K_{\text{DM}}$, $c$), instrumental (sampling clocks, channel widths), and array geometry constants are dynamically imported.
+- **First-Run / Standalone Fallback**: If `charts-constants` is not present on the machine, `tools/constants.py` and `include/beamformer/constants.hpp` seamlessly use built-in exact standard CHARTS fallback definitions. No external repositories or packages are strictly required to build and test `beamform_project`.
+- **C++ Compile-Time Constants**: High-performance kernel parameters (`constexpr`) reside in `include/beamformer/constants.hpp`.
+- **Synchronization**:
+  ```bash
+  # Verify parity between C++ headers and Python constants
+  cmake --build build --target check_constants
+
+  # Synchronize C++ header from Python constants
+  cmake --build build --target sync_constants
+  # or directly:
+  python scripts/sync_constants.py
+  ```
+
+---
+
 ## Benchmarks & Performance Sweeps
 
 ### Running Standalone C++ Benchmarks

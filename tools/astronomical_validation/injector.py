@@ -14,12 +14,14 @@ from typing import Tuple
 import numpy as np
 from .chime_catalog import FRBParameters
 
-# Dispersion constant K_DM in s * MHz^2 / (pc * cm^-3)
-K_DM = 4.148808e3
-SPEED_OF_LIGHT = 2.99792458e8  # m/s
+from .constants import (
+    K_DM,
+    SPEED_OF_LIGHT,
+    DEFAULT_SPACING_M,
+)
 
 
-def default_antenna_positions(n_ant: int, spacing_m: float = 0.6) -> np.ndarray:
+def default_antenna_positions(n_ant: int, spacing_m: float = DEFAULT_SPACING_M) -> np.ndarray:
     """Generate (n_ant, 3) antenna coordinates in meters matching C++ geometry."""
     if n_ant == 32:
         nx, ny = 8, 4

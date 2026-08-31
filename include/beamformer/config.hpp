@@ -1,5 +1,7 @@
 #pragma once
 
+#include "beamformer/constants.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -9,10 +11,9 @@ namespace beamformer {
 
 // A production input is one local frequency shard, not the concatenated band.
 // Each NIC contributes 336 channels; the two shards cover the 672-channel band.
-inline constexpr std::size_t local_frequency_channels = 336;
-inline constexpr std::size_t frequency_shard_count = 2;
-inline constexpr std::size_t full_band_frequency_channels =
-    local_frequency_channels * frequency_shard_count;
+inline constexpr std::size_t frequency_shard_count = constants::charts_shard_count;
+inline constexpr std::size_t local_frequency_channels = constants::charts_local_channels;
+inline constexpr std::size_t full_band_frequency_channels = constants::charts_full_band_channels;
 // Compatibility name: n_freq in Dimensions means local frequency count.
 inline constexpr std::size_t default_frequency_channels = local_frequency_channels;
 inline constexpr std::size_t maximum_beams = 128;
@@ -21,10 +22,10 @@ inline constexpr std::size_t rfsoc_subbands_per_nic = 2;
 inline constexpr std::size_t rfsoc_channels_per_nic =
     rfsoc_channels_per_subband * rfsoc_subbands_per_nic;
 inline constexpr std::size_t rfsoc_elements_per_device = 32;
-inline constexpr float default_frequency_start_hz = 300'000'000.0F;
-inline constexpr float default_channel_width_hz = 300'000.0F;
-inline constexpr float beam_grid_design_frequency_hz = 400'000'000.0F;
-inline constexpr float default_spacing_m = 0.6F;
+inline constexpr float default_frequency_start_hz = constants::charts_frequency_start_hz;
+inline constexpr float default_channel_width_hz = constants::charts_channel_width_hz;
+inline constexpr float beam_grid_design_frequency_hz = constants::charts_design_frequency_hz;
+inline constexpr float default_spacing_m = constants::charts_default_spacing_m;
 
 struct ShardDescriptor {
     // Identity is deliberately explicit: shard buffers must remain independent.
